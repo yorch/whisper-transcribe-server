@@ -3199,6 +3199,14 @@ CONFIG_TEMPLATE = """\
 # enabled = true
 # Where the daily files and the prompt sidecars live. Default: <work dir>/audit
 # dir = "/mnt/big/transcribe-state/audit"
+#
+# A Windows path needs quoting that TOML accepts. In a double-quoted string a
+# backslash starts an escape, so "C:\\Users\\me\\audit" is a parse error (\\U is a
+# unicode escape). Single quotes are literal; a double-quoted string needs every
+# backslash doubled:
+#   'C:\\Users\\me\\audit'
+#   "C:\\\\Users\\\\me\\\\audit"
+#
 # Also log status/list/detail polls. Chatty, so off by default.
 # reads = false
 # Store prompt and hotword text in the sidecar files. Turning this off keeps
