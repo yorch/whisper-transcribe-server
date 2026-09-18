@@ -14,15 +14,20 @@ winget install astral-sh.uv
 That's it. The first `uv run` resolves and caches everything, including the CUDA
 runtime libs CTranslate2 needs (`nvidia-cublas-cu12` and `nvidia-cudnn-cu12`) —
 faster-whisper does **not** use PyTorch, so those two packages are the real
-GPU dependency.
+GPU dependency. Budget a couple of GB for that first download; cuBLAS alone is
+over 500 MB.
 
-Those wheels drop `libcublas`/`libcudnn` into `site-packages/nvidia/…/lib`, which
-is not on the dynamic loader path, and CTranslate2 only `dlopen`s them when it
-starts encoding. The server preloads them at startup so this works out of the
-box; without that you get a model that loads fine and then fails every job with
-`Library libcublas.so.12 is not found or cannot be loaded`. If you ever see that
-message from another entry point, set `LD_LIBRARY_PATH` (Linux/macOS) or use
-`uv run` rather than a bare `python transcribe_server.py`.
+You do **not** need the CUDA Toolkit or a system cuDNN. Those wheels carry
+cuBLAS and cuDNN 9, and the server wires them up at startup, before it loads a
+model, so `uv run` really is the whole install.
+
+That step is necessary because the wheels drop `libcublas`/`libcudnn` into
+`site-packages/nvidia/…`, which is not on the loader's search path, and
+CTranslate2 only resolves them when it starts encoding. Without it you get a
+model that loads fine and then fails every job with `Library libcublas.so.12 is
+not found or cannot be loaded` — or the same for `cublas64_12.dll` on Windows.
+[When CUDA fails](#when-cuda-fails) is what to do if you ever see that from some
+other entry point.
 
 `--preload` therefore **verifies the device can encode**, not just load, and
 exits with an explanation if it cannot. A green "Model ready." means a job will
@@ -85,7 +90,8 @@ Useful flags:
 | `--port 8765`                 | listen port                                                                                                                 |
 | `--preload`                   | load the model at startup so the first job doesn't stall                                                                    |
 | `--token secret123`           | require the `x-token` header on every API call (`?token=` bootstraps the page, then moves to `sessionStorage`)              |
-| `--device cpu`                | fall back to CPU                                                                                                            |
+| `--device cpu`                | always CPU                                                                                                                  |
+| `--device auto`               | use the GPU only if it actually works, otherwise CPU                                                                        |
 | `--compute-type int8_float16` | lower VRAM use                                                                                                              |
 | `--quality fast`              | default beam size: `fast`=1, `balanced`=5, `thorough`=8                                                                     |
 | `--model-cache 2`             | models held in VRAM at once (default 1)                                                                                     |
@@ -359,7 +365,84 @@ takes device 0. Two things decide which `--compute-type` to use:
 - `large-v3` in fp16 wants roughly **4.7 GB of VRAM**. Below ~6 GB, use
   `int8_float16`, or drop to `medium`.
 
+The precision list the UI offers is whatever CTranslate2 reports for the
+device that was resolved, so a CPU fallback offers `int8` and `float32` only,
+and a client asking for something that device cannot run is refused rather than
+queued up to fail. If `--compute-type` names something the device cannot run —
+`float16` on CPU is the usual case, since CPU has no float16 at all — the
+server runs the best available option instead (`int8`, unless you asked for
+`float32` or `int8_float32`, which a CPU can run as-is) and says so at startup.
+
 Multi-GPU isn't wired up — it always uses device 0.
+
+### Where the libraries come from, and when they are missing
+
+CTranslate2 doesn't link against cuBLAS and cuDNN. It loads cuBLAS by name at
+runtime (`cublas64_12.dll` on Windows, `libcublas.so.12` elsewhere), and the
+`cudnn64_9.dll` it bundles is a shim that loads the cuDNN 9 parts the same way.
+A bare `LoadLibrary` searches the executable's directory, the system
+directories and `PATH` — and nothing about `uv run` puts
+`site-packages\nvidia\...\bin` on `PATH`. Left alone, that produces a very
+misleading failure: the server starts, `--preload` loads the model, and the
+first job dies minutes later inside the first matrix multiply.
+
+So before it loads anything, the server:
+
+1. Finds the CUDA directories the wheels brought: it asks `importlib` where the
+   `nvidia` packages actually live, scans `site-packages/nvidia/*/{bin,lib}`,
+   and falls back to a real CUDA 12 toolkit (`CUDA_PATH`) if there is one.
+2. Makes them reachable. On Windows it prepends them to `PATH`, which is what a
+   bare `LoadLibrary` consults, and registers them with the OS loader as well;
+   on macOS and Linux, where the loader read its search path before Python
+   started, it loads the libraries by absolute path with `RTLD_GLOBAL`, so a
+   later `dlopen` of the same soname resolves against the copy already in
+   memory.
+3. Verifies the result, then acts. A cheap probe loads cuBLAS and the cuDNN
+   parts and asks the driver for a device: `--device auto` becomes `cuda` only
+   if that passed, and an explicit `--device cuda` that fails stops startup with
+   exit code 1 rather than serving jobs that will die. `--preload` goes one step
+   further and runs a real one-second encode, because a GPU can load a model and
+   still be unable to encode. If a service wrapper restarts on failure, capture
+   the output or treat exit 1 as fatal, or it will restart-loop without ever
+   showing you the diagnosis.
+
+`--device cpu` skips all of it.
+
+The probe cannot catch every way a GPU can misbehave — only a real transcription
+can, which is what `--preload` is for. Hover the device name in the status strip
+for the reason behind the device it settled on; `server.started` in the audit
+trail records the same thing.
+
+## When CUDA fails
+
+The failure this section exists for looks like this — usually minutes into a
+job, usually with a healthy-looking server in front of it:
+
+```
+RuntimeError: Library cublas64_12.dll is not found or cannot be loaded
+```
+
+or the same for `cudnn_ops64_9.dll` or `cudnn_cnn64_9.dll`. It means the loader
+could not find a library that is sitting on disk in `site-packages\nvidia\...`.
+The server now checks for exactly this before it starts serving, and prints the
+directories it searched, so the terminal says which case you are in:
+
+| What it says | What to do |
+| --- | --- |
+| No `nvidia-*` wheel directory exists for this interpreter | `uv run transcribe_server.py`, to re-resolve the inline dependencies. If you started it some other way (`python transcribe_server.py` in a hand-made venv), install `nvidia-cublas-cu12` and `nvidia-cudnn-cu12` there, or just use `uv run`. |
+| The libraries were found but the loader refused them | `uv cache clean && uv run transcribe_server.py`. Almost always a truncated or wrong-architecture wheel. |
+| The libraries load but no CUDA device is visible | A driver problem: install or update the NVIDIA driver (CUDA 12 wants >= 525) and reopen the terminal. |
+| `--preload` reports the model *cannot run* | The libraries loaded but a real encode failed. Install the runtime by running through `uv`, or fall back to `--device cpu --compute-type int8`. |
+| `--device auto` fell back to CPU | One of the above; run with `--device cuda` for the detail. Everything works, it is just slower. |
+
+`--device cpu` always works and needs none of this: it skips the GPU entirely
+and switches the precision to `int8`.
+
+Two warnings on every Windows run are noise rather than problems: Hugging Face
+reporting that it cannot use symlinks in `%USERPROFILE%\.cache\huggingface`
+(setting `HF_HUB_DISABLE_SYMLINKS_WARNING=1` silences it; Developer Mode fixes
+the cause), and a note that you are downloading anonymously
+(`$env:HF_TOKEN = "hf_..."` raises the rate limit).
 
 ## Security posture
 
@@ -459,3 +542,16 @@ uvx pyright --project pyrightconfig.json
 
 Tests never start the worker thread, so they queue uploads without loading a
 model or touching a GPU.
+
+`tests/test_cuda_bootstrap.py` gives you a one-command check that needs neither
+that `.venv` nor faster-whisper: it declares its own dependencies inline
+(pytest, fastapi, httpx, numpy) and runs the whole suite, because the
+model-loading paths are monkeypatched and the CUDA probes stub the loader and
+the driver.
+
+```bash
+uv run tests/test_cuda_bootstrap.py
+```
+
+The `.venv` above is still what `pyright` type-checks against, and it is the
+only environment that exercises a real model load.

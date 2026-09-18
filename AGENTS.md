@@ -29,10 +29,15 @@ push failure as a blocker.
 ## Tests
 
 ```bash
-.venv/bin/pytest -q                    # 115 tests
+.venv/bin/pytest -q                    # 170 tests
 uvx ruff check .                       # configured by ruff.toml
 uvx pyright --project pyrightconfig.json
 ```
+
+`uv run tests/test_cuda_bootstrap.py` runs the same suite in a throwaway env
+with no `.venv` and no CUDA wheels; the two `tests/test_gpu.py` tests that need
+the real wheels skip there. Use it for a quick check, and the `.venv` when you
+want the wheel-dependent tests to actually execute.
 
 `.venv` is created by hand (see the README's Tests section) and is gitignored.
 Tests never start the worker thread, so they queue uploads without loading a

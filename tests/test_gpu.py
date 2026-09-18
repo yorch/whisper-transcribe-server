@@ -163,7 +163,7 @@ def test_enable_cuda_libraries_is_safe_when_the_wheels_are_absent(
     configured, monkeypatch
 ):
     """A CPU-only install must not blow up at startup."""
-    monkeypatch.setattr(s.importlib.util, "find_spec", lambda name: None)
+    monkeypatch.setattr(s, "cuda_search_dirs", lambda *a, **k: [])
     assert s.enable_cuda_libraries() == []
 
 

@@ -6,6 +6,7 @@
 #     "uvicorn[standard]>=0.27",
 #     "python-multipart>=0.0.9",
 #     "faster-whisper>=1.0.3",
+#     "numpy>=1.24",
 #     "tomli>=2; python_version < '3.11'",
 #     "nvidia-cublas-cu12; sys_platform != 'darwin'",
 #     "nvidia-cudnn-cu12>=9,<10; sys_platform != 'darwin'",
@@ -57,6 +58,7 @@ import time
 import traceback
 import uuid
 from collections import OrderedDict, deque
+from collections.abc import MutableMapping
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, TypeVar
@@ -71,7 +73,7 @@ try:  # tomllib is 3.11+; the inline dependency covers older interpreters
         return tomllib.loads(text)
 
 except ModuleNotFoundError:  # pragma: no cover - 3.10 only
-    import tomli
+    import tomli  # pyright: ignore[reportMissingImports]
 
     def load_toml(text: str) -> dict[str, Any]:
         return tomli.loads(text)
@@ -130,13 +132,554 @@ _MODEL_CACHE: OrderedDict[tuple, Any] = OrderedDict()
 _MODEL_LOCK = threading.Lock()
 
 
+# Windows drive-absolute and UNC paths. The directory prefixes above only cover
+# the home and work directories; anything else (C:\Program Files\...,
+# \\share\...) can still reach a client, so catch absolute Windows paths by
+# shape. The lookbehind keeps "https://host/x" from looking like a drive. A path
+# containing spaces redacts only up to the first space: swallowing to the end of
+# the line would eat the rest of the message instead.
+_ABSOLUTE_PATH = re.compile(r"""(?<![A-Za-z0-9])(?:[A-Za-z]:[\\/]|\\\\)[^\s"']*""")
+
+
 def redact(text: str, limit: int = 300) -> str:
     """Strip local filesystem paths out of anything shown to a client."""
     for base in (str(UPLOAD_DIR), str(WORK_DIR), str(Path.home())):
         for variant in (base, base.replace("\\", "/")):
             if variant:
                 text = text.replace(variant, "<path>")
-    return text[:limit]
+    return _ABSOLUTE_PATH.sub("<path>", text)[:limit]
+
+
+# --------------------------------------------------------------------------- #
+# CUDA libraries
+# --------------------------------------------------------------------------- #
+#
+# CTranslate2's wheels ship neither cuBLAS nor the real cuDNN 9 libraries. The
+# cuBLAS stub inside libctranslate2 calls LoadLibraryA("cublas64_12.dll"), and
+# the cudnn64_9.dll it bundles is itself a shim that does the same for
+# cudnn_*64_9.dll. A bare LoadLibrary searches only the application directory,
+# the system directories and PATH, so the copies the nvidia-* wheels install
+# into site-packages stay invisible: nothing about `uv run` puts them on PATH,
+# and os.add_dll_directory does not help those calls either (it only applies to
+# LoadLibraryEx calls that pass LOAD_LIBRARY_SEARCH_USER_DIRS).
+#
+# That is why the failure is so late and so opaque: loading a model never calls
+# a cuBLAS kernel, so the server starts, the model loads, and the job dies
+# minutes later inside the first matmul with "Library cublas64_12.dll is not
+# found or cannot be loaded".
+#
+# Windows: prepend the wheel directories to PATH, which is what the loader
+# really consults, and also register them with os.add_dll_directory for
+# anything resolved through CPython's extension loader.
+# POSIX: the dynamic loader has already read its search path by the time Python
+# starts, so PATH is inert. Instead we dlopen the libraries by absolute path
+# with RTLD_GLOBAL, after which a dlopen of the same soname resolves to the
+# copy already in memory. Only tried when loading by name failed, so a working
+# system CUDA install is never disturbed.
+
+# What CTranslate2 asks the loader for by name, so what it can fail on. The
+# cuDNN parts cover conv1d, which the Whisper encoder needs; the rest of cuDNN
+# ships with them or is pulled in transitively.
+CUDA_PROBE_LIBS: dict[str, tuple[str, ...]] = {
+    "win32": ("cublas64_12.dll", "cudnn_ops64_9.dll", "cudnn_cnn64_9.dll"),
+    "posix": (
+        "libcublas.so.12",
+        "libcudnn_ops.so.9",
+        "libcudnn_cnn.so.9",
+        "libcudnn.so.9",
+    ),
+}
+
+# POSIX preload order: dependencies before the libraries that need them.
+POSIX_PRELOAD_ORDER = (
+    "libcublasLt.so.12",
+    "libcublas.so.12",
+    "libcudnn_ops.so.9",
+    "libcudnn_cnn.so.9",
+    "libcudnn.so.9",
+)
+
+CUDA_ERROR_HINT = (
+    " The CUDA libraries CTranslate2 needs are not on the loader search path; "
+    "see 'When CUDA fails' in README.md."
+)
+
+# os.add_dll_directory() hands back a handle that must outlive the call, and
+# ctypes.CDLL() does not unload anything either.
+_DLL_DIR_HANDLES: list[Any] = []
+_REGISTERED_DLL_DIRS: set[str] = set()
+_PRELOADED_LIBS: list[Any] = []
+
+# Set in main(). None when the operator asked for CPU, so nothing was probed.
+CUDA: dict[str, Any] | None = None
+
+# Also set in main(): the subset of COMPUTE_TYPES the resolved device can run.
+# CTranslate2 rejects the rest at model load, so shipping float16 to a CPU box
+# would mean a server that looks healthy and fails every single job.
+PRECISIONS: list[str] = list(COMPUTE_TYPES)
+
+
+def platform_family(platform: str | None = None) -> str:
+    """'win32' or 'posix' -- coarse enough for every branch below."""
+    return "win32" if (platform or sys.platform) == "win32" else "posix"
+
+
+def short_path(path: Path | str, parts: int = 3) -> str:
+    """Trailing path components, for records that must not carry machine paths."""
+    chunks = Path(path).parts
+    return "/".join(chunks[-parts:])
+
+
+def safe_lib_name(entry: str) -> str:
+    """A soname as it is; a directory as its last few components."""
+    return short_path(entry) if Path(entry).is_absolute() else entry
+
+
+def _environ() -> MutableMapping[str, str]:
+    """The process environment, behind a seam a test can stand a wall in front of."""
+    return os.environ
+
+
+def site_package_dirs() -> list[Path]:
+    """Every site-packages-style directory this interpreter could import from.
+
+    sys.path is the ground truth once the wheels are importable, but the
+    prefix-derived layouts are checked too so discovery still works before the
+    first import and under interpreters that report site-packages oddly.
+    """
+    candidates: list[Path] = []
+    with contextlib.suppress(Exception):  # embedded or exotic interpreters
+        import site
+
+        candidates += [Path(p) for p in site.getsitepackages()]
+        candidates.append(Path(site.getusersitepackages()))
+    candidates += [
+        Path(entry)
+        for entry in sys.path
+        if entry.endswith(("site-packages", "dist-packages"))
+    ]
+    version = f"python{sys.version_info[0]}.{sys.version_info[1]}"
+    for prefix in (Path(sys.prefix), Path(sys.base_prefix)):
+        candidates += [
+            prefix / "Lib" / "site-packages",  # Windows layout
+            prefix / "lib" / version / "site-packages",  # POSIX layout
+        ]
+    seen: set[str] = set()
+    dirs: list[Path] = []
+    for path in candidates:
+        key = str(path).replace("\\", "/").casefold()
+        if key in seen or not path.is_dir():
+            continue
+        seen.add(key)
+        dirs.append(path)
+    return dirs
+
+
+def nvidia_lib_dirs(roots: list[Path] | None = None) -> list[Path]:
+    """<site-packages>/nvidia/<package>/bin (Windows) or /lib (POSIX)."""
+    dirs: list[Path] = []
+    for root in site_package_dirs() if roots is None else roots:
+        nvidia = root / "nvidia"
+        if not nvidia.is_dir():
+            continue
+        for package in sorted(nvidia.iterdir()):
+            if not package.is_dir():
+                continue
+            for leaf in ("bin", "lib"):
+                candidate = package / leaf
+                if candidate.is_dir() and candidate not in dirs:
+                    dirs.append(candidate)
+    return dirs
+
+
+def cuda_toolkit_dirs(platform: str | None = None) -> list[Path]:
+    """A real CUDA 12 toolkit, if one is installed. Ranks below the wheels."""
+    dirs: list[Path] = []
+    leaf = "bin" if platform_family(platform) == "win32" else "lib64"
+    for name in ("CUDA_PATH", "CUDA_HOME"):
+        root = os.environ.get(name)
+        if root:
+            dirs.append(Path(root) / leaf)
+    if platform_family(platform) == "win32":
+        toolkit = Path("C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA")
+        if toolkit.is_dir():
+            dirs += sorted(
+                entry / "bin" for entry in toolkit.glob("v12*") if entry.is_dir()
+            )
+    return dirs
+
+
+def spec_lib_dirs() -> list[Path]:
+    """Where the nvidia-* wheels say they are: the authoritative import location.
+
+    find_spec resolves the package the interpreter would actually import, which
+    the directory scan below can only guess at, so it is checked first and
+    cannot pick up a copy that belongs to some other environment.
+    """
+    dirs: list[Path] = []
+    for module in ("nvidia.cublas.lib", "nvidia.cudnn.lib"):
+        try:
+            spec = importlib.util.find_spec(module)
+        except (ImportError, ValueError):
+            continue
+        locations = getattr(spec, "submodule_search_locations", None)
+        if not locations:
+            continue
+        directory = Path(next(iter(locations)))
+        if directory.is_dir() and directory not in dirs:
+            dirs.append(directory)
+    return dirs
+
+
+def cuda_search_dirs(
+    extra: list[Path] | None = None, platform: str | None = None
+) -> list[Path]:
+    """Where the CUDA runtime libraries may live, best candidate first.
+
+    The wheels rank above a system toolkit: they are what the inline metadata
+    pins, so a machine that has both should run the versions this script
+    declares.
+    """
+    candidates = (
+        spec_lib_dirs()
+        + nvidia_lib_dirs()
+        + cuda_toolkit_dirs(platform)
+        + list(extra or [])
+    )
+    present: list[Path] = []
+    for path in candidates:
+        if path.is_dir() and path not in present:
+            present.append(path)
+    return present
+
+
+def cuda_library_wiring(
+    extra: list[Path] | None = None, platform: str | None = None
+) -> dict[str, Any]:
+    """Make the CUDA libraries the wheels bring visible to the loader, and say
+    what it did.
+
+    Windows: prepend the directories to PATH, which is what the loader consults
+    for a bare LoadLibrary, and register them with os.add_dll_directory as
+    well. POSIX: preload them by absolute path with RTLD_GLOBAL, after which a
+    dlopen by soname resolves against the copy already in memory, because the
+    dynamic loader read its search path before Python started.
+
+    Idempotent: PATH keeps its original entries behind the new ones, and a
+    directory is never registered twice.
+    """
+    dirs = cuda_search_dirs(extra, platform)
+    added_to_path: list[str] = []
+    path_error: str | None = None
+    if platform_family(platform) == "win32":
+        env = _environ()
+        current = env.get("PATH", "")
+        have = {
+            entry.rstrip("\\/").casefold()
+            for entry in current.split(os.pathsep)
+            if entry
+        }
+        missing = [d for d in dirs if str(d).rstrip("\\/").casefold() not in have]
+        if missing:
+            parts = [str(d) for d in missing] + ([current] if current else [])
+            try:
+                env["PATH"] = os.pathsep.join(parts)
+            except OSError as exc:  # a PATH at the 32k limit, or a locked block
+                path_error = str(exc)
+            else:
+                added_to_path = [str(d) for d in missing]
+        registered: list[str] = []
+        add_dll_directory = getattr(os, "add_dll_directory", None)
+        if add_dll_directory is not None:
+            for directory in dirs:
+                key = str(directory).casefold()
+                if key in _REGISTERED_DLL_DIRS:
+                    registered.append(str(directory))
+                    continue
+                try:
+                    _DLL_DIR_HANDLES.append(add_dll_directory(str(directory)))
+                except OSError:
+                    continue
+                _REGISTERED_DLL_DIRS.add(key)
+                registered.append(str(directory))
+        preloaded = list(dict.fromkeys(added_to_path + registered))
+    else:
+        preloaded = preload_cuda_libraries(dirs)
+    return {
+        "dirs": dirs,
+        "added_to_path": added_to_path,
+        "path_error": path_error,
+        "preloaded": preloaded,
+    }
+
+
+def enable_cuda_libraries(
+    extra: list[Path] | None = None, platform: str | None = None
+) -> list[str]:
+    """Make the CUDA runtime that ships in the nvidia-* wheels loadable.
+
+    ctranslate2 resolves libcublas/libcudnn lazily, when it starts encoding, and
+    the wheels install them somewhere the loader does not search. Without this,
+    the model loads happily and then every job fails with "Library
+    libcublas.so.12 is not found or cannot be loaded" — the failure mode that
+    makes a broken GPU look healthy at startup.
+
+    Returns what it wired: sonames on POSIX, directories on Windows, empty when
+    no CUDA runtime was found at all.
+    """
+    return cuda_library_wiring(extra, platform)["preloaded"]
+
+
+def preload_cuda_libraries(dirs: list[Path]) -> list[str]:
+    """POSIX only: absolute-path load so a later dlopen by soname hits memory.
+
+    Dependency order matters and is fixed by POSIX_PRELOAD_ORDER: a bare dlopen
+    of an absolute path resolves that object's own dependencies through the
+    loader's search path, which does not include the directory it was loaded
+    from. Best effort per library; the probe afterwards decides.
+    """
+    loaded: list[str] = []
+    if platform_family() == "win32":
+        return loaded
+    for name in POSIX_PRELOAD_ORDER:
+        path = next((d / name for d in dirs if (d / name).is_file()), None)
+        if path is None:
+            continue
+        try:
+            _PRELOADED_LIBS.append(ctypes.CDLL(str(path), mode=ctypes.RTLD_GLOBAL))
+        except OSError:
+            continue
+        loaded.append(name)
+    return loaded
+
+
+def _load_library_a(name: str) -> str | None:
+    """The exact call CTranslate2 makes, so a green probe means what it says.
+
+    ctypes' own loader is not the same search: WinDLL/CDLL pass their own flags
+    to LoadLibraryEx, while the fix depends specifically on the bare
+    LoadLibraryA standard search order -- the one that includes PATH, which is
+    where this module puts the wheel directories.
+    """
+    # WinDLL/get_last_error only exist in the Windows build of ctypes, and this
+    # is type-checked on Linux as well.
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # pyright: ignore[reportAttributeAccessIssue]
+    kernel32.LoadLibraryA.argtypes = [ctypes.c_char_p]
+    kernel32.LoadLibraryA.restype = ctypes.c_void_p
+    handle = kernel32.LoadLibraryA(name.encode("ascii"))
+    if handle:
+        return None
+    error = ctypes.get_last_error()  # pyright: ignore[reportAttributeAccessIssue]
+    return f"LoadLibraryA({name}) failed (error {error})"
+
+
+def load_library_probe(name: str, platform: str | None = None) -> str | None:
+    """None if the loader can find `name`, else the loader's complaint."""
+    if platform_family(platform) == "win32":
+        return _load_library_a(name)
+    try:
+        ctypes.CDLL(name)
+    except OSError as exc:
+        return str(exc)
+    return None
+
+
+def cuda_device_count() -> int:
+    import ctranslate2
+
+    return int(ctranslate2.get_cuda_device_count())
+
+
+def supported_compute_types(device: str) -> set[str]:
+    import ctranslate2
+
+    return set(ctranslate2.get_supported_compute_types(device))
+
+
+def device_precisions(device: str) -> list[str]:
+    """The precisions this device can run, in the UI's order.
+
+    Asked of CTranslate2 rather than hardcoded: CPU has no float16, Pascal has
+    no fast one, and the library is the authority on both.
+    """
+    try:
+        supported = supported_compute_types(device)
+    except Exception:  # noqa: BLE001 - never fail startup over a dropdown
+        return list(COMPUTE_TYPES)
+    usable = [kind for kind in COMPUTE_TYPES if kind in supported]
+    return usable or list(COMPUTE_TYPES)
+
+
+def resolve_precision(device: str, requested: str) -> tuple[str, str | None, list[str]]:
+    """(precision to run on, a notice if it had to change, device's choices)."""
+    usable = device_precisions(device)
+    if requested in usable:
+        return requested, None, usable
+    fallback = "int8" if "int8" in usable else usable[0]
+    notice = f"!  {requested} is not available on {device}; using {fallback}."
+    return fallback, notice, usable
+
+
+def probe_cuda(platform: str | None = None) -> dict[str, Any]:
+    """Can this machine actually run CTranslate2 on the GPU?
+
+    Cheap on purpose: it forces the libraries that failures come from and asks
+    the driver for a device. It cannot catch every way a GPU can misbehave --
+    only a real transcription can -- but it catches the whole "library not
+    found" family, which is the one that otherwise shows up mid-job.
+    """
+    missing = [
+        name
+        for name in CUDA_PROBE_LIBS[platform_family(platform)]
+        if load_library_probe(name, platform)
+    ]
+    report: dict[str, Any] = {
+        "usable": False,
+        "kind": None,
+        "reason": None,
+        "missing": missing,
+        "device_count": 0,
+    }
+    if missing:
+        report["kind"] = "missing-libs"
+        report["reason"] = f"{missing[0]} could not be loaded"
+        return report
+    try:
+        count = cuda_device_count()
+    except Exception as exc:  # noqa: BLE001 - any import or driver failure counts
+        report["kind"] = "no-ctranslate2"
+        # The reason is a fixed sentence because this one is published: the
+        # exception text can name a path outside the home directory, which
+        # redact() covers only by shape. cuda_diagnosis() prints the detail,
+        # which never leaves the console.
+        report["reason"] = "CTranslate2 could not be loaded"
+        report["detail"] = str(exc)[:400]
+        return report
+    report["device_count"] = count
+    if count < 1:
+        report["kind"] = "no-device"
+        report["reason"] = "no CUDA device is visible to the driver"
+        return report
+    report["usable"] = True
+    return report
+
+
+def decide_device(requested: str, probe: dict[str, Any]) -> tuple[str, bool]:
+    """(device to run on, whether an unusable GPU should stop startup).
+
+    `auto` means "use the GPU only if it demonstrably works": CTranslate2's own
+    auto only counts devices, and a machine with a driver and a missing cuBLAS
+    counts them happily.
+    """
+    if requested == "cpu":
+        return "cpu", False
+    if probe["usable"]:
+        return "cuda", False
+    if requested == "auto":
+        return "cpu", False
+    return requested, True
+
+
+def cuda_report(
+    requested: str, device: str, wired: dict[str, Any], probe: dict[str, Any]
+) -> dict[str, Any]:
+    """Client- and audit-safe view: short paths in, machine paths out."""
+    return {
+        "requested_device": requested,
+        "device": device,
+        "usable": bool(probe["usable"]),
+        "kind": probe["kind"],
+        "reason": probe["reason"],
+        "missing": list(probe["missing"]),
+        "device_count": probe["device_count"],
+        "lib_dirs": [short_path(d) for d in wired["dirs"]],
+        "preloaded": [safe_lib_name(name) for name in wired["preloaded"]],
+    }
+
+
+def cuda_diagnosis(report: dict[str, Any], wired: dict[str, Any]) -> list[str]:
+    """Console-only explanation of an unusable GPU, with real paths."""
+    lines = ["!  CUDA is not usable on this machine.", f"   {report['reason']}."]
+    if report.get("detail"):
+        lines.append(f"   {report['detail']}")
+    dirs = [str(d) for d in wired["dirs"]]
+    if dirs:
+        lines.append("   CUDA libraries found in:")
+        lines += [f"     {d}" for d in dirs]
+    if wired.get("added_to_path"):
+        lines.append("   These were prepended to PATH for this process.")
+    if wired.get("path_error"):
+        lines.append(f"   PATH could not be extended: {wired['path_error']}")
+    if report["missing"]:
+        lines.append("   Missing: " + ", ".join(report["missing"]))
+    lines.append("")
+    if report["kind"] == "no-device":
+        lines.append("   The libraries load, but the driver reports no GPU. Check the")
+        lines.append("   NVIDIA driver is installed and supports CUDA 12 (>= 525).")
+        lines.append("   Fix:  uv run transcribe_server.py --device cpu")
+        return lines
+    if dirs:
+        lines.append(
+            "   The libraries are there but the loader refused them, which usually"
+        )
+        lines.append("   means a truncated or foreign-architecture wheel.")
+        lines.append("   Fix:  uv cache clean && uv run transcribe_server.py")
+    else:
+        lines.append(
+            "   No nvidia-* wheel directory exists for this interpreter, so there"
+        )
+        lines.append(
+            "   was nothing to wire up. This script declares those wheels inline,"
+        )
+        lines.append("   so re-resolving them is normally all it takes.")
+        lines.append("   Fix:  uv run transcribe_server.py")
+    lines.append("   Or:   uv run transcribe_server.py --device cpu")
+    return lines
+
+
+def cuda_fallback_notice(report: dict[str, Any]) -> list[str]:
+    return [
+        f"!  CUDA is not usable ({report['reason']}); --device auto runs on CPU.",
+        "   Transcription will be much slower. Run with --device cuda for the details.",
+    ]
+
+
+def cuda_startup(requested: str) -> dict[str, Any]:
+    """Wire the loader, verify the GPU, then decide. Printing stays in main()."""
+    wiring = cuda_library_wiring()
+    probe = probe_cuda()
+    device, fatal = decide_device(requested, probe)
+    report = cuda_report(requested, device, wiring, probe)
+    if fatal:
+        # Console view: the safe report plus the raw exception text, which is
+        # deliberately not part of the report itself.
+        lines = cuda_diagnosis({**report, "detail": probe.get("detail")}, wiring)
+    elif not probe["usable"]:
+        lines = cuda_fallback_notice(report)
+    else:
+        lines = []
+    if wiring["preloaded"]:
+        lines.append(
+            f"CUDA libs  preloaded {len(wiring['preloaded'])} librar(y/ies) from the wheels"
+        )
+    return {"device": device, "report": report, "fatal": fatal, "lines": lines}
+
+
+def friendly_error(exc: Exception) -> str:
+    """A job error a client can see: redacted, plus a hint when CUDA is to blame."""
+    text = redact(str(exc))
+    lowered = text.lower()
+    if any(
+        marker in lowered
+        for marker in (
+            "is not found or cannot be loaded",
+            "cublas",
+            "cudnn",
+            "dll load failed",
+        )
+    ):
+        return text + CUDA_ERROR_HINT
+    return text
 
 
 # --------------------------------------------------------------------------- #
@@ -667,7 +1210,7 @@ def build_opts(
 
     if ARGS.allow_precision_choice:
         compute_type = compute_type or ARGS.compute_type
-        if compute_type not in COMPUTE_TYPES:
+        if compute_type not in PRECISIONS:
             raise HTTPException(status_code=400, detail="Unknown compute type")
     else:
         compute_type = ARGS.compute_type
@@ -701,47 +1244,6 @@ def build_opts(
 # --------------------------------------------------------------------------- #
 # Transcription worker
 # --------------------------------------------------------------------------- #
-
-
-def enable_cuda_libraries() -> list[str]:
-    """Make the CUDA runtime that ships in the nvidia-* wheels loadable.
-
-    ctranslate2 dlopen()s libcublas/libcudnn by soname at *encode* time, but the
-    wheels install them under site-packages/nvidia/<lib>/lib, which is not on the
-    loader path. Without this, the model loads happily and then every job fails
-    with "Library libcublas.so.12 is not found or cannot be loaded" — the exact
-    failure mode that makes a broken GPU look healthy at startup.
-
-    Loading them here with RTLD_GLOBAL means the later dlopen resolves against
-    the already-loaded soname. Returns the names it managed to preload.
-    """
-    loaded: list[str] = []
-    for module, names in (
-        ("nvidia.cublas.lib", ("libcublas.so.12", "libcublasLt.so.12")),
-        ("nvidia.cudnn.lib", ("libcudnn.so.9",)),
-    ):
-        try:
-            spec = importlib.util.find_spec(module)
-        except (ImportError, ValueError):
-            continue
-        locations = getattr(spec, "submodule_search_locations", None)
-        if not locations:
-            continue
-        libdir = Path(next(iter(locations)))
-        if sys.platform == "win32":
-            # Windows resolves DLLs from the directories added here.
-            with contextlib.suppress(OSError):
-                os.add_dll_directory(str(libdir))
-            loaded.append(str(libdir))
-            continue
-        for name in names:
-            candidate = libdir / name
-            if not candidate.exists():
-                continue
-            with contextlib.suppress(OSError):
-                ctypes.CDLL(str(candidate), mode=ctypes.RTLD_GLOBAL)
-                loaded.append(name)
-    return loaded
 
 
 def verify_device(model: Any, name: str) -> None:
@@ -833,7 +1335,7 @@ def run_job(job_id: str) -> None:
             job_id,
             state="error",
             finished=time.time(),
-            message=f"Could not load {opts['model']}: {redact(str(exc))}",
+            message=f"Could not load {opts['model']}: {friendly_error(exc)}",
         )
         prune_jobs()
         return
@@ -929,7 +1431,7 @@ def run_job(job_id: str) -> None:
             job_id,
             state="error",
             finished=time.time(),
-            message=f"{type(exc).__name__}: {redact(str(exc))}",
+            message=f"{type(exc).__name__}: {friendly_error(exc)}",
         ):
             audit(
                 "job.error",
@@ -968,7 +1470,7 @@ def worker_loop() -> None:
                 job_id,
                 state="error",
                 finished=time.time(),
-                message=f"{type(exc).__name__}: {redact(str(exc))}",
+                message=f"{type(exc).__name__}: {friendly_error(exc)}",
             )
         finally:
             JOB_QUEUE.task_done()
@@ -1259,11 +1761,12 @@ def status() -> dict[str, Any]:
     return {
         "device": ARGS.device,
         "gpu": gpu,
+        "cuda": CUDA,
         "compute_type": ARGS.compute_type,
         "default_model": ARGS.model,
         "default_quality": ARGS.quality,
         "models": MODELS,
-        "compute_types": COMPUTE_TYPES,
+        "compute_types": PRECISIONS,
         "qualities": list(QUALITIES),
         "allow_model_choice": ARGS.allow_model_choice,
         "allow_precision_choice": ARGS.allow_precision_choice,
@@ -2006,8 +2509,10 @@ async function refreshStatus(){
     el("main").classList.remove("locked");
     el("gate").classList.add("locked");
 
+    const cuda = s.cuda || null;
     el("lamp").className = "lamp " + (s.device === "cuda" ? "on" : "bad");
     el("r-device").textContent = s.gpu || s.device;
+    el("r-device").title = cuda && !cuda.usable ? (cuda.reason || "CUDA unavailable") : "";
     el("r-precision").textContent = s.compute_type;
     el("r-ffmpeg").textContent = s.ffmpeg ? "found" : "missing";
     el("r-ffmpeg").style.color = s.ffmpeg ? "" : "var(--red)";
@@ -2034,6 +2539,7 @@ async function refreshStatus(){
     if(e.message !== "unauthorised"){
       el("lamp").className = "lamp bad";
       el("r-device").textContent = "server unreachable";
+      el("r-device").title = "";
     }
   }
 }
@@ -2894,7 +3400,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="default model",
     )
     gpu.add_argument(
-        "--device", default=argparse.SUPPRESS, choices=["cuda", "cpu", "auto"]
+        "--device",
+        default=argparse.SUPPRESS,
+        choices=["cuda", "cpu", "auto"],
+        help="cuda (default) stops startup if the GPU cannot be used; "
+        "auto falls back to CPU instead; cpu skips the GPU entirely",
     )
     gpu.add_argument(
         "--compute-type",
@@ -3095,6 +3605,7 @@ def startup_snapshot(args: argparse.Namespace, cfg: Path | None) -> dict[str, An
         "port": args.port,
         "work_dir": redact(str(WORK_DIR), 500),
         "device": args.device,
+        "cuda": CUDA,
         "model": args.model,
         "compute_type": args.compute_type,
         "quality": args.quality,
@@ -3165,6 +3676,7 @@ def preload_model(args: argparse.Namespace) -> None:
 
 def main() -> None:
     global ARGS, ALLOWED_HOSTS, ALLOWED_SUFFIXES, AUDIT, WORK_DIR, UPLOAD_DIR, READY
+    global CUDA
     args, cfg_path, cfg_required = resolve_args()
 
     if args.no_auth:
@@ -3192,8 +3704,35 @@ def main() -> None:
     )
 
     args.model_cache = max(1, args.model_cache)
+
+    # Before anything loads a model: put the CUDA libraries where the loader can
+    # see them, then find out whether the GPU is really usable. A broken GPU
+    # must not look healthy here -- it would fail minutes into the first job.
+    cuda = None
+    if args.device != "cpu":
+        decision = cuda_startup(args.device)
+        args.device = decision["device"]
+        if decision["lines"]:
+            print()
+            print("\n".join(decision["lines"]), flush=True)
+            print()
+        if decision["fatal"]:
+            raise SystemExit(1)
+        cuda = decision["report"]
+
+    # A CPU fallback inherits a GPU precision unless we look, and CTranslate2
+    # will not run float16 on a CPU at all.
+    args.compute_type, precision_notice, precisions = resolve_precision(
+        args.device, args.compute_type
+    )
+    PRECISIONS[:] = precisions  # in place: request handlers hold no reference
+    if precision_notice:
+        print(precision_notice, flush=True)
+        print()
+
     ARGS = args
     READY = True
+    CUDA = cuda
     ALLOWED_HOSTS, ALLOWED_SUFFIXES = local_names(args.host, args.allow_host)
 
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
@@ -3214,12 +3753,6 @@ def main() -> None:
         print("   winget install Gyan.FFmpeg   (then reopen the terminal)\n")
 
     threading.Thread(target=worker_loop, daemon=True, name="transcriber").start()
-
-    if args.device in ("cuda", "auto"):
-        # ctranslate2 resolves the CUDA runtime lazily, at encode time.
-        preloaded = enable_cuda_libraries()
-        if preloaded:
-            print(f"CUDA libs  preloaded {len(preloaded)} librar(y/ies) from the wheels")
 
     if args.preload:
         preload_model(args)
@@ -3251,6 +3784,14 @@ def main() -> None:
         f"Precision  {args.compute_type}"
         f"{'  (selectable)' if args.allow_precision_choice else '  (pinned)'}"
     )
+    detail = ""
+    if CUDA:
+        detail = (
+            f"  {CUDA['device_count']} CUDA device(s)"
+            if CUDA["usable"]
+            else "  CPU fallback"
+        )
+    print(f"Device     {args.device}{detail}")
     print(f"VRAM cache {args.model_cache} model(s)")
     print(
         f"Sources    retention={args.source_retention}"
