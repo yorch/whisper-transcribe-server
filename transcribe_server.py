@@ -227,14 +227,27 @@ def platform_family(platform: str | None = None) -> str:
 
 
 def short_path(path: Path | str, parts: int = 3) -> str:
-    """Trailing path components, for records that must not carry machine paths."""
-    chunks = Path(path).parts
+    """Trailing path components, for records that must not carry machine paths.
+
+    Backslashes are normalised first so a Windows path is shortened correctly
+    even when the check runs on POSIX (and vice versa), which matters because
+    this is a privacy guard, not a display nicety.
+    """
+    chunks = Path(str(path).replace("\\", "/")).parts
     return "/".join(chunks[-parts:])
 
 
 def safe_lib_name(entry: str) -> str:
-    """A soname as it is; a directory as its last few components."""
-    return short_path(entry) if Path(entry).is_absolute() else entry
+    """A soname as it is; a directory as its last few components.
+
+    Deliberately not `Path(entry).is_absolute()`: on Windows a rooted but
+    driveless path such as `/home/somebody/site-packages/...` is *not* absolute,
+    so a POSIX path reaching a Windows process slipped through this guard
+    unreduced. Anything containing a separator is treated as a path.
+    """
+    if "/" in entry or "\\" in entry:
+        return short_path(entry)
+    return entry
 
 
 def _environ() -> MutableMapping[str, str]:

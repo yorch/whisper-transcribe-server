@@ -24,8 +24,15 @@ import pytest
 ROOT = Path(__file__).resolve().parent.parent
 SCRIPT = ROOT / "scripts" / "git-sync.sh"
 GIT = shutil.which("git")
+# The guard is a bash script, so exercising it needs bash. Windows runners have
+# neither /bin/bash nor a bash on PATH, and skipping is the honest outcome there
+# rather than a failure that says nothing about the script.
+BASH = shutil.which("bash") or ("/bin/bash" if Path("/bin/bash").exists() else None)
 
-pytestmark = pytest.mark.skipif(GIT is None, reason="git is not installed")
+pytestmark = pytest.mark.skipif(
+    GIT is None or BASH is None,
+    reason="the guard is a bash script; git and bash are both required",
+)
 
 
 def git_bin() -> str:
@@ -111,8 +118,9 @@ class Guard:
         git(self.work, "remote", "set-url", "origin", "/nonexistent/nowhere.git")
 
     def guard(self, *args: str, env: dict[str, str] | None = None):
+        assert BASH is not None
         return run(
-            ["/bin/bash", str(self.work / "scripts" / "git-sync.sh"), *args],
+            [BASH, str(self.work / "scripts" / "git-sync.sh"), *args],
             self.work,
             env or clean_env(),
         )
