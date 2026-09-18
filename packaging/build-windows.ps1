@@ -87,8 +87,14 @@ Step ("Built {0:N0} MB -> {1}" -f $size, $dist)
 # way to catch a broken bundle before it reaches a user.
 
 Step "Running the launcher self-test from the bundle"
-& $exe --self-test
-if ($LASTEXITCODE -ne 0) { throw "Bundled launcher failed its self-test" }
+# Start-Process -Wait, not `&`: the bundle is built console=False, which makes
+# it a GUI-subsystem binary, and PowerShell does not wait for those. `& $exe`
+# returned immediately and left $LASTEXITCODE stale, so the check below was
+# vacuous — it reported success while the exe was still starting.
+$selfTest = Start-Process -FilePath $exe -ArgumentList "--self-test" -Wait -PassThru
+$reportPath = Join-Path $env:LOCALAPPDATA "TranscriptionServer\self-test.log"
+if (Test-Path $reportPath) { Get-Content $reportPath }
+if ($selfTest.ExitCode -ne 0) { throw "Bundled launcher failed its self-test" }
 
 # The pages are files now, so a bundle that forgot static/ would serve 500s.
 # The pages are files now, so a bundle that forgot static/ would serve 500s.

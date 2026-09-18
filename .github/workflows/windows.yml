@@ -59,7 +59,9 @@ jobs:
       - name: Run the suite
         # The UI tests shell out to node, which the runner already has; they
         # skip themselves if it is missing rather than failing.
-        run: uv run --no-project --python ${{ env.PYTHON }} ${{ env.DEPS }} pytest tests/ -q
+        run: |
+          uv run --no-project --python ${{ env.PYTHON }} `
+            ${{ env.DEPS }} pytest tests/ -q
 
       - name: Lint
         run: uvx ruff check . --output-format github
@@ -91,7 +93,9 @@ jobs:
       - name: Build (and build the installer)
         # Vendors uv.exe + ffmpeg, runs PyInstaller, runs the launcher's
         # self-test against the bundle, checks static/ shipped, then ISCC.
-        run: pwsh -File packaging/build-windows.ps1 -Installer -Python ${{ env.PYTHON }}
+        run: |
+          pwsh -File packaging/build-windows.ps1 -Installer `
+            -Python ${{ env.PYTHON }}
 
       - name: Self-test the bundle, including a real server
         # Proves the launcher can start the server through uv and poll it, which
@@ -99,22 +103,31 @@ jobs:
         # its console output is not reliably captured: read the report it writes
         # instead of trusting an exit code.
         run: |
-          $report = Join-Path $env:LOCALAPPDATA "TranscriptionServer\self-test.log"
+          $exe = "dist\TranscriptionServer\Transcription Server.exe"
+          $report = Join-Path $env:LOCALAPPDATA `
+            "TranscriptionServer\self-test.log"
           # Delete it first. A stale report from an earlier run reads like a
           # pass and hides the failure it was meant to explain.
           Remove-Item $report -ErrorAction SilentlyContinue
 
-          & "dist\TranscriptionServer\Transcription Server.exe" --self-test --with-server
-          $code = $LASTEXITCODE
+          # Start-Process -Wait, not `&`: the bundle is built console=False, so
+          # it is a GUI-subsystem binary and PowerShell does not wait for those.
+          # `& $exe` returned immediately, left $LASTEXITCODE stale, and made
+          # the checks below meaningless.
+          $proc = Start-Process -FilePath $exe `
+            -ArgumentList "--self-test", "--with-server" -Wait -PassThru
 
           if (-not (Test-Path $report)) {
             throw "the self-test wrote no report; the run cannot be trusted"
           }
           Get-Content $report
-          if (-not (Select-String -Path $report -Pattern "readiness probe" -Quiet)) {
+          if (-not (Select-String -Path $report `
+                    -Pattern "readiness probe" -Quiet)) {
             throw "the report has no readiness probe; --with-server did not run"
           }
-          if ($code -ne 0) { throw "bundled launcher self-test failed" }
+          if ($proc.ExitCode -ne 0) {
+            throw "bundled launcher self-test failed"
+          }
         timeout-minutes: 15
 
       - name: Report what was produced
