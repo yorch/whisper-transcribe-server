@@ -375,7 +375,9 @@ def test_audit_failure_is_reported_and_not_fatal(tmp_path, monkeypatch):
     """A broken audit sink must never break a request, but must be visible."""
     log = s.AuditLog(tmp_path / "audit", enabled=True, retain_days=30, prompts=True)
     monkeypatch.setattr(
-        s.AuditLog, "_rotate", lambda self, day: (_ for _ in ()).throw(OSError("disk full"))
+        s.AuditLog,
+        "_rotate",
+        lambda self, day: (_ for _ in ()).throw(OSError("disk full")),
     )
     log.emit("job.created", job="x")  # must not raise
     assert log.last_error is not None and "disk full" in log.last_error
@@ -496,13 +498,13 @@ def test_work_dir_flag_moves_the_default_config_path(tmp_path, monkeypatch):
 @pytest.mark.parametrize(
     "body,needle",
     [
-        ('[server]\nport = 99999\n', "port"),
-        ('[server]\nport = 0\n', "port"),
+        ("[server]\nport = 99999\n", "port"),
+        ("[server]\nport = 0\n", "port"),
         ('[model]\nmodel = "gigantic"\n', "not one of"),
-        ('[audit]\nnonsense = 1\n', "unknown option"),
-        ('[limits]\nmax_upload_mb = 0\n', "at least 1"),
-        ('[limits]\nmax_queue = 0\n', "at least 1"),
-        ('[limits]\nmax_jobs = -1\n', "negative"),
+        ("[audit]\nnonsense = 1\n", "unknown option"),
+        ("[limits]\nmax_upload_mb = 0\n", "at least 1"),
+        ("[limits]\nmax_queue = 0\n", "at least 1"),
+        ("[limits]\nmax_jobs = -1\n", "negative"),
     ],
 )
 def test_invalid_config_is_rejected(tmp_path, body, needle):
@@ -515,7 +517,7 @@ def test_invalid_config_is_rejected(tmp_path, body, needle):
 
 def test_unknown_config_key_is_fatal(tmp_path):
     cfg = tmp_path / "typo.toml"
-    cfg.write_text('[server]\nprot = 1234\n')
+    cfg.write_text("[server]\nprot = 1234\n")
     with pytest.raises(SystemExit):
         s.resolve_args(["--config", str(cfg)])
 
@@ -620,7 +622,9 @@ def test_render_formats_are_numbered_per_export(configured):
 def test_new_job_survives_a_missing_source(configured):
     """A retry can race an eviction that already unlinked the source."""
     missing = Path(s.UPLOAD_DIR) / "gone.wav"
-    opts = s.build_opts(None, None, "", "true", "fast", "", "", "false", "false", "false", 2000, 400)
+    opts = s.build_opts(
+        None, None, "", "true", "fast", "", "", "false", "false", "false", 2000, 400
+    )
     job_id = s.new_job("gone.wav", missing, opts)
     assert s.JOBS[job_id]["size"] == 0
 
