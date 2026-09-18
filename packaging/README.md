@@ -117,3 +117,20 @@ Being explicit about what has and has not been exercised:
   antivirus products flag PyInstaller output. Signing needs a certificate.
 - **No auto-update.** Rebuild and reinstall to update, which also refreshes the
   vendored ffmpeg.
+
+## Installer trade-off: per-machine vs per-user
+
+The default install is machine-wide because the firewall rule needs elevation.
+That has one consequence worth knowing: the optional "start when I sign in"
+shortcut goes to `{userstartup}`, which under an admin install belongs to the
+account that approved the elevation — not necessarily the account that will use
+the app.
+
+`PrivilegesRequiredOverridesAllowed=dialog` is set, so you can pick a per-user
+install instead. Then the shortcut lands in your own profile and the firewall
+rule is skipped; add it yourself if other devices need to reach the server:
+
+```powershell
+New-NetFirewallRule -DisplayName "Transcription Server" -Direction Inbound `
+  -Protocol TCP -LocalPort 8765 -Action Allow -Profile Private
+```
