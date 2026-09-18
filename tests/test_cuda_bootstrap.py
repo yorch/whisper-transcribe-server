@@ -90,7 +90,15 @@ def test_site_package_dirs_finds_the_running_environment():
     dirs = s.site_package_dirs()
     assert dirs, "expected at least one site-packages for this interpreter"
     assert all(d.is_dir() for d in dirs)
-    assert all(d.name in ("site-packages", "dist-packages") for d in dirs)
+
+    # The property that matters is functional: wherever this interpreter's
+    # installed packages actually live has to be in the list. Asserting the leaf
+    # name is not enough — uv's ephemeral environments are not laid out like a
+    # normal prefix, which is exactly what the Windows runner showed.
+    import fastapi
+
+    installed = Path(fastapi.__file__).resolve().parent.parent
+    assert installed in [d.resolve() for d in dirs], f"{installed} not in {dirs}"
 
 
 def test_nvidia_lib_dirs_finds_the_wheel_layout(tmp_path):
