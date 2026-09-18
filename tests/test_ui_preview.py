@@ -560,6 +560,30 @@ def test_cards_are_newest_first_on_load_and_after_a_new_upload():
 
 
 @needs_node
+def test_a_relabellable_job_offers_relabel_and_says_which_job():
+    """Offered only when the server says the request would be accepted, and
+    carrying the job id the click handler posts to."""
+    probe = card_probe(
+        """
+        const flat = (node) => node.children.flatMap(kid =>
+          kid.className === "save-group" ? flat(kid)
+          : kid.className === "save-label" ? [] : [kid]);
+        const done = (id, can) => ({id, filename: "x", state: "done", opts: {model: "m"},
+          segments: [], segment_count: 0, elapsed: 4, duration: 4, language: "en",
+          can_relabel: can});
+        render(done("yes", true));
+        render(done("no", false));
+        const read = (id) => flat(views.get(viewKey(id)).actions)
+          .map(b => [b.textContent, JSON.stringify(b.dataset)]);
+        return {yes: read("yes"), no: read("no")};
+        """
+    )
+    relabel = [row for row in probe["yes"] if row[0] == "Relabel speakers"]
+    assert relabel and json.loads(relabel[0][1]) == {"relabel": "yes"}
+    assert all(row[0] != "Relabel speakers" for row in probe["no"])
+
+
+@needs_node
 def test_a_running_job_keeps_its_cancel_button_between_polls():
     """The action buttons were rebuilt on every render, which for a running job
     is every poll. A click whose press and release straddled a poll landed on

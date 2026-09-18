@@ -417,6 +417,14 @@ hour-long recording.
   merge people or split one person in two. `Speaker 2` appearing for a single
   line is usually the diarizer being unsure, not a new person.
 
+  **Got the count wrong?** Set Speakers to the right number and press
+  **Relabel speakers** on the finished card. It runs only the speaker pass
+  again, over the transcript the job already has — no model load, no
+  re-transcription — and the result arrives as a new card, the old one left as
+  it was. It needs the job's word timings (Identify speakers turns them on) and
+  its audio still on disk; otherwise use **Retry**. A pinned count is taken
+  literally: pin one too many and a real voice gets split in two.
+
   The labels ride along in every export: `Speaker 1: ...` in `.txt` and `.srt`,
   `<v Speaker 1>` in `.vtt`, and a `speaker` field per segment plus a `speakers`
   totals block in `.json`. If the diarization pass fails, the transcript still

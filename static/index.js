@@ -661,6 +661,12 @@ function actions(node, job){
        the tooltip, where it has room to be exact. */
     add(node, "Retry", {retry: job.id}).title =
       "Run this audio again with the controls as they are set now";
+  /* The cheap fix for a wrong speaker count: only the speaker pass runs again,
+     over the transcript this job already has. */
+  if(job.can_relabel)
+    add(node, "Relabel speakers", {relabel: job.id}).title =
+      "Identify the speakers again using the Speakers count above, without "
+      + "transcribing again";
   const live = ["queued","loading","running"].includes(job.state);
   /* A finished transcript lives only in the server's memory, so Remove is the
      one click that loses it for good: it asks twice. */
@@ -699,7 +705,7 @@ function render(job){
   /* Rebuilt only when the set of buttons changes. A running job renders every
      poll, and a fresh Cancel under the pointer each time ate any click whose
      press and release straddled a poll, and threw keyboard focus off it. */
-  const shape = job.state + ":" + !!(RETRY_OK && job.can_retry);
+  const shape = job.state + ":" + !!(RETRY_OK && job.can_retry) + ":" + !!job.can_relabel;
   if(view.actionShape !== shape){
     view.actionShape = shape;
     actions(view.actions, job);
@@ -771,6 +777,20 @@ el("jobs").addEventListener("click", async (e) => {
         alert("Retry failed: " + detail);
         b.disabled = false;
       }
+      await tick();
+    }
+    if(b.dataset.relabel){
+      b.disabled = true;
+      const fd = new FormData();
+      fd.append("speakers", el("speakers").value || "0");
+      const r = await api("/api/jobs/" + encodeURIComponent(b.dataset.relabel)
+                          + "/speakers", {method:"POST", body:fd});
+      if(!r.ok){
+        let detail = r.statusText;
+        try{ detail = (await r.json()).detail || detail; }catch{}
+        alert("Relabel failed: " + detail);
+      }
+      b.disabled = false;
       await tick();
     }
     if(b.dataset.del){
