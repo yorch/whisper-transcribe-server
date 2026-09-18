@@ -82,6 +82,12 @@
       <label class="field" id="speakers-field">Speakers
         <select id="speakers"><option value="0" selected>Auto</option></select>
       </label>
+      <!-- Shown only when the server lets jobs choose; the models are measured
+           against each other in docs/speaker-diarization.md, section 10. -->
+      <label class="field locked" id="speaker-model-field"
+             title="The model that tells voices apart. Relabel with the other one to compare.">Voice model
+        <select id="speaker-model"></select>
+      </label>
     </div>
 
     <details class="advanced">

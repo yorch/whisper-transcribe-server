@@ -112,6 +112,11 @@ async function refreshStatus(){
       // appears if the operator explicitly opened it up.
       if(s.allow_precision_choice) el("compute-field").classList.remove("locked");
       fillSpeakers(s.diarize_max_speakers);
+      SPEAKER_MODEL_DEFAULT = s.default_speaker_model || "";
+      if(DIARIZE_OK && s.allow_speaker_model_choice){
+        fill("speaker-model", s.speaker_models || [], s.default_speaker_model);
+        el("speaker-model-field").classList.remove("locked");
+      }
       if(!DIARIZE_OK){
         el("diarize").checked = false;
         for(const id of ["diarize-field", "speakers-field", "diarize-hint"])
@@ -137,6 +142,7 @@ async function refreshStatus(){
 
 /* ---------- upload ---------- */
 let MAX_MB = 0, RETRY_OK = true, POPULATED = false, DIARIZE_OK = false;
+let SPEAKER_MODEL_DEFAULT = "";
 
 /* Auto, then every count the server accepts. A pure list so the choices can be
    tested without a browser; fillSpeakers() only turns it into options. */
@@ -184,6 +190,8 @@ function currentSettings(){
   fd.append("word_timestamps", el("words").checked ? "true" : "false");
   fd.append("diarize", (DIARIZE_OK && el("diarize").checked) ? "true" : "false");
   fd.append("speakers", el("speakers").value || "0");
+  // Empty when the server pins the model: the server then uses its own.
+  fd.append("speaker_model", el("speaker-model").value || "");
   fd.append("min_silence_ms", el("min-silence").value || "2000");
   fd.append("speech_pad_ms", el("speech-pad").value || "400");
   return fd;
@@ -394,6 +402,7 @@ function syncDiarize(){
   el("words").title = on ? "Required for speaker labels" : "";
   // A count for labels nobody asked for would read as a setting that applies.
   el("speakers").disabled = !el("diarize").checked;
+  el("speaker-model").disabled = !el("diarize").checked;
 }
 el("diarize").addEventListener("change", syncDiarize);
 /* Deliberately not called here: DIARIZE_OK is only known once /api/status has
@@ -483,6 +492,9 @@ function jobTags(job){
     .map(s => s.speaker).filter(v => v != null));
   if(o.diarize && found.size)
     bits.push(found.size + (found.size === 1 ? " speaker" : " speakers"));
+  // Off-default only, like the other tags: the default model goes unsaid.
+  if(o.diarize && o.speaker_model && o.speaker_model !== SPEAKER_MODEL_DEFAULT)
+    bits.push(o.speaker_model);
   if(job.duration) bits.push(fmtTime(job.duration));
   return bits.join(" \u00b7 ");
 }
@@ -748,8 +760,8 @@ function actions(node, job){
      over the transcript this job already has. */
   if(job.can_relabel)
     add(node, "Relabel speakers", {relabel: job.id}).title =
-      "Identify the speakers again using the Speakers count above, without "
-      + "transcribing again";
+      "Identify the speakers again using the Speakers count and Voice model "
+      + "above, without transcribing again";
   const live = ["queued","loading","running"].includes(job.state);
   /* A finished transcript lives only in the server's memory, so Remove is the
      one click that loses it for good: it asks twice. */
@@ -917,6 +929,7 @@ el("jobs").addEventListener("click", async (e) => {
       b.disabled = true;
       const fd = new FormData();
       fd.append("speakers", el("speakers").value || "0");
+      fd.append("speaker_model", el("speaker-model").value || "");
       const r = await api("/api/jobs/" + encodeURIComponent(b.dataset.relabel)
                           + "/speakers", {method:"POST", body:fd});
       if(!r.ok){

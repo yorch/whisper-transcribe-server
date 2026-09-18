@@ -153,6 +153,7 @@ CARD_HARNESS = """
 const TICKS = 40;
 const views = new Map();
 const RETRY_OK = true;
+const SPEAKER_MODEL_DEFAULT = "titanet-small";
 const jobsBox = {children: [], prepend: (kid) => { jobsBox.children.unshift(kid); }};
 const domIds = new Map();
 function makeNode(){
@@ -632,6 +633,35 @@ def test_named_speakers_are_named_in_the_transcript():
 
 
 @needs_node
+def test_the_card_names_a_voice_model_only_when_it_is_not_the_default():
+    probe = card_probe(
+        """
+        const tags = (model) => jobTags({opts: {model: "base", diarize: true,
+          speaker_model: model}, segments: [{speaker: 1}, {speaker: 2}]});
+        return {plain: tags("titanet-small"), other: tags("eres2net-en")};
+        """
+    )
+    assert probe["plain"] == "base \u00b7 2 speakers"
+    assert probe["other"] == "base \u00b7 2 speakers \u00b7 eres2net-en"
+
+
+@needs_node
+def test_the_voice_model_is_disabled_while_labels_are_off():
+    probe = control_probe(
+        """
+        DIARIZE_OK = true; controls.diarize.checked = false; syncDiarize();
+        return controls["speaker-model"].disabled;
+        """
+    )
+    assert probe is True
+
+
+def test_the_voice_model_ships_hidden_until_the_server_offers_it():
+    """A pinned server never shows it, and the page cannot know until status."""
+    assert re.search(r'class="field locked"[^>]*id="speaker-model-field"', page_html())
+
+
+@needs_node
 def test_a_finished_labelled_card_shows_a_chip_per_speaker():
     probe = card_probe(
         """
@@ -992,6 +1022,7 @@ const controls = {
   diarize: {checked: true},
   words: {checked: false, disabled: false, title: ""},
   speakers: {disabled: false},
+  "speaker-model": {disabled: false},
 };
 const el = (id) => controls[id];
 let DIARIZE_OK = false;

@@ -434,6 +434,13 @@ hour-long recording.
   measurements behind the defaults, and `scripts/diarize_eval.py` reruns them
   on your own recordings.
 
+  **Voice model** sits beside Speakers: the model that tells voices apart,
+  `titanet-small` (the default) or `eres2net-en`. Neither is better across the
+  board (section 10 of `docs/speaker-diarization.md` has the numbers), so the
+  practical use is a comparison — relabel a finished card with the other one
+  and keep whichever reads right. A card names its model when it is not the
+  default. The server can pin it with `--pin-diarization-embedding`.
+
   **Merge and name speakers on the card.** A finished, labelled card shows a
   chip per speaker with their talk time. Click one to give it a name — the
   transcript and every export then say `Alice:` instead of `Speaker 1:` — or to
