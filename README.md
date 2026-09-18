@@ -372,8 +372,14 @@ the TLS this server lacks on the LAN.
 
 ## Using it
 
-Drop one or more files on the intake panel. Whatever the controls say when you
-drop applies to that job.
+Drop one or more files on the intake panel. They are listed there and nothing
+starts yet: set the controls, then press **Transcribe**. The controls are read
+when you press it, not when you drop, so you can change the model or the speaker
+count after seeing which file you picked. Each staged row has a **Remove** in
+case you dropped the wrong one.
+
+An upload that fails puts the file back in the list, so a network blip costs you
+a second press rather than a second drag of an hour-long recording.
 
 **Main controls**
 
@@ -450,8 +456,8 @@ note where something was said. When a job completes you can copy the text or
 save `.txt`, timestamped `.txt`, `.srt`, `.vtt`, or `.json` (segment timings,
 word timings if requested, and the exact options used).
 
-Jobs run one at a time regardless of how many files you drop, so the GPU isn't
-fighting itself. Drop five files and walk away.
+Jobs run one at a time regardless of how many files you stage, so the GPU isn't
+fighting itself. Stage five files, press Transcribe, and walk away.
 
 ## A note on VRAM
 

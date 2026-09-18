@@ -68,6 +68,8 @@ def served_markup(page: str) -> str:
 # before this branch was rebased onto the diarization work:
 #   - #r-ffmpeg.bad, .offscreen: the inline-style removal above
 #   - .seg .sp*: main's speaker column, which landed while this branch was open
+#   - .staged*, .runbar, .run-note, #start*: files are staged and sent by a
+#     button now, instead of the drop starting the job on the spot
 INDEX_SELECTORS_ADDED = {
     "#r-ffmpeg.bad",
     ".offscreen",
@@ -75,6 +77,18 @@ INDEX_SELECTORS_ADDED = {
     ".seg .sp.s0",
     ".seg .sp.s1",
     ".seg .sp.s2",
+    "#start",
+    "#start:active",
+    "#start:disabled",
+    "#start:hover",
+    ".run-note",
+    ".runbar",
+    ".staged",
+    ".staged-name",
+    ".staged-row",
+    ".staged-row + .staged-row",
+    ".staged-size",
+    ".staged-x",
 }
 
 
@@ -288,6 +302,23 @@ def test_a_name_that_merely_collides_stays_per_page():
     assert ".wrap" not in selectors(asset("app.css"))
     assert ".wrap" in selectors(asset("index.css"))
     assert ".wrap" in selectors(asset("audit.css"))
+
+
+def test_locked_wins_against_the_rule_it_is_hiding():
+    """`.locked` is a one-word off switch and has to beat the rule the element
+    is styled by. A bare `.locked{display:none}` does not: `label.field` and
+    `.adv-row` are element selectors in index.css, which loads after app.css, so
+    the Precision field stayed visible on a server that pins precision and the
+    speaker row stayed visible on one started with --no-diarize."""
+    assert re.search(
+        r"\.locked\s*\{\s*display:\s*none\s*!important", asset("app.css")
+    ), ".locked must outrank the display rules it hides"
+
+    # The two the bug was visible on, pinned by name so the reason is on record.
+    html = asset("index.html")
+    assert re.search(r'class="field locked"[^>]*id="compute-field"', html)
+    assert re.search(r'class="adv-row"[^>]*id="diarize-row"', html)
+    assert re.search(r"\.adv-row\{[^}]*display:flex", asset("index.css"))
 
 
 # --------------------------------------------------------------------------- #

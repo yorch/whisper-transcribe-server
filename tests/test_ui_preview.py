@@ -101,8 +101,12 @@ const speakers = (rows) => rows.map(r => cell(r, "sp"));
 
 
 def function_source(name: str) -> str:
-    """One `function name(...) {...}` block, which is how the harness gets them."""
-    match = re.search(rf"function {name}\(.*?\n\}}", page_script(), re.S)
+    """One `function name(...) {...}` block, which is how the harness gets them.
+
+    The optional `async` matters: `startJobs` and `send` are async, and a
+    harness that took the body without the keyword would not parse.
+    """
+    match = re.search(rf"(?:async )?function {name}\(.*?\n\}}", page_script(), re.S)
     assert match, f"{name}() is gone from the page script"
     return match.group(0)
 
@@ -128,6 +132,76 @@ def preview_probe(body: str) -> dict:
         + "\n".join(
             function_source(name)
             for name in ("fmtStamp", "stick", "setPaused", "appendSegments")
+        )
+        + "\nprocess.stdout.write(JSON.stringify((() => {"
+        + body
+        + "})()));"
+    )
+    return json.loads(run_node(program))
+
+
+# A DOM big enough that createCard() and render() can really run: nodes record
+# their children, and only the transcript behaves like a scroll box, which is
+# what stick() reads. The jobs area is the one element looked up by id.
+CARD_HARNESS = """
+const TICKS = 40;
+const views = new Map();
+const RETRY_OK = true;
+const jobsBox = {children: [], prepend: (kid) => { jobsBox.children.unshift(kid); }};
+function makeNode(){
+  const node = {
+    className: "", id: "", title: "", dataset: {}, children: [],
+    isConnected: true, scrollHeight: 0, scrollTop: 0, clientHeight: 100,
+    _text: "",
+    append(...kids){
+      node.children.push(...kids);
+      if(node.className === "transcript") node.scrollHeight = node.children.length * 20;
+    },
+    prepend(kid){ node.children.unshift(kid); },
+    addEventListener(){},
+    classList: {add(){}, remove(){}, toggle(name, on){ if(name === "paused") node.paused = on; }},
+  };
+  // A browser drops the children when textContent is set, which is how
+  // renderStaged() redraws the list; the transcript also loses its scroll.
+  Object.defineProperty(node, "textContent", {
+    get(){ return node._text; },
+    set(value){
+      node._text = value;
+      node.children.length = 0;
+      if(node.className === "transcript"){ node.scrollHeight = 0; node.scrollTop = 0; }
+    },
+  });
+  return node;
+}
+const document = {
+  createElement: () => makeNode(),
+  getElementById: (id) => (id === "jobs" ? jobsBox : {checked: true}),
+};
+const el = (id) => document.getElementById(id);
+"""
+
+
+def card_probe(body: str) -> dict:
+    """Run `body` against the real card-building functions and a stub DOM."""
+    program = (
+        CARD_HARNESS
+        + "\n".join(
+            function_source(name)
+            for name in (
+                "viewKey",
+                "fmtStamp",
+                "fmtTime",
+                "meter",
+                "statusLine",
+                "jobTags",
+                "followOn",
+                "stick",
+                "setPaused",
+                "appendSegments",
+                "actions",
+                "createCard",
+                "render",
+            )
         )
         + "\nprocess.stdout.write(JSON.stringify((() => {"
         + body
@@ -167,12 +241,132 @@ def test_the_transcript_dom_survives_a_poll():
     """The point of the rewrite: no wholesale innerHTML on a live card."""
     script = page_script()
     assert "const views = new Map()" in script
-    assert "views.get(id)" in script, "render() must reuse the card it already built"
+    assert "views.get(viewKey(job.id))" in script, (
+        "render() must look up the card it already built"
+    )
     assert "view.transcript.append(row)" in script, "segments are appended, not rebuilt"
     assert "map(s => s.text).join" not in script, (
         "the preview must not collapse back into one run-on paragraph"
     )
-    assert "views.delete(stale)" in script, "a removed card must not be remembered"
+    assert "views.delete(viewKey(stale))" in script, (
+        "a removed card must not be remembered"
+    )
+
+
+def test_every_view_lookup_keys_the_map_the_same_way():
+    """The bug this pins: createCard() stored the card under the bare job id
+    while render() and tick() looked it up as "job-" + id, so every lookup
+    missed. render() then built a second card above the first on every progress
+    step — meter, transcript and all — while the full transcript came back over
+    the wire on every tick, and each stale card leaked out of the DOM for good
+    because the sweep removes one node per id."""
+    calls = re.findall(r"views\.(get|set|delete)\(([^)]*)\)", page_script())
+    assert sorted(name for name, _ in calls) == ["delete", "get", "get", "set"], calls
+    wrongly_keyed = [arg.strip() for _, arg in calls if "viewKey(" not in arg]
+    assert not wrongly_keyed, (
+        f"a view is keyed differently from the rest: {wrongly_keyed}"
+    )
+
+
+@needs_node
+def test_a_progress_step_reuses_the_card_instead_of_building_another_one():
+    """The regression, executed: two polls of the same running job must leave
+    exactly one card in the DOM, holding one meter and both segments."""
+    probe = card_probe(
+        """
+        const job = (extra) => Object.assign({
+          id: "abc", filename: "a.wav", state: "running", progress: 0.1,
+          elapsed: 5, duration: 60, segment_count: 1, speaker_labels: false,
+          opts: {model: "small"}, segments: [{start: 0, text: "one"}],
+        }, extra);
+        render(job());
+        const first = views.get(viewKey("abc"));
+        // The next poll sends only the tail, the way tick() asks for it.
+        render(job({progress: 0.4, elapsed: 20, segment_count: 2,
+                    segments: [{start: 1, text: "two"}]}));
+        const second = views.get(viewKey("abc"));
+        return {
+          cards: jobsBox.children.length,
+          remembered: views.size,
+          sameCard: first.node === second.node,
+          rows: first.transcript.children.length,
+          texts: first.transcript.children.map(r => r.children[2].textContent),
+          cells: first.meter.children.length,
+          lit: first.meter.children.filter(c => c.className === "lit").length,
+          name: first.name.textContent,
+          status: first.status.textContent,
+        };
+        """
+    )
+    assert probe["cards"] == 1, "a poll rebuilt the card instead of reusing it"
+    assert probe["remembered"] == 1
+    assert probe["sameCard"] is True
+    assert probe["rows"] == 2, "the tail was not appended to the same transcript"
+    assert probe["texts"] == ["one", "two"]
+    assert probe["cells"] == 40 and probe["lit"] == 16, probe["lit"]
+    assert probe["name"] == "a.wav"
+    assert probe["status"].startswith("40% \u00b7 2 segments"), probe["status"]
+
+
+@needs_node
+def test_a_filename_cannot_become_markup_in_the_card():
+    """The card is built as nodes, so the filename is a text node whatever it
+    contains: no escaping step to forget, and nothing for the transcript's own
+    textContent to leak either."""
+    probe = card_probe(
+        """
+        const nasty = '<img src=x onerror="alert(1)">';
+        render({id: "h", filename: nasty, state: "done", opts: {model: "small"},
+                segments: [{start: 0, text: nasty}], segment_count: 1,
+                elapsed: 3, duration: 3, language: "en"});
+        const view = views.get(viewKey("h"));
+        return {name: view.name.textContent, title: view.name.title,
+                row: view.transcript.children[0].children[2].textContent};
+        """
+    )
+    nasty = '<img src=x onerror="alert(1)">'
+    assert probe == {"name": nasty, "title": nasty, "row": nasty}
+    assert "innerHTML" not in function_source("render")
+    assert "innerHTML" not in function_source("createCard")
+
+
+@needs_node
+def test_the_actions_are_buttons_a_handler_can_read_back():
+    """The download/copy/retry/remove handlers read dataset, so the DOM builder
+    has to put the same keys there the markup string used to."""
+    probe = card_probe(
+        """
+        const buttons = (job) => {
+          const view = createCard(job);
+          render(job);
+          return view.actions.children.map(b => [b.textContent,
+            JSON.stringify(b.dataset), b.className]);
+        };
+        return {
+          done: buttons({id: "d", filename: "x", state: "done", opts: {model: "m"},
+                         segments: [], segment_count: 0, elapsed: 4, duration: 4,
+                         language: "en"}),
+          running: buttons({id: "r", filename: "x", state: "running", progress: 0.2,
+                            opts: {model: "m"}, segments: [], segment_count: 0}),
+        };
+        """
+    )
+    labels = [row[0] for row in probe["done"]]
+    assert labels == [
+        "Copy text",
+        "Save .txt",
+        "Save timestamped",
+        "Save .srt",
+        "Save .vtt",
+        "Save .json",
+        "Remove",
+    ], labels
+    assert json.loads(probe["done"][1][1]) == {"dl": "txt", "id": "d"}
+    assert json.loads(probe["done"][0][1]) == {"copy": "d"}
+    # A live job is cancelled, not removed, and the ghost class rides along.
+    assert [row[0] for row in probe["running"]] == ["Cancel"]
+    assert probe["running"][0][2] == "ghost"
+    assert json.loads(probe["running"][0][1]) == {"del": "r"}
 
 
 # --------------------------------------------------------------------------- #
@@ -654,6 +848,228 @@ def test_pausing_marks_the_preview_and_says_why():
     assert probe["paused"]["marks"] == ["paused"]
     assert "bottom" in probe["paused"]["title"]
     assert probe["marks"] == [] and probe["title"] == ""
+
+
+# --------------------------------------------------------------------------- #
+# Staging: a dropped file waits for the button
+# --------------------------------------------------------------------------- #
+
+# The staging functions run against a small DOM and stub collaborators, so the
+# state machine (what is staged, what the button says, what a failure does) is
+# executed rather than read.
+STAGE_HARNESS = """
+const nodes = {};
+function makeNode(tag){
+  const node = {
+    tag, className: "", id: "", textContent: "", title: "", dataset: {},
+    disabled: undefined, children: [], classes: new Set(), _text: "",
+    attributes: {},
+    append(...kids){ node.children.push(...kids); },
+    setAttribute(name, value){ node.attributes[name] = value; },
+    classList: {
+      add(name){ node.classes.add(name); },
+      remove(name){ node.classes.delete(name); },
+      toggle(name, on){ on ? node.classes.add(name) : node.classes.delete(name); },
+    },
+  };
+  // Setting textContent drops the children, as it does in a browser: that is
+  // what makes renderStaged() redraw the list rather than add to it.
+  Object.defineProperty(node, "textContent", {
+    get(){ return node._text; },
+    set(value){ node._text = value; node.children.length = 0; },
+  });
+  return node;
+}
+const document = {createElement: (tag) => makeNode(tag)};
+const el = (id) => nodes[id] || (nodes[id] = makeNode(id));
+let MAX_MB = 0;
+const staged = [];
+let alerts = [], uploaded = [], uploadFails = false;
+const alert = (message) => { alerts.push(message); };
+async function api(path){
+  uploaded.push(path);
+  return {ok: !uploadFails, statusText: "500",
+          json: async () => ({detail: "the server said no"})};
+}
+async function tick(){}
+function currentSettings(){ return new FormData(); }
+"""
+
+
+def stage_probe(body: str) -> dict:
+    """Run `body` against the real staging functions and the stub DOM.
+
+    `body` is an async function body: it may await startJobs(), which awaits
+    send().
+    """
+    program = (
+        STAGE_HARNESS
+        + "\n".join(
+            function_source(name)
+            for name in (
+                "fmtSize",
+                "startLabel",
+                "stageNote",
+                "renderStaged",
+                "stage",
+                "unstage",
+                "startJobs",
+                "send",
+            )
+        )
+        + "\n(async () => { process.stdout.write(JSON.stringify(await (async () => {"
+        + body
+        + "})())); })();"
+    )
+    return json.loads(run_node(program))
+
+
+def test_dropping_or_picking_a_file_stages_it_instead_of_transcribing_it():
+    """The change: a file waits for the button, because the controls above it
+    are read at press time and a wrong model used to cost a re-upload."""
+    script = page_script()
+    assert 'addEventListener("change", () => { stage([...picker.files]);' in script
+    assert (
+        'intake.addEventListener("drop", (e) => stage([...e.dataTransfer.files]))'
+        in script
+    )
+    assert 'el("start").addEventListener("click", startJobs)' in script
+    assert not re.search(r"\bsend\(\[", script), "only the button may upload"
+
+
+def test_the_page_ships_the_button_disabled_with_the_initial_note():
+    html = page_html()
+
+    assert re.search(r'id="start"[^>]*disabled', html), (
+        "nothing is staged on arrival, so the button starts disabled"
+    )
+    assert re.search(r'class="staged locked"', html), (
+        "the empty staged list starts hidden"
+    )
+    assert re.search(r'id="run-note"[^>]*>Drop a recording above', html)
+    # The controls are what the press reads, so the button belongs below them.
+    assert html.index('id="hotwords"') < html.index('id="start"'), (
+        "the button must sit after the controls it applies"
+    )
+
+
+@needs_node
+def test_the_staged_list_arms_the_button_and_matches_the_shipped_markup():
+    """The empty state renderStaged() produces has to equal the one in the
+    markup, or the label would change the moment the first file lands."""
+    html = page_html()
+
+    # What the markup ships, so renderStaged()'s empty state can be held to it.
+    start = re.search(r'id="start"[^>]*>([^<]*)<', html)
+    note = re.search(r'id="run-note"[^>]*>([^<]*)<', html)
+    assert start is not None, "the Start button is gone from the markup"
+    assert note is not None, "the note beside it is gone from the markup"
+
+    probe = stage_probe(
+        """
+        renderStaged();
+        const snapshot = () => ({
+          disabled: el("start").disabled,
+          label: el("start").textContent,
+          note: el("run-note").textContent,
+          rows: el("staged").children.length,
+          hidden: el("staged").classes.has("locked"),
+        });
+        const empty = snapshot();
+        stage([{name: "standup.wav", size: 1024},
+               {name: "demo.mkv", size: 1.5 * 1024 * 1024 * 1024}]);
+        const two = snapshot();
+        const names = el("staged").children.map(r => r.children[0].textContent);
+        const sizes = el("staged").children.map(r => r.children[1].textContent);
+        const removers = el("staged").children.map(r => r.children[2].textContent);
+        const keys = el("staged").children.map(r => r.children[2].dataset.unstage);
+        const labels = el("staged").children.map(
+          r => r.children[2].attributes["aria-label"]);
+        unstage(0);
+        return {empty, two, names, sizes, removers, keys, labels, after: snapshot(),
+                afterNames: el("staged").children.map(r => r.children[0].textContent)};
+        """
+    )
+    assert probe["empty"] == {
+        "disabled": True,
+        "label": start.group(1),
+        "note": note.group(1),
+        "rows": 0,
+        "hidden": True,
+    }
+    assert probe["empty"]["label"] == "Transcribe"
+    assert probe["empty"]["note"] == "Drop a recording above to get started."
+
+    assert probe["two"]["disabled"] is False
+    assert probe["two"]["label"] == "Transcribe 2 files"
+    assert probe["two"]["hidden"] is False
+    assert "read when you press Transcribe" in probe["two"]["note"], (
+        "the note has to say the controls apply at press time"
+    )
+    assert probe["names"] == ["standup.wav", "demo.mkv"]
+    assert probe["sizes"] == ["1 kB", "1.5 GB"]
+    assert probe["removers"] == ["Remove", "Remove"]
+    assert probe["keys"] == ["0", "1"], "a row must know which file it removes"
+    assert probe["labels"] == ["Remove standup.wav", "Remove demo.mkv"], (
+        "five buttons all named Remove are five identical names to a screen reader"
+    )
+
+    assert probe["after"]["rows"] == 1
+    assert probe["after"]["label"] == "Transcribe", "one file left is still one file"
+    assert probe["afterNames"] == ["demo.mkv"]
+
+
+@needs_node
+def test_a_file_over_the_limit_is_refused_when_it_is_staged():
+    """Refusing at press time would mean uploading a gigabyte to be told no."""
+    probe = stage_probe(
+        """
+        MAX_MB = 10;
+        stage([{name: "huge.wav", size: 20 * 1024 * 1024},
+               {name: "fine.wav", size: 5 * 1024 * 1024}]);
+        return {alerts, names: el("staged").children.map(r => r.children[0].textContent)};
+        """
+    )
+    assert probe["alerts"] == ["huge.wav is larger than the 10 MB limit."]
+    assert probe["names"] == ["fine.wav"]
+
+
+@needs_node
+def test_pressing_the_button_sends_what_was_staged_and_clears_it():
+    probe = stage_probe(
+        """
+        stage([{name: "a.wav", size: 10}, {name: "b.wav", size: 10}]);
+        await startJobs();
+        await startJobs();   // nothing staged now: a second press is a no-op
+        return {uploaded, rows: el("staged").children.length,
+                disabled: el("start").disabled, alerts};
+        """
+    )
+    assert probe["uploaded"] == ["/api/jobs", "/api/jobs"]
+    assert probe["rows"] == 0
+    assert probe["disabled"] is True, "an empty staging list disarms the button"
+    assert probe["alerts"] == []
+
+
+@needs_node
+def test_a_failed_upload_goes_back_to_the_staging_list_in_order():
+    """The point of staging: a blip costs a press, not a re-pick of an
+    hour-long recording."""
+    probe = stage_probe(
+        """
+        uploadFails = true;
+        stage([{name: "a.wav", size: 10}, {name: "b.wav", size: 10}]);
+        await startJobs();
+        return {alerts, disabled: el("start").disabled,
+                names: el("staged").children.map(r => r.children[0].textContent)};
+        """
+    )
+    assert probe["alerts"] == [
+        "Upload failed for a.wav: the server said no",
+        "Upload failed for b.wav: the server said no",
+    ]
+    assert probe["names"] == ["a.wav", "b.wav"], "staged order survives a failure"
+    assert probe["disabled"] is False, "there is something to retry"
 
 
 # --------------------------------------------------------------------------- #

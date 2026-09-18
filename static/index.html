@@ -20,8 +20,8 @@
   </div>
 
   <h1>Transcribe audio on the workstation</h1>
-  <p class="sub">Drop a recording here and it runs through Whisper on the GPU in this
-  machine. Nothing leaves the network.</p>
+  <p class="sub">Drop a recording here, set the controls, then press Transcribe. It
+  runs through Whisper on the GPU in this machine, and nothing leaves the network.</p>
 
   <div class="gate locked" id="gate">
     <p>This server needs an access token. It was printed in the terminal when the
@@ -42,6 +42,8 @@
       <input type="file" id="picker" multiple
              accept="audio/*,video/*,.m4a,.mp3,.wav,.mp4,.mov,.mkv,.flac,.ogg,.opus,.webm">
     </div>
+
+    <div class="staged locked" id="staged" aria-live="polite"></div>
 
     <div class="controls">
       <label class="field">Model
@@ -122,6 +124,11 @@
         </div>
       </div>
     </details>
+
+    <div class="runbar">
+      <button id="start" type="button" disabled>Transcribe</button>
+      <p class="run-note" id="run-note">Drop a recording above to get started.</p>
+    </div>
 
     <div id="jobs"></div>
     <p class="empty" id="empty">No jobs yet.</p>

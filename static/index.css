@@ -82,6 +82,67 @@
   input[type=file]{display:none}
 
 
+  /* What has been dropped and not yet sent. */
+  .staged{
+    margin-top:12px;
+    border:1px solid var(--panel-lo);
+    border-radius:3px;
+    background:rgba(255,255,255,.5);
+    padding:6px 12px;
+  }
+
+  .staged-row{display:flex;align-items:baseline;gap:12px;padding:5px 0}
+
+  .staged-row + .staged-row{border-top:1px solid var(--panel-lo)}
+
+  .staged-name{
+    flex:1;min-width:0;
+    overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+    font-size:14px;
+  }
+
+  .staged-size{
+    flex:0 0 auto;color:var(--muted);
+    font-family:var(--display);font-size:12.5px;font-variant-numeric:tabular-nums;
+  }
+
+  .staged-x{padding:3px 9px;font-size:12px}
+
+
+  /* The one primary action on the page, so the one thing that is not grey.
+     It sits below the controls on purpose: they are read at press time, and
+     the layout should say so. Disabled until something is staged. */
+  .runbar{
+    margin-top:18px;
+    display:flex;flex-wrap:wrap;align-items:center;gap:8px 16px;
+    border-top:1px solid var(--panel-lo);
+    padding-top:14px;
+  }
+
+  .run-note{margin:0;color:var(--muted);font-size:13px;flex:1;min-width:220px}
+
+  #start{
+    font-family:var(--display);
+    font-size:14px;
+    padding:8px 20px;
+    color:#fff;
+    background:linear-gradient(180deg,#c66d16,var(--amber));
+    border-color:#8f4a0c;
+  }
+
+  #start:hover{background:linear-gradient(180deg,#d1781d,#c26711)}
+
+  #start:active{background:#a8580d}
+
+  /* After the hover and active rules: a disabled button must not light up. */
+  #start:disabled{
+    color:var(--muted);
+    background:linear-gradient(180deg,#eef0f2,#dcdfe3);
+    border-color:#b6bcc3;
+    cursor:default;
+  }
+
+
   .controls{
     margin-top:14px;
     display:flex;

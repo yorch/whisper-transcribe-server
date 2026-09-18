@@ -70,4 +70,9 @@
 
   button.ghost:hover{background:rgba(0,0,0,.05);color:var(--ink)}
 
-  .locked{display:none}
+  /* The off switch for a control this server does not offer. It has to win
+     against the rule the element is styled by — `label.field{display:flex}`,
+     `.adv-row{display:flex}`, `.hint{display:block}` — and those are element
+     selectors in a later stylesheet, so a bare `.locked{display:none}` loses to
+     them and the Precision field and the speaker row stayed on screen. */
+  .locked{display:none!important}

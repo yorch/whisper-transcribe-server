@@ -28,7 +28,7 @@ async function submitToken(){
     el("gate").classList.add("locked");
     el("gate-token").value = "";
     await boot();
-  }catch(e){
+  }catch{
     el("gate-err").classList.remove("locked");
   }
 }
@@ -170,35 +170,138 @@ intake.addEventListener("click", () => picker.click());
 intake.addEventListener("keydown", (e) => {
   if(e.key === "Enter" || e.key === " "){ e.preventDefault(); picker.click(); }
 });
-picker.addEventListener("change", () => { send([...picker.files]); picker.value = ""; });
+picker.addEventListener("change", () => { stage([...picker.files]); picker.value = ""; });
 
 for(const ev of ["dragenter","dragover"])
   intake.addEventListener(ev, (e) => { e.preventDefault(); intake.classList.add("hot"); });
 for(const ev of ["dragleave","drop"])
   intake.addEventListener(ev, (e) => { e.preventDefault(); intake.classList.remove("hot"); });
-intake.addEventListener("drop", (e) => send([...e.dataTransfer.files]));
+intake.addEventListener("drop", (e) => stage([...e.dataTransfer.files]));
 document.addEventListener("dragover", (e) => e.preventDefault());
 document.addEventListener("drop", (e) => e.preventDefault());
 
-async function send(files){
-  for(const f of files){
-    if(MAX_MB && f.size > MAX_MB * 1024 * 1024){
-      alert(f.name + " is larger than the " + MAX_MB + " MB limit.");
+/* ---------- staging ---------- */
+/* A dropped file is held, not sent: the controls below are read when Transcribe
+   is pressed, so a recording survives a change of mind about the model, the
+   language or the speaker count. Dropping used to start the job on the spot,
+   which made a wrong setting cost a re-upload. */
+const staged = [];
+
+function fmtSize(bytes){
+  const units = ["B", "kB", "MB", "GB"];
+  let n = Number(bytes) || 0, i = 0;
+  while(n >= 1024 && i < units.length - 1){ n /= 1024; i++; }
+  // Whole units up to kB, one decimal from MB up: "312 kB", "1.4 GB".
+  return `${i >= 2 ? n.toFixed(1) : Math.round(n)} ${units[i]}`;
+}
+
+function startLabel(count){
+  return count > 1 ? `Transcribe ${count} files` : "Transcribe";
+}
+
+/* Says out loud what the button does, so the controls above it read as input to
+   the press rather than as something already applied. */
+function stageNote(count){
+  if(!count) return "Drop a recording above to get started.";
+  const what = count === 1 ? "1 file" : `${count} files`;
+  return `${what} staged \u00b7 the controls above are read when you press Transcribe.`;
+}
+
+/* One row per staged file. Built with createElement and textContent: a filename
+   is whatever the operator's filesystem said, and this path never touches
+   innerHTML, so there is nothing here to escape. */
+function renderStaged(){
+  const box = el("staged");
+  box.textContent = "";
+  box.classList.toggle("locked", staged.length === 0);
+  el("start").disabled = staged.length === 0;
+  el("start").textContent = startLabel(staged.length);
+  el("run-note").textContent = stageNote(staged.length);
+  staged.forEach((file, index) => {
+    const row = document.createElement("div");
+    row.className = "staged-row";
+    const name = document.createElement("span");
+    name.className = "staged-name";
+    name.textContent = file.name;
+    name.title = file.name;
+    const size = document.createElement("span");
+    size.className = "staged-size";
+    size.textContent = fmtSize(file.size);
+    const drop = document.createElement("button");
+    drop.className = "ghost staged-x";
+    drop.type = "button";
+    drop.textContent = "Remove";
+    drop.dataset.unstage = String(index);
+    drop.title = `Remove ${file.name}`;
+    // Five buttons all called "Remove" are five identical names to a screen
+    // reader; the label is what tells them apart.
+    drop.setAttribute("aria-label", `Remove ${file.name}`);
+    row.append(name, size, drop);
+    box.append(row);
+  });
+}
+
+function stage(files){
+  for(const file of files){
+    if(MAX_MB && file.size > MAX_MB * 1024 * 1024){
+      alert(`${file.name} is larger than the ${MAX_MB} MB limit.`);
       continue;
     }
-    const fd = currentSettings();
-    fd.append("file", f);
+    staged.push(file);
+  }
+  renderStaged();
+}
+
+function unstage(index){
+  staged.splice(index, 1);
+  renderStaged();
+}
+
+el("staged").addEventListener("click", (e) => {
+  const button = e.target.closest("button[data-unstage]");
+  if(button) unstage(Number(button.dataset.unstage));
+});
+
+el("start").addEventListener("click", startJobs);
+
+/* Upload everything staged under the controls as they are right now. Reached
+   only from the button: nothing else sends a file. */
+async function startJobs(){
+  if(!staged.length) return;
+  const files = staged.splice(0, staged.length);
+  renderStaged();
+  await send(files);
+}
+
+async function send(files){
+  for(const f of files){
+    /* Set once the server has taken the file. A failure after that — the poll
+       that follows an upload — must not put it back: the job is already queued,
+       and retrying would run the same audio twice. */
+    let accepted = false;
     try{
+      const fd = currentSettings();
+      fd.append("file", f);
       const r = await api("/api/jobs", {method:"POST", body:fd});
       if(!r.ok){
         let detail = r.statusText;
-        try{ detail = (await r.json()).detail || detail; }catch(_){}
+        try{ detail = (await r.json()).detail || detail; }catch{}
         throw new Error(detail);
       }
       await r.json();
+      accepted = true;
       await tick();
     }catch(err){
-      if(err.message !== "unauthorised") alert("Upload failed for " + f.name + ": " + err.message);
+      if(accepted) continue;
+      if(err.message !== "unauthorised")
+        alert(`Upload failed for ${f.name}: ${err.message}`);
+      /* Put it back — including after a 401, where the gate swallows the
+         message. The file is still in the picker, but re-picking an hour of
+         audio because the network blipped is how a page stops being used.
+         push(), not unshift(): a run of failures comes back in the order it was
+         staged, so pressing Transcribe again retries them in that order. */
+      staged.push(f);
+      renderStaged();
     }
   }
 }
@@ -236,7 +339,7 @@ el("diarize").addEventListener("change", syncDiarize);
    session: a switch that quietly comes back on after every reload is worse
    than not having one. */
 const FOLLOW_KEY = "follow";
-try{ el("follow").checked = sessionStorage.getItem(FOLLOW_KEY) !== "0"; }catch(_){}
+try{ el("follow").checked = sessionStorage.getItem(FOLLOW_KEY) !== "0"; }catch{}
 el("follow").addEventListener("change", () => setFollow(el("follow").checked));
 
 /* ---------- rendering ---------- */
@@ -247,12 +350,26 @@ const known = new Map();
    this used to do) threw away the scroll position and any selection. */
 const views = new Map();
 
-function meter(job){
+/* The one key for that map. Every lookup has to agree on it: createCard()
+   stored by the bare job id while render() and tick() asked for "job-" + id, so
+   every lookup missed, render() built a second card per progress step — meter,
+   transcript and all — and the full transcript came back over the wire on every
+   tick. One function means the next call site cannot pick a different spelling. */
+function viewKey(id){
+  return `job-${id}`;
+}
+
+/* The meter is 40 cells, and it is repainted on every poll: the cells are built
+   once with the card and only re-classed afterwards, so a running job does not
+   hand the collector 40 elements per tick. */
+function meter(node, job){
   const lit = Math.round((job.progress || 0) * TICKS);
   const cls = job.state === "done" ? "done" : job.state === "error" ? "fail" : "lit";
-  let html = '<div class="meter">';
-  for(let i=0;i<TICKS;i++) html += '<i class="' + (i<lit?cls:"") + '"></i>';
-  return html + "</div>";
+  if(node.children.length !== TICKS){
+    node.textContent = "";
+    for(let i=0;i<TICKS;i++) node.append(document.createElement("i"));
+  }
+  [...node.children].forEach((cell, i) => { cell.className = i < lit ? cls : ""; });
 }
 
 function fmtTime(s){
@@ -261,13 +378,16 @@ function fmtTime(s){
   return m ? m + "m " + String(s%60).padStart(2,"0") + "s" : s + "s";
 }
 
+/* Everything here comes from the server, the model list or a job id, and the
+   result is assigned with textContent. It returns text, not markup: do not
+   hand it to innerHTML. */
 function statusLine(job){
   if(job.state === "queued")  return "Waiting for the GPU";
-  if(job.state === "loading") return "Loading " + esc(job.opts.model);
+  if(job.state === "loading") return "Loading " + (job.opts.model || "");
   if(job.state === "running"){
     // The diarization pass has no useful ETA of its own, and the meter is in
     // its last tenth by then, so report the phase rather than a wrong guess.
-    if(job.phase === "diarizing") return esc(job.message || "Identifying speakers");
+    if(job.phase === "diarizing") return job.message || "Identifying speakers";
     const pct = Math.round((job.progress||0)*100);
     const eta = job.progress > 0.02
       ? " \u00b7 about " + fmtTime(job.elapsed/job.progress - job.elapsed) + " left"
@@ -278,10 +398,10 @@ function statusLine(job){
     const speed = job.duration && job.elapsed
       ? " \u00b7 " + (job.duration/job.elapsed).toFixed(1) + "\u00d7 realtime" : "";
     return "Finished in " + fmtTime(job.elapsed) + speed
-      + " \u00b7 " + esc(job.language || "?") + " \u00b7 " + job.segment_count + " segments";
+      + " \u00b7 " + (job.language || "?") + " \u00b7 " + job.segment_count + " segments";
   }
   if(job.state === "cancelled") return "Cancelled";
-  return esc(job.message);
+  return job.message || "";
 }
 
 /* Only show the knobs that were actually off-default, so the line stays short. */
@@ -327,7 +447,7 @@ function stick(view){
 }
 
 function setFollow(on){
-  try{ sessionStorage.setItem(FOLLOW_KEY, on ? "1" : "0"); }catch(_){}
+  try{ sessionStorage.setItem(FOLLOW_KEY, on ? "1" : "0"); }catch{}
   for(const view of views.values()){
     setPaused(view, false);
     if(on && view.live) stick(view);   // catch up now, not at the next segment
@@ -337,25 +457,34 @@ function setFollow(on){
 function createCard(job){
   const node = document.createElement("div");
   node.className = "job";
-  node.id = "job-" + job.id;
-  node.innerHTML =
-    '<div class="job-head"></div>' +
-    '<div class="meter-slot"></div>' +
-    '<div class="job-body">' +
-      '<p class="status"></p>' +
-      '<div class="transcript"></div>' +
-      '<div class="actions"></div>' +
-    "</div>";
+  node.id = viewKey(job.id);
+  /* Every part is built as a node rather than parsed from a markup string, so
+     nothing a job carries — its filename, its message — can be read as markup
+     in the first place, and no call site has to remember to escape it. The
+     parts are kept on the view, which also makes render() a matter of setting
+     text and classes instead of four querySelector calls per poll. */
+  const view = {node, shown: 0, paused: false, live: false, labeled: false};
+  view.name = document.createElement("span");
+  view.name.className = "job-name";
+  view.meta = document.createElement("span");
+  view.meta.className = "job-meta";
+  view.head = document.createElement("div");
+  view.head.className = "job-head";
+  view.head.append(view.name, view.meta);
+  view.meter = document.createElement("div");
+  view.meter.className = "meter";
+  view.status = document.createElement("p");
+  view.status.className = "status";
+  view.transcript = document.createElement("div");
+  view.transcript.className = "transcript";
+  view.actions = document.createElement("div");
+  view.actions.className = "actions";
+  const body = document.createElement("div");
+  body.className = "job-body";
+  body.append(view.status, view.transcript, view.actions);
+  node.append(view.head, view.meter, body);
   el("jobs").prepend(node);
 
-  const view = {
-    node,
-    transcript: node.querySelector(".transcript"),
-    shown: 0,
-    paused: false,
-    live: false,
-    labeled: false,
-  };
   /* Scrolling away from the newest line pauses; coming back re-arms. The
      Follow switch stays the authoritative off switch. */
   view.transcript.addEventListener("scroll", () => {
@@ -363,7 +492,7 @@ function createCard(job){
                      - view.transcript.clientHeight <= 8;
     if(atBottom === view.paused) setPaused(view, !atBottom);
   });
-  views.set(job.id, view);
+  views.set(viewKey(job.id), view);
   return view;
 }
 
@@ -423,36 +552,44 @@ function appendSegments(view, segments, live, total, labeled){
   if(live || rebuilt) stick(view);
 }
 
-function actionsHtml(job){
-  const dl = (fmt, label) =>
-    '<button data-dl="' + fmt + '" data-id="' + esc(job.id) + '">' + label + "</button>";
-  return (job.state === "done"
-      ? '<button data-copy="' + esc(job.id) + '">Copy text</button>' +
-        dl("txt","Save .txt") + dl("timestamped","Save timestamped") +
-        dl("srt","Save .srt") + dl("vtt","Save .vtt") + dl("json","Save .json")
-      : "") +
-    (RETRY_OK && job.can_retry
-      ? '<button data-retry="' + esc(job.id) + '">Retry with these settings</button>'
-      : "") +
-    '<button class="ghost" data-del="' + esc(job.id) + '">' +
-      (["queued","loading","running"].includes(job.state) ? "Cancel" : "Remove") +
-    "</button>";
+/* A button per action. Built rather than written: a job id lands in a data
+   attribute and the label is text, so a filename or an error message never has
+   to be escaped to be safe here. */
+function actions(node, job){
+  node.textContent = "";
+  const add = (label, data, ghost) => {
+    const button = document.createElement("button");
+    button.textContent = label;
+    Object.assign(button.dataset, data);
+    if(ghost) button.className = "ghost";
+    node.append(button);
+  };
+  if(job.state === "done"){
+    add("Copy text", {copy: job.id});
+    for(const [fmt, label] of [["txt", "Save .txt"],
+                               ["timestamped", "Save timestamped"],
+                               ["srt", "Save .srt"],
+                               ["vtt", "Save .vtt"],
+                               ["json", "Save .json"]])
+      add(label, {dl: fmt, id: job.id});
+  }
+  if(RETRY_OK && job.can_retry)
+    add("Retry with these settings", {retry: job.id});
+  add(["queued","loading","running"].includes(job.state) ? "Cancel" : "Remove",
+      {del: job.id}, true);
 }
 
 function render(job){
-  const id = "job-" + job.id;
-  let view = views.get(id);
+  let view = views.get(viewKey(job.id));
   if(!view || !view.node.isConnected) view = createCard(job);
 
-  const name = esc(job.filename);
-  view.node.querySelector(".job-head").innerHTML =
-    '<span class="job-name" title="' + name + '">' + name + "</span>" +
-    '<span class="job-meta">' + esc(jobTags(job)) + "</span>";
-  view.node.querySelector(".meter-slot").innerHTML = meter(job);
-  const status = view.node.querySelector(".status");
-  status.className = "status" + (job.state === "error" ? " err" : "");
-  status.innerHTML = statusLine(job);
-  view.node.querySelector(".actions").innerHTML = actionsHtml(job);
+  view.name.textContent = job.filename || "";
+  view.name.title = job.filename || "";
+  view.meta.textContent = jobTags(job);
+  meter(view.meter, job);
+  view.status.className = job.state === "error" ? "status err" : "status";
+  view.status.textContent = statusLine(job);
+  actions(view.actions, job);
 
   appendSegments(view, job.segments || [],
                  ["queued","loading","running"].includes(job.state),
@@ -470,7 +607,7 @@ async function download(jobId, fmt){
   let name = "transcript." + (fmt === "timestamped" ? "txt" : fmt);
   const star = /filename\*=UTF-8''([^;]+)/i.exec(cd);
   const plain = /filename="([^"]*)"/i.exec(cd);
-  if(star) { try { name = decodeURIComponent(star[1]); } catch(_){} }
+  if(star) { try { name = decodeURIComponent(star[1]); } catch{} }
   else if(plain) name = plain[1];
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
@@ -511,7 +648,7 @@ el("jobs").addEventListener("click", async (e) => {
                           {method:"POST", body:currentSettings()});
       if(!r.ok){
         let detail = r.statusText;
-        try{ detail = (await r.json()).detail || detail; }catch(_){}
+        try{ detail = (await r.json()).detail || detail; }catch{}
         alert("Retry failed: " + detail);
         b.disabled = false;
       }
@@ -521,7 +658,7 @@ el("jobs").addEventListener("click", async (e) => {
       await api("/api/jobs/" + encodeURIComponent(b.dataset.del), {method:"DELETE"});
       await tick();
     }
-  }catch(err){ /* 401 already handled by api() */ }
+  }catch{ /* 401 already handled by api() */ }
 });
 
 /* ---------- poll ---------- */
@@ -533,10 +670,10 @@ async function tick(){
     el("empty").classList.toggle("locked", jobs.length > 0);
 
     for(const stale of [...known.keys()].filter(id => !live.includes(id))){
-      const n = document.getElementById("job-" + stale);
+      const n = document.getElementById(viewKey(stale));
       if(n) n.remove();
       known.delete(stale);
-      views.delete(stale);
+      views.delete(viewKey(stale));
     }
 
     for(const summary of jobs){
@@ -546,7 +683,7 @@ async function tick(){
 
       /* Ask for only what this card has not seen. A card that lost its rows
          (the job's segments went backwards) starts from zero again. */
-      const view = views.get("job-" + summary.id);
+      const view = views.get(viewKey(summary.id));
       let since = view ? view.shown : 0;
       if(view && summary.segment_count < view.shown){
         view.transcript.textContent = "";
@@ -565,7 +702,7 @@ async function tick(){
       }
       render(full);
     }
-  }catch(e){ /* server blip or 401; next tick retries */ }
+  }catch{ /* server blip or 401; next tick retries */ }
 }
 
 async function boot(){
