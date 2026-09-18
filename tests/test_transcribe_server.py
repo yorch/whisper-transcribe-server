@@ -8,6 +8,10 @@ functions, not copies, so they fail if the behaviour regresses.
 from __future__ import annotations
 
 import json
+import os
+import re
+import stat
+import sys
 import threading
 import time
 from pathlib import Path
@@ -527,6 +531,22 @@ def test_missing_explicit_config_is_fatal(tmp_path):
         s.resolve_args(["--config", str(tmp_path / "nope.toml")])
 
 
+def test_no_starter_config_flag_and_env(tmp_path, monkeypatch):
+    for var in ("TRANSCRIBE_STARTER_CONFIG", "TRANSCRIBE_WORK_DIR"):
+        monkeypatch.delenv(var, raising=False)
+    args, _, _ = s.resolve_args(["--work-dir", str(tmp_path / "state")])
+    assert args.starter_config is True, "creating the starter file is the default"
+
+    args, _, _ = s.resolve_args(
+        ["--work-dir", str(tmp_path / "state"), "--no-starter-config"]
+    )
+    assert args.starter_config is False
+
+    monkeypatch.setenv("TRANSCRIBE_STARTER_CONFIG", "0")
+    args, _, _ = s.resolve_args(["--work-dir", str(tmp_path / "state")])
+    assert args.starter_config is False, "environment must win over the default"
+
+
 def test_audit_section_aliases(tmp_path, monkeypatch):
     monkeypatch.delenv("TRANSCRIBE_AUDIT_READS", raising=False)
     cfg = tmp_path / "c.toml"
@@ -535,6 +555,98 @@ def test_audit_section_aliases(tmp_path, monkeypatch):
     assert args.audit_reads is True
     assert args.audit_retain_days == 3
     assert args.audit is False
+
+
+# --------------------------------------------------------------------------- #
+# Starter config
+# --------------------------------------------------------------------------- #
+
+KEY_LINE = re.compile(r"^#\s*([a-z_][a-z0-9_]*)\s*=")
+
+# DEFAULTS stores None for "derive it from the work dir", so the template can
+# only show a plausible path for these two. They are checked for presence.
+DERIVED_DEFAULTS = {"work_dir", "audit_dir"}
+
+
+def materialise(template: str) -> str:
+    """The template with every commented `key = value` line uncommented."""
+    body = "\n".join(
+        KEY_LINE.sub(r"\1 = ", line) if KEY_LINE.match(line) else line
+        for line in template.splitlines()
+    )
+    return body + "\n"
+
+
+def test_starter_config_is_inert_as_shipped(tmp_path):
+    """The point of the whole thing: the file we create pins no values."""
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(s.CONFIG_TEMPLATE, encoding="utf-8")
+    assert s.load_config_file(cfg, required=False) == {}
+
+
+def test_starter_config_documents_every_option_at_its_default(tmp_path):
+    """Uncommenting the whole template must reproduce DEFAULTS exactly.
+
+    That one assertion proves every option is documented, every documented key
+    is real (an unknown one is a SystemExit), and no comment quotes a default
+    the code no longer uses.
+    """
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(materialise(s.CONFIG_TEMPLATE), encoding="utf-8")
+    flat = s.load_config_file(cfg, required=False)
+
+    # `config` is this file, and `starter_config` only matters before it
+    # exists, so neither can be set from inside it.
+    assert set(flat) == set(s.DEFAULTS) - {"config", "starter_config"}
+    for name, value in flat.items():
+        if name in DERIVED_DEFAULTS:
+            continue
+        assert value == s.DEFAULTS[name], f"{name} quotes a stale default"
+
+
+def test_starter_config_is_created_once_and_never_clobbered(tmp_path):
+    cfg = tmp_path / "state" / "config.toml"
+    assert s.init_starter_config(cfg, required=False, enabled=True) is True
+    assert cfg.read_text(encoding="utf-8") == s.CONFIG_TEMPLATE
+
+    cfg.write_text("[server]\nport = 9000\n", encoding="utf-8")
+    assert s.init_starter_config(cfg, required=False, enabled=True) is False
+    assert cfg.read_text(encoding="utf-8") == "[server]\nport = 9000\n"
+
+
+def test_starter_config_skipped_for_explicit_config_and_when_disabled(tmp_path):
+    """A typo'd --config must not become a server quietly running on defaults."""
+    typo = tmp_path / "config.toml"
+    assert s.init_starter_config(typo, required=True, enabled=True) is False
+    assert not typo.exists()
+
+    off = tmp_path / "other" / "config.toml"
+    assert s.init_starter_config(off, required=False, enabled=False) is False
+    assert not off.exists()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX mode bits")
+def test_starter_config_is_private(tmp_path):
+    """It documents the token keys, so a filled-in copy must not be readable."""
+    cfg = tmp_path / "config.toml"
+    s.init_starter_config(cfg, required=False, enabled=True)
+    mode = stat.S_IMODE(cfg.stat().st_mode)
+    assert mode & 0o077 == 0, f"group or other can read it: {mode:04o}"
+
+
+def test_starter_config_failure_is_not_fatal(tmp_path, capsys):
+    """A read-only home must not stop the server from serving."""
+    root = tmp_path / "readonly"
+    root.mkdir()
+    root.chmod(0o500)
+    if os.access(root, os.W_OK):  # root ignores the mode bits
+        pytest.skip("directory modes are not enforced for this user")
+
+    cfg = root / "config.toml"
+    assert s.init_starter_config(cfg, required=False, enabled=True) is False
+    assert not cfg.exists()
+    assert "Could not create a starter config" in capsys.readouterr().out
+    root.chmod(0o700)
 
 
 # --------------------------------------------------------------------------- #

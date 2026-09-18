@@ -124,6 +124,7 @@ Useful flags:
 | `--source-retention job`      | `run` deletes audio after transcribing (no retry), `job` keeps it while the record lives (default), `forever` never deletes |
 | `--work-dir PATH`             | where uploads and the audit trail live (default `~/.transcribe-server`)                                                     |
 | `--config PATH`               | TOML config file (default `<work dir>/config.toml`)                                                                         |
+| `--no-starter-config`         | never create a starter config at the default location                                                                       |
 | `--audit-dir PATH`            | where daily audit files live (default `<work dir>/audit`)                                                                   |
 | `--audit-token`               | separate token for `/audit` and `/api/audit`; unset disables the audit API                                                  |
 | `--audit-reads`               | also log status/list/detail polls (chatty; off by default)                                                                  |
@@ -138,6 +139,19 @@ First run with a given model downloads it from Hugging Face (a few GB for
 `large-v3`) into the HuggingFace cache. After that it's local.
 
 ## Configuration file
+
+The first run writes a starter file to `<work dir>/config.toml`. Every key in
+it is commented out and shows its default, so uncommenting is how you change a
+setting and a commented line keeps tracking the default in later releases. The
+server never rewrites it: your edits stay yours. The file is created readable
+only by you, because it documents the token keys.
+
+Two cases where nothing is created: an explicit `--config` (or
+`TRANSCRIBE_CONFIG`) points at a file you expect to exist, so a typo stays a
+startup error instead of becoming a server quietly running on defaults, and
+`--no-starter-config` turns the whole thing off. If the file cannot be written
+(a read-only or container home) the server says so and carries on with
+defaults.
 
 Anything settable by a flag can also live in a TOML file, which is what you
 want on a machine you don't want to re-type a long command line for:
@@ -185,10 +199,10 @@ prompts/<job_id>.json       # full prompt/hotword text, 0600, separate
 ```
 
 Events cover uploads, retries, deletions, transcript exports, worker
-start/finish/error, VRAM evictions, model loads, every refused request
-(`421` host, `403` cross-site, `401` auth) and a `server.started` snapshot of
-how the process was configured. Tokens never appear, and transcript text never
-appears.
+start/finish/error, VRAM evictions, model loads, the starter config being
+created, every refused request (`421` host, `403` cross-site, `401` auth) and a
+`server.started` snapshot of how the process was configured. Tokens never
+appear, and transcript text never appears.
 
 ```json
 {"ts":"2026-09-18T02:01:57.677Z","event":"job.created","client":"127.0.0.1",
@@ -552,10 +566,10 @@ What it still doesn't do, by design:
 
 ## Tests
 
-The suite covers the audit trail, config layering, host allowlist, job state
-machine and the HTTP surface, including regressions for the two most serious
-bugs found in review (a self-deadlock on cancel, and prompt text leaking to an
-app-token holder).
+The suite covers the audit trail, config layering, the starter config, host
+allowlist, job state machine and the HTTP surface, including regressions for
+the two most serious bugs found in review (a self-deadlock on cancel, and
+prompt text leaking to an app-token holder).
 
 It needs the runtime dependencies plus `pytest` and `httpx`, which is what the
 `.venv` is for:
