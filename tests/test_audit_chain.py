@@ -422,7 +422,12 @@ def test_verify_and_head_endpoints_report_a_clean_day(client, configured):
     assert body["ok"] is True and body["checked"] >= 1
 
     head = client.get("/api/audit/head", headers=audit_headers(configured)).json()
-    assert head["chain"] == configured.audit.head(head["date"])["chain"]
+    # Against the file itself, not against AUDIT.head() -- comparing the endpoint
+    # to the method it calls only restates the implementation.
+    path = configured.audit.dir / f"audit-{head['date']}.jsonl"
+    last = records(path)[-1]
+    assert last["event"] == "audit.head_read", "the read is logged before the head"
+    assert head["chain"] == last["chain"]
 
 
 def test_verify_endpoint_rejects_a_bad_date_and_an_unknown_day(client, configured):
