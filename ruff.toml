@@ -19,8 +19,9 @@ ignore = ["E501"]
 # can be stripped by -O.
 "tests/*" = ["S101"]
 # Same reasoning for the diarization proof-of-concept scripts: assertions are the
-# right shape for a throwaway probe, and nothing ships from this directory.
-"docs/poc/*" = ["S101"]
+# right shape for a throwaway probe, and a /tmp default is the point of them —
+# nothing ships from this directory.
+"docs/poc/*" = ["S101", "S108"]
 
 [lint.flake8-bugbear]
 # File(...) and Form(...) in argument defaults are the FastAPI dependency idiom.

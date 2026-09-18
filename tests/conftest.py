@@ -101,6 +101,7 @@ def configured(tmp_path, monkeypatch):
         quality="balanced",
         allow_model_choice=True,
         allow_precision_choice=False,
+        allow_diarize=True,
         model_cache=1,
         max_jobs=60,
         max_queue=20,

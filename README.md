@@ -132,6 +132,7 @@ Useful flags:
 | `--model-cache 2`             | models held in VRAM at once (default 1)                                                                                     |
 | `--pin-model`                 | force every job to `--model`, disable the UI selector                                                                       |
 | `--allow-precision-choice`    | expose the precision selector (hidden by default)                                                                           |
+| `--no-diarize`                | remove the speaker-identification control, so the diarization models are never fetched or loaded                             |
 | `--no-auth`                   | serve without a token                                                                                                       |
 | `--allow-host name`           | accept an extra `Host` header value (repeatable; prefix with `.` for a suffix match, e.g. `.trycloudflare.com`)             |
 | `--max-upload-mb 2048`        | per-file upload ceiling                                                                                                     |
@@ -154,6 +155,12 @@ audit trail.
 
 First run with a given model downloads it from Hugging Face (a few GB for
 `large-v3`) into the HuggingFace cache. After that it's local.
+
+Speaker identification adds one more dependency (`sherpa-onnx`, ~15 MB, no
+transitive requirements) and its own ~42 MB of models, fetched from GitHub
+releases rather than Hugging Face — no account or licence click-through. Those
+models are only downloaded if a job actually asks for speaker labels, or by
+`--preload`. `--no-diarize` removes the feature and its downloads entirely.
 
 ## Configuration file
 
@@ -194,6 +201,10 @@ device = "cuda"
 compute_type = "float16"
 quality = "balanced"
 preload = true
+
+[diarization]
+# Anything settable by a flag lives in this file too.
+allow_diarize = true
 
 [limits]
 max_upload_mb = 2048
@@ -383,8 +394,32 @@ drop applies to that job.
 - **Context prompt** — a sentence describing the recording. Biases style and
   vocabulary more broadly than the term list. `initial_prompt` under the hood.
 - **Translate to English** — switches the task from transcribe to translate.
-- **Word-level timings** — costs time, but makes a later diarization pass
-  (WhisperX, pyannote) align much better. Included in the `.json` export.
+- **Word-level timings** — costs time, but the exported `.json` word timings
+  are useful on their own, and asking for **Identify speakers** turns this on for
+  you (see below).
+- **Identify speakers** — labels the voices in the recording `Speaker 1`,
+  `Speaker 2` and so on, and splits a sentence at the point the speaker changes.
+  Off by default because it is a second pass over the audio: expect roughly
+  2 minutes per hour of recording, on the CPU, after the transcript is finished.
+  The first job that uses it downloads ~42 MB of models from GitHub.
+
+  The labels are **anonymous and per-recording**. `Speaker 1` in today's standup
+  is not the same person as `Speaker 1` in tomorrow's, and nothing here
+  recognises a voice across files. What it can do is tell apart the people in
+  *this* meeting.
+
+  **Set the speaker count if you know it.** Left at 0 it guesses, and the guess
+  is a clustering threshold tuned on a handful of recordings; pinned to the real
+  number it is much more reliable. On two similar voices, or on a video call
+  where each remote participant arrives through a different codec, even that can
+  merge people or split one person in two. `Speaker 2` appearing for a single
+  line is usually the diarizer being unsure, not a new person.
+
+  The labels ride along in every export: `Speaker 1: ...` in `.txt` and `.srt`,
+  `<v Speaker 1>` in `.vtt`, and a `speaker` field per segment plus a `speakers`
+  totals block in `.json`. If the diarization pass fails, the transcript still
+  finishes and the job says why — an hour of transcription is worth more than
+  its labels.
 - **Carry context forward** — off by default, and that's deliberate. Whisper's
   `condition_on_previous_text` is the usual cause of repetition loops on long
   recordings: one bad segment poisons the context and it repeats a phrase for
@@ -563,9 +598,11 @@ What it still doesn't do, by design:
 
 ## Notes and limits
 
-- **No speaker labels.** Whisper doesn't do diarization. If you need "who said
-  what", run the audio through WhisperX or pyannote afterwards using the `.json`
-  timings, or use Otter/Fireflies instead.
+- **Speaker labels are anonymous.** Diarization answers "how many people spoke,
+  and when", not "who". Labels are `Speaker 1..N`, decided per recording, and
+  they do not carry over to the next file. Naming people needs enrolled
+  voiceprints, which this does not do. See **Identify speakers** above for what
+  it gets wrong, and prefer pinning the speaker count over letting it guess.
 - Uploads land in `%USERPROFILE%\.transcribe-server\uploads`. By default they're
   kept as long as the job record exists, which is what makes Retry work, and
   deleted when the record is removed or evicted. Use `--source-retention run` if
@@ -602,8 +639,19 @@ It needs the runtime dependencies plus `pytest` and `httpx`, which is what the
 ```bash
 uv venv .venv --python 3.12
 uv pip install --python .venv/bin/python \
-  fastapi "uvicorn[standard]" python-multipart faster-whisper pytest httpx
+  fastapi "uvicorn[standard]" python-multipart faster-whisper pytest httpx \
+  sherpa-onnx
 .venv/bin/pytest -q
+```
+
+`sherpa-onnx` is only needed for the opt-in test that loads a real diarization
+model; everything else in the suite stubs it. To run that one, point it at the
+weights and a recording whose speaker count you know:
+
+```bash
+TRANSCRIBE_DIARIZE_MODELS=~/.transcribe-server/diarize-models \
+TRANSCRIBE_DIARIZE_AUDIO=meeting.wav TRANSCRIBE_DIARIZE_SPEAKERS=3 \
+  .venv/bin/pytest -q tests/test_diarization.py -k real
 ```
 
 `ruff.toml` and `pyrightconfig.json` point the linters at that same venv:

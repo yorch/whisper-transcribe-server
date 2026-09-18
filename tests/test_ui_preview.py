@@ -35,6 +35,10 @@ const document = {
   createElement: () => {
     const node = {className: "", textContent: "", children: [],
                   append: (...kids) => { node.children.push(...kids); }};
+    // classList, because the speaker gutter colours itself by class.
+    node.classList = {add: (name) => {
+      node.className = (node.className ? node.className + " " : "") + name;
+    }};
     return node;
   },
 };
@@ -47,15 +51,28 @@ function makeView(){
     scrollHeight: 0, scrollTop: 0, clientHeight: 100, title: "",
     classList: {toggle: (name, on) => { on ? marks.add(name) : marks.delete(name); }},
     append: (row) => { rows.push(row); transcript.scrollHeight = rows.length * 20; },
-    set textContent(value){ if(value === "") rows.length = 0; },
+    // Clearing the content collapses the scroll box and clamps scrollTop, the
+    // way a browser does. Without that the follow-after-redraw test below
+    // would pass for the wrong reason.
+    set textContent(value){
+      if(value === ""){ rows.length = 0; transcript.scrollHeight = 0; transcript.scrollTop = 0; }
+    },
   };
-  return {view: {transcript, shown: 0, paused: false, live: false}, rows, marks};
+  return {view: {transcript, shown: 0, paused: false, live: false, labeled: false},
+          rows, marks};
 }
 const seg = (start, text) => ({start, text});
 /* Read the live rows, not every node ever built: a cleared transcript must not
-   still show up in a result. */
-const times = (rows) => rows.map(r => r.children[0].textContent);
-const texts = (rows) => rows.map(r => r.children[1].textContent);
+   still show up in a result. Cells are found by class, not by index, so adding
+   a column (the speaker gutter) cannot silently shift what a test reads. */
+const cell = (row, cls) => {
+  const found = row.children.find(
+    (kid) => (kid.className || "").split(" ").includes(cls));
+  return found ? found.textContent : "";
+};
+const times = (rows) => rows.map(r => cell(r, "ts"));
+const texts = (rows) => rows.map(r => cell(r, "tx"));
+const speakers = (rows) => rows.map(r => cell(r, "sp"));
 """
 
 
@@ -227,6 +244,74 @@ def test_appending_the_same_segments_again_adds_nothing():
         """
     )
     assert (probe["rows"], probe["shown"]) == (2, 2)
+
+
+@needs_node
+def test_labels_arriving_at_the_end_redraw_the_transcript_once():
+    """Diarization is a second pass, so every row on screen was drawn without a
+    speaker. Counting new segments cannot notice that, so the shape is compared
+    instead and the transcript rebuilt exactly once."""
+    probe = preview_probe(
+        """
+        const h = makeView();
+        appendSegments(h.view, [seg(3, "first"), seg(72, "second")], true);
+        const before = {rows: h.rows.length, speakers: speakers(h.rows)};
+        const labeled = [{start: 3, text: "first", speaker: 1},
+                         {start: 72, text: "second", speaker: 2}];
+        appendSegments(h.view, labeled, false);
+        const after = {rows: h.rows.length, speakers: speakers(h.rows),
+                       texts: texts(h.rows), times: times(h.rows)};
+        appendSegments(h.view, labeled, false);   // a later poll, same data
+        const again = {rows: h.rows.length, shown: h.view.shown};
+        return {before, after, again};
+        """
+    )
+    assert probe["before"] == {"rows": 2, "speakers": ["", ""]}
+    assert probe["after"] == {
+        "rows": 2,
+        "speakers": ["Speaker 1", "Speaker 2"],
+        "texts": ["first", "second"],
+        "times": ["00:00:03", "00:01:12"],
+    }
+    assert probe["again"] == {"rows": 2, "shown": 2}
+
+
+@needs_node
+def test_the_speaker_gutter_does_not_disturb_unlabelled_rows():
+    rows = preview_probe(
+        """
+        const h = makeView();
+        appendSegments(h.view, [seg(3, "first"), seg(72, "second")], true);
+        return {speakers: speakers(h.rows), texts: texts(h.rows),
+                cells: h.rows.map(r => r.children.length)};
+        """
+    )
+    assert rows["speakers"] == ["", ""]
+    assert rows["texts"] == ["first", "second"]
+    # The gutter is present but empty, so nothing shifts sideways when the
+    # labels land.
+    assert rows["cells"] == [3, 3]
+
+
+@needs_node
+def test_following_survives_the_redraw_that_adds_labels():
+    """Rebuilding clears the transcript, which resets the scroll: someone who
+    was following a live job must not be thrown back to the top."""
+    probe = preview_probe(
+        """
+        const h = makeView();
+        appendSegments(h.view, [seg(3, "a"), seg(4, "b")], true);
+        const wasAtBottom = h.view.transcript.scrollTop === h.view.transcript.scrollHeight;
+        appendSegments(h.view, [{start: 3, text: "a", speaker: 1},
+                                {start: 4, text: "b", speaker: 2}], false);
+        return {wasAtBottom,
+                atBottom: h.view.transcript.scrollTop === h.view.transcript.scrollHeight,
+                paused: h.view.paused};
+        """
+    )
+    assert probe["wasAtBottom"] is True
+    assert probe["atBottom"] is True, "the redraw lost the follower's position"
+    assert probe["paused"] is False
 
 
 @needs_node

@@ -85,6 +85,22 @@ launcher/transcribe_tray.py --self-test --with-server   # also probes a real ser
 
 ## Invariants worth not breaking
 
+- **Diarization runs in a child process, and must keep doing so.**
+  `OfflineSpeakerDiarization.process()` holds the GIL for its entire run
+  (measured; `docs/speaker-diarization.md` section 5). Called from the worker
+  thread it freezes the event loop for minutes — the status poll, the live
+  transcript and Cancel all stop dead — which looks exactly like the cancel
+  deadlock above. `run_diarizer` therefore spawns `DIARIZE_WORKER` as a
+  subprocess. Do not "simplify" it into a thread;
+  `tests/test_diarization.py` fails if you do.
+- **A failed diarization pass never fails the job.** Labels are worth less than
+  the transcript: `run_job` catches it, records `job.diarize_failed`, and
+  finishes the job unlabelled with the reason in its message. A model download
+  or a child process going wrong must not cost an hour of transcription.
+- **Alignment splits on speaker change, so `word_timestamps` is not optional.**
+  Asking for diarization forces it on. Without word timings a whole segment can
+  only go to its dominant speaker, which is the version of the feature that is
+  confidently wrong.
 - **Prompt/hotword text never reaches an app-token holder.** It is the one field
   the audit credential gates. `job_public()` and `render(..., "json")` must emit
   `public_opts()`, which returns a flag and a length, never the text. Only

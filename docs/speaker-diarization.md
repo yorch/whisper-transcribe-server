@@ -16,7 +16,10 @@ for minutes (§5, §7.3). That second one is the finding that actually shapes th
 design, and it is the reason this document recommends a child process.
 
 This document records what was checked, what it costs, what it will get wrong,
-and the integration points. It is research, not a plan that has been agreed.
+and the integration points. **It is built** — the decisions in §8 were taken, and
+§9 lists what landed. The measurements and the calibration in §5 are the parts
+worth re-reading before changing anything, because two of them contradict what
+the upstream documentation implies.
 
 Current state: the README's "Notes and limits" says *"No speaker labels. Whisper
 doesn't do diarization."* (README.md:495.) Every line reference below is against
@@ -278,6 +281,48 @@ The problem with placing it is not its cost.
 turns in 2.11 s. **No `soundfile`, no `librosa`, no system ffmpeg** — the whole
 decode side is already in the dependency tree, exactly as §4.2 predicted.
 
+### The auto-detect threshold had to be calibrated, and the documented value was wrong
+
+`FastClusteringConfig` takes either a speaker count or a threshold. Sherpa's own
+examples pass **0.5**, and I copied that. It is wrong, and the reason it looks
+fine in their docs is that they always pass `num_clusters` alongside it, which
+makes the threshold inert.
+
+Run the auto path (threshold only, no pinned count) against the four recordings
+in sherpa's own CI, whose speaker counts are known:
+
+| file | true speakers | 0.4 | 0.5 | 0.6 | 0.7 | **0.8** | 0.9 | 1.0 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `0-four-speakers-zh.wav` | 4 | 8 | 7 | 7 | 4 | **4** | 4 | 3 |
+| `1-two-speakers-en.wav` | 2 | 2 | 2 | 2 | 2 | **2** | 2 | 2 |
+| `2-two-speakers-en.wav` | 2 | 5 | 3 | 3 | 2 | **2** | 2 | 2 |
+| `3-two-speakers-en.wav` | 2 | 5 | 4 | 3 | 3 | **2** | 2 | 2 |
+| **exact** | | 1/4 | **1/4** | 1/4 | 3/4 | **4/4** | 4/4 | 3/4 |
+
+At 0.5 — the value I had written down — **three of the four files over-segment**,
+and a two-person call is reported as four speakers. That is the worst kind of
+wrong: plausible, specific, and invisible unless you already know the answer.
+0.8 sits at the safe end of the [0.8, 0.9] plateau that is right on all four;
+1.0 starts merging the four-speaker file down to three.
+
+This is the strongest argument in the document for the UI's advice to **pin the
+speaker count when you know it**. Pinned, all four files come out exact. The
+auto path is a guess about a clustering distance, and four files is not a
+sample — treat 0.8 as a better default than 0.5 rather than as a solved problem.
+
+### The child-process path works with the real models
+
+Everything above was measured with the diarizer called in-process. The shipped
+path is a child process, so it was checked too: with real weights and no
+stubbing, `ensure_diarize_models()` → `run_diarizer()` → `align_speakers()` →
+`render()` runs clean, and the child reproduces the pinned four-speaker result
+exactly (10 turns, same boundaries) in **3.0 s**. `probe_diarization()`, which is
+what `--preload` runs, completes in **0.43 s** and cleans up after itself.
+
+The script is `docs/poc/e2e_check.py`. It is also the check that caught the
+threshold problem: every stub in `tests/test_diarization.py` passes with 0.5,
+because the stubs assert the protocol, not the answers.
+
 ### The GIL is held for the entire pass — and this changes the design
 
 A ticker thread waking every 10 ms, measuring how late it ran:
@@ -330,9 +375,11 @@ is the risk.
   different microphones (far end vs near end in a video call), can collapse into
   one cluster or split into two. Video-call audio is the hard case: each remote
   participant has been through a different codec and mixer.
-- **Speaker count.** Auto-detection is a threshold, not a classifier. It
-  routinely picks 3 for a 2-person call with a noisy room. Pinning the count
-  when the operator knows it is much more reliable than tuning the threshold.
+- **Speaker count.** Auto-detection is a clustering threshold, not a classifier,
+  and it is the weakest part of this (§5). At the calibrated 0.8 it was right on
+  all four recordings sherpa publishes, but that is four recordings. Pinning the
+  count when the operator knows it is much more reliable than tuning the
+  threshold, which is why the UI offers the number and not the threshold.
 - **Short turns.** `min_duration_on=0.3` / `min_duration_off=0.5` exist to stop
   a cough becoming a speaker. Back-channels ("mm-hm", "right") get absorbed into
   the neighbouring turn.
@@ -593,58 +640,56 @@ and the preview branch second (or vice versa) will produce a conflict in
 `render`/`appendSegments` either way, and the resolution is easier if the
 diarization side knows about the append-only structure.
 
-## 8. Decision points
+## 8. Decision points, and how they were settled
 
-1. **Ship at all?** The README currently promises no speaker labels. Adding them
-   means an honest sentence about anonymous, per-file labels and a DER disclaimer
-   — not "now with speaker identification".
-2. **Dependency placement** — inline (always available, +15–19 MB) vs `--with`
-   (opt-in, hidden when absent). §7.6. The launcher makes this close to decided:
-   inline, or the shipped app doesn't get the feature. Confirm and move on.
-3. **Isolation of the pass** — child process (`subprocess` + embedded worker),
-   the hand-rolled chunked pipeline, or accept the freeze. §7.3. Measured: the
-   GIL makes a thread impossible and makes the naive serial version freeze the
-   whole server for minutes. I'd take the subprocess.
-4. **`word_timestamps` coupling** — force it on when diarizing (better output,
-   honest cost) vs leave it optional (crude splitting when off).
-5. **`txt` export** — prefix labels or keep the plain export pure and add a
-   format. §7.5.
-6. **Numeric labels only** in v1, or take on the audit-token plumbing for real
-   names. §7.4.
-7. **Segmentation model** — `pyannote-segmentation-3-0` (MIT, well understood) or
-   `reverb-diarization-v1` (newer, and in the published runs it merged the
-   four-speaker sample's turns more aggressively; license needs a look).
+1. **Ship at all?** Yes. The README's "No speaker labels" note is now an honest
+   description of anonymous, per-recording labels, including what it gets wrong.
+2. **Dependency placement** — **inline** (§7.6). `--with` would have made the
+   feature unreachable in the packaged tray app, and 15 MB against a 2.2 GB
+   first run is not a real cost.
+3. **Isolation** — **child process** (§7.3). Not a preference: the GIL
+   measurement leaves no thread-based option, and the naive serial version
+   freezes the whole server.
+4. **`word_timestamps` coupling** — **forced on** when diarizing, with the box
+   ticked and locked in the UI so the cost is visible rather than silent.
+5. **`txt` export** — labels are prefixed when the job has them. A job without
+   them exports byte-identically to before, which is pinned by a test.
+6. **Numeric labels only** in v1. A server-side name mapping would need the
+   audit-token plumbing; renaming stays client-side.
+7. **Segmentation model** — `pyannote-segmentation-3-0`, int8 (MIT), and the
+   threshold was **calibrated rather than copied**: 0.8, not the 0.5 the
+   upstream examples suggest (§5).
 
-## 9. What I would build first
+One thing was deliberately narrowed: the plan here originally included an
+operator-tunable clustering threshold. It is not exposed. Pinning the speaker
+count is both easier to explain and measurably better, so the threshold is a
+single calibrated constant with the measurement next to it.
 
-A staged path, each step independently reviewable and verifiable:
+## 9. What was built
 
-1. **Prove the pipeline in the repo, with a test.** A `tests/` case that stubs
-   `sherpa_onnx` (the suite never touches a real model today, and must not
-   start) plus one optional real-model test in `tests/test_gpu.py`'s spirit —
-   skipped unless the models are present. Plus the alignment function
-   (`align_speakers(segments, turns)`) fully unit-tested against hand-written
-   turns, because that is where the bugs will be and it needs no model at all.
-2. **The isolation boundary.** The embedded worker, the JSON contract, the
-   timeout and the kill-on-cancel path — with a test that asserts a diarizing
-   child cannot stop the event loop from answering `/api/status`. That test is
-   the one that would have caught the GIL problem, so it should exist before the
-   feature does.
-3. **Backend + model fetching**, with checksums and a `--preload` probe.
-4. **Wire it into `run_job`**, `build_opts`, the form fields and the audit event.
-5. **Exports and JSON shape.**
-6. **UI**: the checkbox, the speaker column, and the `appendSegments` change —
-   coordinated with `feat/transcript-preview`.
-7. **README**: rewrite the "No speaker labels" note into an honest description,
-   including what it gets wrong.
+- `transcribe_server.py` — inline `sherpa-onnx` dependency; `DIARIZE_MODELS`
+  with pinned SHA-256s; the embedded `DIARIZE_WORKER` child; `run_diarizer` with
+  a stall guard, a cancel path and Windows `CREATE_NO_WINDOW`; `align_speakers`;
+  `render` output for txt/timestamped/srt/vtt/json; `--no-diarize`; the
+  `--preload` probe; `job.diarized` / `job.diarize_failed` audit events.
+- `tests/test_diarization.py` — the GIL-isolation regression test, the child
+  protocol, an alignment case per failure mode, the export shapes, and an
+  opt-in test against the real model.
+- `tests/test_ui_preview.py` — the append-only preview now redraws when labels
+  arrive, with the gutter present but empty beforehand so rows do not shift.
+- `docs/poc/` — the measurements, and `e2e_check.py` for the real path.
+- `README.md`, `AGENTS.md` — the operator view and the three new invariants.
 
-Steps 1 and 2 are the ones that can be judged without committing to the feature.
+Not built, and deliberately: server-side speaker names (§7.4), a GPU
+`onnxruntime` path (§4.3), and crossing-diarization identities.
 
 ## 10. Sources
 
 - sherpa-onnx diarization docs — <https://k2-fsa.github.io/sherpa/onnx/speaker-diarization/index.html>
 - Pre-trained models, published RTF figures, model sizes —
   <https://k2-fsa.github.io/sherpa/onnx/speaker-diarization/models.html>
+- The four sample recordings with known speaker counts, and the CI job that uses
+  them — <https://github.com/k2-fsa/sherpa-onnx/blob/master/.github/workflows/speaker-diarization.yaml>
 - Python API example — <https://github.com/k2-fsa/sherpa-onnx/blob/master/python-api-examples/offline-speaker-diarization.py>
 - Install / wheel platforms — <https://k2-fsa.github.io/sherpa/onnx/python/install.html>
 - `faster_whisper/audio.py` (`decode_audio`, PyAV-bundled FFmpeg) —

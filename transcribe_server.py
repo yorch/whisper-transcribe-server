@@ -7,6 +7,10 @@
 #     "python-multipart>=0.0.9",
 #     "faster-whisper>=1.0.3",
 #     "numpy>=1.24",
+#     # Speaker diarization. The whole reason "who said what" is possible without
+#     # pulling PyTorch in: ~15 MB, no transitive dependencies, and its models
+#     # come from GitHub releases rather than a gated Hugging Face repo.
+#     "sherpa-onnx>=1.13.8",
 #     "tomli>=2; python_version < '3.11'",
 #     "nvidia-cublas-cu12; sys_platform != 'darwin'",
 #     "nvidia-cudnn-cu12>=9,<10; sys_platform != 'darwin'",
@@ -52,13 +56,17 @@ import re
 import secrets
 import shutil
 import socket
+import subprocess
 import sys
+import tarfile
 import threading
 import time
 import traceback
+import urllib.request
 import uuid
+import wave
 from collections import OrderedDict, deque
-from collections.abc import MutableMapping
+from collections.abc import Callable, MutableMapping
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, TypeVar
@@ -100,6 +108,9 @@ RETENTION = ["run", "job", "forever"]
 
 PROMPT_LIMIT = 1000
 HOTWORDS_LIMIT = 400
+
+# Speaker count a client may ask for. 0 means "decide from the audio".
+DIARIZE_MAX_SPEAKERS = 10
 
 WORK_DIR = Path(
     os.environ.get("TRANSCRIBE_WORK_DIR", Path.home() / ".transcribe-server")
@@ -1031,6 +1042,9 @@ def new_job(filename: str, path: Path, opts: dict[str, Any]) -> str:
             "path": str(path),
             "size": size,
             "state": "queued",  # queued | loading | running | done | error | cancelled
+            # Which pass the worker is in, so the client can say "identifying
+            # speakers" instead of inventing an ETA from a stalled meter.
+            "phase": None,  # None | transcribing | diarizing
             "progress": 0.0,
             "message": "Waiting for the GPU",
             "segments": [],
@@ -1194,6 +1208,8 @@ def build_opts(
     word_timestamps: str,
     min_silence_ms: int,
     speech_pad_ms: int,
+    diarize: str = "false",
+    speakers: int = 0,
 ) -> dict[str, Any]:
     """Validate everything a client can influence. Pinned knobs ignore the client."""
     truthy = lambda v: str(v).lower() in ("1", "true", "yes", "on")  # noqa: E731
@@ -1219,6 +1235,21 @@ def build_opts(
     if quality not in QUALITIES:
         quality = ARGS.quality
 
+    # A server started with --no-diarize pins this off rather than refusing, the
+    # same way --pin-model pins the model: the client never sees the control.
+    if ARGS.allow_diarize and truthy(diarize):
+        diarize_on = True
+        wanted = clamp(as_int(speakers, 0), 0, DIARIZE_MAX_SPEAKERS)
+        # Diarization is only as good as the word boundaries it splits on. With
+        # no word timings a whole segment can only be handed to its dominant
+        # speaker, which is the version of this feature that is confidently
+        # wrong, so asking for speakers asks for the timings too.
+        word_timestamps_on = True
+    else:
+        diarize_on = False
+        wanted = 0
+        word_timestamps_on = truthy(word_timestamps)
+
     return {
         "model": model,
         "compute_type": compute_type,
@@ -1232,10 +1263,558 @@ def build_opts(
         # Whisper's repetition loops on long audio come from carrying a poisoned
         # context forward, so this is off unless asked for.
         "condition": truthy(condition),
-        "word_timestamps": truthy(word_timestamps),
+        "word_timestamps": word_timestamps_on,
+        "diarize": diarize_on,
+        # 0 means "work it out from the audio".
+        "speakers": wanted,
         "min_silence_ms": clamp(as_int(min_silence_ms, 2000), 100, 10000),
         "speech_pad_ms": clamp(as_int(speech_pad_ms, 400), 0, 2000),
     }
+
+
+# --------------------------------------------------------------------------- #
+# Speaker diarization
+# --------------------------------------------------------------------------- #
+#
+# Whisper does not do diarization, and the reference implementation
+# (pyannote.audio) wants PyTorch — which this server deliberately does not have.
+# sherpa-onnx runs the same pyannote segmentation model as ONNX instead: two
+# small wheels with no transitive dependencies, and weights fetched from GitHub
+# releases rather than gated behind a Hugging Face account.
+#
+# The work happens in a *child process*, and that is a measurement rather than a
+# style choice. OfflineSpeakerDiarization.process() holds the GIL for its whole
+# duration (docs/speaker-diarization.md, section 5), so calling it from the
+# worker thread — which is a thread, not a process — stops the event loop dead
+# for the entire pass, and takes the status poll, the live transcript and Cancel
+# with it. A separate interpreter is the only placement where the rest of the
+# server keeps working.
+
+diarize_threads = lambda: clamp(os.cpu_count() or 1, 1, 4)  # noqa: E731
+
+# Only the count is exposed; the threshold is what auto-detection diverges on,
+# and asking the operator how many people were in the room is both easier and
+# more reliable than asking them to tune a clustering distance.
+#
+# 0.8 is measured, not copied. Sherpa's own examples pass 0.5, but they pin
+# num_clusters alongside it, which makes the threshold inert. Against the four
+# files in sherpa's own CI, whose speaker counts are known (4, 2, 2, 2), the
+# auto path scores 1/4 at 0.5 -- it splits a two-person call into four speakers
+# -- 4/4 at 0.8 and 0.9, and 3/4 at 1.0, which merges the four-speaker file
+# down to three. 0.8 is the safe end of the plateau that is right on all four.
+DIARIZE_THRESHOLD = 0.8
+DIARIZE_MIN_DURATION_ON = 0.3
+DIARIZE_MIN_DURATION_OFF = 0.5
+
+# A healthy child emits progress at least once per percent, so this much silence
+# means it is wedged rather than busy.
+DIARIZE_STALL_SECONDS = 120
+DIARIZE_MARK = "@@DIARIZE@@"
+
+# Pinned by SHA-256 on purpose. A truncated .onnx fails deep inside ONNX Runtime
+# with nothing useful to say, which is the same shape as the cuBLAS bug this
+# repo already fixed once; better to catch it at download time. Note that the
+# upstream release tag really is spelled "recongition".
+DIARIZE_MODELS: dict[str, dict[str, Any]] = {
+    "segmentation": {
+        "url": "https://github.com/k2-fsa/sherpa-onnx/releases/download/"
+        "speaker-segmentation-models/"
+        "sherpa-onnx-pyannote-segmentation-3-0.tar.bz2",
+        # The tarball also carries fp32 weights, 4x the size for no difference
+        # worth paying for here.
+        "member": "sherpa-onnx-pyannote-segmentation-3-0/model.int8.onnx",
+        "file": "segmentation.int8.onnx",
+        "bytes": 1_540_506,
+        "sha256": "d582f4b4c6b48205de7e0643c57df0df5615a3c176189be3fc461e9d18827b5d",
+    },
+    "embedding": {
+        "url": "https://github.com/k2-fsa/sherpa-onnx/releases/download/"
+        "speaker-recongition-models/nemo_en_titanet_small.onnx",
+        "member": None,
+        "file": "embedding.onnx",
+        "bytes": 40_257_283,
+        "sha256": "ad4a1802485d8b34c722d2a9d04249662f2ece5d28a7a039063ca22f515a789e",
+    },
+}
+
+# The child. Kept as a string so transcribe_server.py stays one file: this runs
+# as `sys.executable -c`, and under `uv run` that interpreter already has the
+# inline dependencies, sherpa-onnx among them. It prints one JSON object per
+# line, each prefixed with a marker handed to it as argv[1] -- passing it rather
+# than repeating the literal means the two sides cannot drift apart. The prefix
+# is what stops anything ONNX Runtime decides to log being read as a result.
+DIARIZE_WORKER = r'''
+import json, sys
+
+import sherpa_onnx
+from faster_whisper.audio import decode_audio
+
+MARK = ""
+
+
+def emit(payload):
+    sys.stdout.write(MARK + json.dumps(payload) + "\n")
+    sys.stdout.flush()
+
+
+def fail(message):
+    emit({"t": "error", "error": message})
+    return 1
+
+
+def main():
+    global MARK
+    MARK = sys.argv[1]
+    (audio_path, seg_model, emb_model, num_speakers, threshold,
+     min_on, min_off, threads) = sys.argv[2:10]
+
+    # 0 from the UI means "work it out from the audio". The sentinel sherpa
+    # documents for that is -1; passing 0 happens to behave the same way, and
+    # relying on an undocumented coincidence is not worth it.
+    clusters = int(num_speakers) if int(num_speakers) > 0 else -1
+
+    # PyAV through faster-whisper: bundled FFmpeg, no system binary, and the
+    # same decode path the transcription used.
+    audio = decode_audio(audio_path, sampling_rate=16000)
+    if audio.size == 0:
+        return fail("no audio could be decoded from the file")
+
+    config = sherpa_onnx.OfflineSpeakerDiarizationConfig(
+        segmentation=sherpa_onnx.OfflineSpeakerSegmentationModelConfig(
+            pyannote=sherpa_onnx.OfflineSpeakerSegmentationPyannoteModelConfig(
+                model=seg_model, window_shift_ratio=0.1
+            ),
+            num_threads=int(threads),
+        ),
+        embedding=sherpa_onnx.SpeakerEmbeddingExtractorConfig(
+            model=emb_model, num_threads=int(threads)
+        ),
+        clustering=sherpa_onnx.FastClusteringConfig(
+            num_clusters=clusters, threshold=float(threshold)
+        ),
+        min_duration_on=float(min_on),
+        min_duration_off=float(min_off),
+    )
+    if not config.validate():
+        return fail("the diarization models are present but were rejected; "
+                    "delete them and let the server fetch them again")
+
+    diarizer = sherpa_onnx.OfflineSpeakerDiarization(config)
+    if diarizer.sample_rate != 16000:
+        return fail("the decoder produced %d Hz, expected 16000"
+                    % diarizer.sample_rate)
+
+    last = [-1]
+
+    def progress(done, total):
+        percent = int(done * 100 / total) if total else 100
+        if percent != last[0]:
+            last[0] = percent
+            emit({"t": "progress", "v": percent})
+        return 0
+
+    result = diarizer.process(audio, callback=progress).sort_by_start_time()
+    emit({"t": "turns", "turns": [[float(r.start), float(r.end), int(r.speaker)]
+                                   for r in result]})
+    return 0
+
+
+sys.exit(main())
+'''
+
+
+def diarize_model_dir() -> Path:
+    return WORK_DIR / "diarize-models"
+
+
+def _sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as fh:
+        for block in iter(lambda: fh.read(1 << 20), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def _download(url: str, dest: Path) -> None:
+    # Every URL here is a module constant, but a wrong scheme would be a quiet
+    # local-file read, so say no rather than trusting the table. The noqas are
+    # for the same rule on the two lines that actually open it.
+    if not url.startswith("https://"):
+        raise RuntimeError(f"refusing to fetch model weights from {url!r}")
+    request = urllib.request.Request(  # noqa: S310
+        url, headers={"User-Agent": "transcribe-server"}
+    )
+    with urllib.request.urlopen(request, timeout=60) as response:  # noqa: S310
+        with dest.open("wb") as fh:
+            shutil.copyfileobj(response, fh)
+
+
+def ensure_diarize_models() -> dict[str, Path]:
+    """Fetch the diarization weights once, into the work dir.
+
+    They do not come from Hugging Face, so they do not belong in its cache, and
+    they are small enough that re-verifying the hash on every job is cheaper
+    than remembering that we checked.
+    """
+    directory = diarize_model_dir()
+    directory.mkdir(parents=True, exist_ok=True)
+    with contextlib.suppress(OSError):
+        os.chmod(directory, 0o700)
+
+    resolved: dict[str, Path] = {}
+    for key, spec in DIARIZE_MODELS.items():
+        dest = directory / str(spec["file"])
+        if dest.is_file() and _sha256_file(dest) == spec["sha256"]:
+            resolved[key] = dest
+            continue
+
+        # Staged next to the target and renamed only once it verifies, so an
+        # interrupted download can never be mistaken for a usable model.
+        stage = dest.with_name(dest.name + ".tmp")
+        try:
+            _download(str(spec["url"]), stage)
+            member = spec["member"]
+            if member:
+                with tarfile.open(stage, "r:bz2") as archive:
+                    source = archive.extractfile(str(member))
+                    if source is None:
+                        raise RuntimeError(f"{member} is not in the archive")
+                    with dest.open("wb") as fh:
+                        shutil.copyfileobj(source, fh)
+                stage.unlink()
+                staged = dest
+            else:
+                staged = stage
+            actual = _sha256_file(staged)
+            if actual != spec["sha256"]:
+                raise RuntimeError(
+                    f"checksum mismatch for {spec['file']} "
+                    f"(got {actual[:16]}..., expected {str(spec['sha256'])[:16]}...)"
+                )
+            if staged is not dest:
+                staged.replace(dest)
+        except Exception:
+            with contextlib.suppress(OSError):
+                stage.unlink()
+            with contextlib.suppress(OSError):
+                if dest.is_file() and _sha256_file(dest) != spec["sha256"]:
+                    dest.unlink()
+            raise
+        resolved[key] = dest
+    return resolved
+
+
+def _overlap(a_start: float, a_end: float, b_start: float, b_end: float) -> float:
+    return max(0.0, min(a_end, b_end) - max(a_start, b_start))
+
+
+def relabel_speakers(turns: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Renumber so Speaker 1 is whoever speaks first.
+
+    Cluster ids come out of the diarizer in arbitrary order, and a transcript
+    that opens with "Speaker 3" reads like a bug even when it is correct.
+    """
+    order: dict[int, int] = {}
+    out = []
+    for turn in sorted(turns, key=lambda t: (t["start"], t["end"])):
+        raw = int(turn["speaker"])
+        if raw not in order:
+            order[raw] = len(order) + 1
+        out.append(
+            {
+                "start": round(float(turn["start"]), 2),
+                "end": round(float(turn["end"]), 2),
+                "speaker": order[raw],
+            }
+        )
+    return out
+
+
+def speaker_label(speaker: int) -> str:
+    return f"Speaker {speaker}"
+
+
+def segment_speaker(segment: dict[str, Any]) -> int | None:
+    """The speaker on a segment, or None when the job was not diarized."""
+    value = segment.get("speaker")
+    return value if isinstance(value, int) else None
+
+
+def align_speakers(
+    segments: list[dict[str, Any]], turns: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Label every segment, splitting one where the speaker changes mid-sentence.
+
+    This is the part that decides whether the output is readable. A Whisper
+    segment can span four speaker turns, and giving the whole thing to its
+    dominant speaker produces a transcript that is confidently wrong in a way
+    nobody can see.
+
+    So the split is done at word granularity: each word is bucketed into the
+    turn it overlaps most, runs of one speaker become segments, and the text is
+    rebuilt from the word tokens — which carry their own leading whitespace, so
+    the original spacing survives the surgery.
+
+    Both lists are time-ordered, so one cursor walks them together: everything
+    before it has already ended, and the only turns that can overlap a word are
+    the ones from the cursor forward that start before the word ends.
+    """
+    if not turns:
+        return segments
+
+    ordered = sorted(turns, key=lambda t: (t["start"], t["end"]))
+    cursor = 0
+
+    def speaker_for(start: float, end: float) -> int | None:
+        nonlocal cursor
+        while cursor < len(ordered) and ordered[cursor]["end"] <= start:
+            cursor += 1
+        best: int | None = None
+        best_overlap = 0.0
+        index = cursor
+        while index < len(ordered) and ordered[index]["start"] < end:
+            amount = _overlap(
+                start, end, ordered[index]["start"], ordered[index]["end"]
+            )
+            if amount > best_overlap:
+                best = int(ordered[index]["speaker"])
+                best_overlap = amount
+            index += 1
+        if best is not None:
+            return best
+        # No overlap anywhere: the word sits in a pause the diarizer dropped.
+        # Take the nearest turn rather than inventing a fourth speaker — and
+        # note that nearest is not always the *next* one, since a word trailing
+        # a long silence usually belongs to the turn that just ended.
+        before = ordered[cursor - 1] if cursor > 0 else None
+        after = ordered[cursor] if cursor < len(ordered) else None
+        if before is None:
+            return int(after["speaker"]) if after is not None else None
+        if after is None:
+            return int(before["speaker"])
+        gap_before = start - float(before["end"])
+        gap_after = float(after["start"]) - end
+        nearest = before if gap_before <= gap_after else after
+        return int(nearest["speaker"])
+
+    out: list[dict[str, Any]] = []
+    for segment in segments:
+        words = segment.get("words")
+        if not words:
+            entry = dict(segment)
+            entry["speaker"] = speaker_for(
+                float(segment["start"]), float(segment["end"])
+            )
+            out.append(entry)
+            continue
+
+        runs: list[tuple[int | None, list[dict[str, Any]]]] = []
+        for word in words:
+            speaker = speaker_for(float(word["start"]), float(word["end"]))
+            if runs and runs[-1][0] == speaker:
+                runs[-1][1].append(word)
+            else:
+                runs.append((speaker, [word]))
+
+        split: list[dict[str, Any]] = []
+        for speaker, group in runs:
+            text = "".join(str(w["word"]) for w in group).strip()
+            if not text:
+                continue
+            split.append(
+                {
+                    "start": round(float(group[0]["start"]), 2),
+                    "end": round(float(group[-1]["end"]), 2),
+                    "text": text,
+                    "speaker": speaker,
+                    "words": group,
+                }
+            )
+        if not split:
+            # Every word stripped to nothing, which should not happen; keep the
+            # text rather than lose it.
+            entry = dict(segment)
+            entry["speaker"] = speaker_for(
+                float(segment["start"]), float(segment["end"])
+            )
+            out.append(entry)
+        else:
+            out.extend(split)
+    return out
+
+
+def fetch_diarize_models_or_explain() -> dict[str, Path]:
+    """Fetch the weights, or raise something the operator can act on."""
+    try:
+        return ensure_diarize_models()
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError(
+            f"could not fetch the diarization models ({redact(str(exc), 200)}). "
+            "They are a one-time ~42 MB download; check this machine can reach "
+            "github.com, or start the server with --no-diarize"
+        ) from exc
+
+
+def run_diarizer(
+    audio_path: str,
+    speakers: int,
+    models: dict[str, Path],
+    on_progress: Callable[[int], None] | None = None,
+    cancelled: Callable[[], bool] | None = None,
+) -> list[dict[str, Any]] | None:
+    """Diarize one file in a child process and return its turns.
+
+    The two callbacks are optional so that --preload can exercise this exact
+    path with no job to report against: the probe has to prove the real thing
+    works, not a parallel path that only the probe ever uses.
+
+    Returns None when `cancelled` asked us to stop.
+    """
+
+    def stopped() -> bool:
+        return bool(cancelled and cancelled())
+
+    if stopped():
+        return None
+
+    command = [
+        sys.executable,
+        "-c",
+        DIARIZE_WORKER,
+        DIARIZE_MARK,
+        audio_path,
+        str(models["segmentation"]),
+        str(models["embedding"]),
+        str(speakers),
+        f"{DIARIZE_THRESHOLD:g}",
+        f"{DIARIZE_MIN_DURATION_ON:g}",
+        f"{DIARIZE_MIN_DURATION_OFF:g}",
+        str(diarize_threads()),
+    ]
+
+    creation = 0
+    if sys.platform == "win32":
+        # Otherwise a console window flashes up on every diarized job.
+        creation = subprocess.CREATE_NO_WINDOW  # pyright: ignore[reportAttributeAccessIssue]
+
+    # Not untrusted input: sys.executable, a source string compiled into this
+    # file, and paths this server created.
+    child = subprocess.Popen(  # noqa: S603
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        stdin=subprocess.DEVNULL,
+        text=True,
+        bufsize=1,
+        creationflags=creation,
+    )
+
+    # A reader thread rather than reading in the worker thread: it lets us wait
+    # with a timeout (so a wedged child is caught) and notice a cancel between
+    # lines. It only blocks on a pipe, which releases the GIL, so it cannot
+    # recreate the problem this whole design exists to avoid.
+    lines: queue.Queue[str | None] = queue.Queue()
+
+    def pump() -> None:
+        stream = child.stdout
+        try:
+            if stream is not None:
+                for line in stream:
+                    lines.put(line)
+        finally:
+            lines.put(None)
+
+    threading.Thread(target=pump, daemon=True).start()
+
+    turns: list[dict[str, Any]] | None = None
+    error: str | None = None
+    noise: list[str] = []
+    try:
+        while True:
+            if stopped():
+                return None
+            try:
+                line = lines.get(timeout=DIARIZE_STALL_SECONDS)
+            except queue.Empty:
+                raise RuntimeError(
+                    f"the diarizer stopped responding for {DIARIZE_STALL_SECONDS}s "
+                    "and was killed"
+                ) from None
+            if line is None:
+                break
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if not stripped.startswith(DIARIZE_MARK):
+                # ONNX Runtime warnings and the like. Kept for the error text.
+                noise.append(stripped)
+                del noise[:-4]
+                continue
+            try:
+                payload = json.loads(stripped[len(DIARIZE_MARK) :])
+            except ValueError:
+                continue
+            kind = payload.get("t")
+            if kind == "progress":
+                percent = as_int(payload.get("v"), 0)
+                # Fill the last tenth of the meter, which the transcription
+                # loop deliberately left free when labels were requested.
+                if on_progress is not None:
+                    on_progress(percent)
+            elif kind == "turns":
+                turns = [
+                    {"start": float(t[0]), "end": float(t[1]), "speaker": int(t[2])}
+                    for t in payload.get("turns", [])
+                ]
+            elif kind == "error":
+                error = str(payload.get("error") or "the diarizer failed")
+    finally:
+        if child.poll() is None:
+            child.terminate()
+            try:
+                child.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                child.kill()
+                child.wait(timeout=5)
+        if child.stdout is not None:
+            child.stdout.close()
+
+    if error:
+        raise RuntimeError(error)
+    if turns is None:
+        detail = f" Last output: {' '.join(noise)}" if noise else ""
+        raise RuntimeError(f"the diarizer produced no result.{detail}")
+    if child.returncode not in (0, None) and not turns:
+        detail = f" Last output: {' '.join(noise)}" if noise else ""
+        raise RuntimeError(f"the diarizer exited with {child.returncode}.{detail}")
+    return relabel_speakers(turns)
+
+
+def diarize_job(
+    job_id: str, audio_path: str, opts: dict[str, Any]
+) -> list[dict[str, Any]] | None:
+    """The job-aware wrapper: fetch, report progress, honour Cancel."""
+    patch_job(job_id, message="Fetching diarization models", phase="diarizing")
+    models = fetch_diarize_models_or_explain()
+    if job_cancelled(job_id):
+        return None
+
+    def note(percent: int) -> None:
+        if not job_cancelled(job_id):
+            patch_job(
+                job_id,
+                progress=min(0.9 + percent / 1000.0, 0.99),
+                message=f"Identifying speakers {percent}%",
+            )
+
+    patch_job(job_id, message="Identifying speakers", phase="diarizing")
+    return run_diarizer(
+        audio_path,
+        as_int(opts.get("speakers"), 0),
+        models,
+        on_progress=note,
+        cancelled=lambda: job_cancelled(job_id),
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -1342,7 +1921,7 @@ def run_job(job_id: str) -> None:
         prune_jobs()
         return
 
-    patch_job(job_id, state="running", message="Transcribing")
+    patch_job(job_id, state="running", message="Transcribing", phase="transcribing")
     audit(
         "job.started",
         job=job_id,
@@ -1389,7 +1968,11 @@ def run_job(job_id: str) -> None:
                     ]
             collected.append(entry)
 
-            progress = min(seg.end / duration, 1.0) if duration else 0.0
+            # When labels are coming, the meter deliberately stops at 90% here
+            # so the diarization pass has somewhere to go. Otherwise it would
+            # sit at 100% while the second pass ran, looking stuck.
+            ceiling = 0.9 if opts["diarize"] else 1.0
+            progress = min(seg.end / duration, 1.0) * ceiling if duration else 0.0
             stop = False
             with JOBS_LOCK:
                 live = JOBS.get(job_id)
@@ -1403,12 +1986,69 @@ def run_job(job_id: str) -> None:
                 # and threading.Lock is not reentrant.
                 return
 
+        # Speaker labels are a second pass over the audio, and they are worth
+        # less than the transcript itself: if anything goes wrong in here the
+        # job still finishes, unlabelled, and says why. Losing an hour of
+        # transcription because a 42 MB download failed would be absurd.
+        diarize_note: str | None = None
+        if opts["diarize"] and collected:
+            diarize_started = time.time()
+            try:
+                turns = diarize_job(job_id, job["path"], opts)
+            except Exception as exc:  # noqa: BLE001
+                traceback.print_exc()
+                diarize_note = friendly_error(exc)
+                audit(
+                    "job.diarize_failed",
+                    job=job_id,
+                    file=job["filename"],
+                    reason=type(exc).__name__,
+                    message=redact(str(exc)),
+                )
+            else:
+                if turns is None:
+                    return  # cancelled while the child was running
+                if not turns:
+                    diarize_note = "the diarizer found no speech"
+                else:
+                    before = len(collected)
+                    collected = align_speakers(collected, turns)
+                    # patch_job is what refuses a cancelled job, not us:
+                    # overwriting one with a finished result is the exact bug
+                    # that return value exists to prevent.
+                    if not patch_job(job_id, segments=list(collected)):
+                        return
+                    audit(
+                        "job.diarized",
+                        job=job_id,
+                        file=job["filename"],
+                        backend="sherpa-onnx",
+                        segmentation=DIARIZE_MODELS["segmentation"]["file"],
+                        embedding=DIARIZE_MODELS["embedding"]["file"],
+                        requested=opts["speakers"],
+                        threshold=DIARIZE_THRESHOLD,
+                        speakers=len(
+                            {
+                                speaker
+                                for speaker in map(segment_speaker, collected)
+                                if speaker is not None
+                            }
+                        ),
+                        segments_before=before,
+                        segments_after=len(collected),
+                        elapsed=round(time.time() - diarize_started, 1),
+                    )
+
+        message = f"{len(collected)} segments"
+        if diarize_note:
+            message += f" \u00b7 no speaker labels ({diarize_note})"
+
         if not patch_job(
             job_id,
             state="done",
             progress=1.0,
             finished=time.time(),
-            message=f"{len(collected)} segments",
+            message=message,
         ):
             return  # cancelled while finishing; don't claim success
         audit(
@@ -1487,34 +2127,73 @@ def _stamp(seconds: float, comma: bool = False) -> str:
     return f"{h:02d}:{m:02d}:{s:02d}{sep}{ms:03d}"
 
 
+def speaker_summary(segs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Per-speaker totals, or an empty list when the job was not diarized."""
+    totals: dict[int, dict[str, Any]] = {}
+    for segment in segs:
+        speaker = segment_speaker(segment)
+        if speaker is None:
+            continue
+        entry = totals.setdefault(
+            speaker,
+            {
+                "speaker": speaker,
+                "label": speaker_label(speaker),
+                "segments": 0,
+                "seconds": 0.0,
+            },
+        )
+        entry["segments"] += 1
+        entry["seconds"] += max(0.0, float(segment["end"]) - float(segment["start"]))
+    for entry in totals.values():
+        entry["seconds"] = round(entry["seconds"], 2)
+    return [totals[key] for key in sorted(totals)]
+
+
 def render(job: dict[str, Any], fmt: str) -> tuple[str, str]:
-    """Return (body, mime) for the requested format."""
+    """Return (body, mime) for the requested format.
+
+    A job that was not diarized produces byte-identical output to before: the
+    speaker prefix is driven by the presence of a label on the segment, not by
+    the option, so an old job and a failing diarization pass both fall through
+    to the plain transcript.
+    """
     segs = job["segments"]
 
+    def spoken(segment: dict[str, Any]) -> str:
+        speaker = segment_speaker(segment)
+        if speaker is None:
+            return str(segment["text"])
+        return f"{speaker_label(speaker)}: {segment['text']}"
+
     if fmt == "txt":
-        return "\n".join(s["text"] for s in segs) + "\n", "text/plain; charset=utf-8"
+        return "\n".join(spoken(s) for s in segs) + "\n", "text/plain; charset=utf-8"
 
     if fmt == "timestamped":
-        lines = [f"[{_stamp(s['start'])}] {s['text']}" for s in segs]
+        lines = [f"[{_stamp(s['start'])}] {spoken(s)}" for s in segs]
         return "\n".join(lines) + "\n", "text/plain; charset=utf-8"
 
     if fmt == "srt":
+        # SRT has no voice construct, so the label is part of the cue text.
         blocks = []
         for i, s in enumerate(segs, 1):
             blocks.append(
                 f"{i}\n{_stamp(s['start'], comma=True)} --> "
-                f"{_stamp(s['end'], comma=True)}\n{s['text']}\n"
+                f"{_stamp(s['end'], comma=True)}\n{spoken(s)}\n"
             )
         return "\n".join(blocks), "application/x-subrip; charset=utf-8"
 
     if fmt == "vtt":
+        # WebVTT does have one, and players use it to style the speaker.
         blocks = ["WEBVTT\n"]
         for s in segs:
-            blocks.append(f"{_stamp(s['start'])} --> {_stamp(s['end'])}\n{s['text']}\n")
+            speaker = segment_speaker(s)
+            text = s["text"] if speaker is None else f"<v {speaker_label(speaker)}>{s['text']}"
+            blocks.append(f"{_stamp(s['start'])} --> {_stamp(s['end'])}\n{text}\n")
         return "\n".join(blocks), "text/vtt; charset=utf-8"
 
     if fmt == "json":
-        payload = {
+        payload: dict[str, Any] = {
             "filename": job["filename"],
             "language": job["language"],
             "duration": job["duration"],
@@ -1523,6 +2202,11 @@ def render(job: dict[str, Any], fmt: str) -> tuple[str, str]:
             "options": public_opts(job["opts"]),
             "segments": segs,
         }
+        speakers = speaker_summary(segs)
+        if speakers:
+            # Only present when there is something to say, so the shape of a
+            # plain export does not change.
+            payload["speakers"] = speakers
         return (
             json.dumps(payload, indent=2, ensure_ascii=False),
             "application/json; charset=utf-8",
@@ -1801,6 +2485,8 @@ def status() -> dict[str, Any]:
         "model_cache": ARGS.model_cache,
         "max_upload_mb": ARGS.max_upload_mb,
         "retry_available": ARGS.source_retention != "run",
+        "allow_diarize": ARGS.allow_diarize,
+        "diarize_max_speakers": DIARIZE_MAX_SPEAKERS,
         "prompt_limit": PROMPT_LIMIT,
         "hotwords_limit": HOTWORDS_LIMIT,
     }
@@ -1857,6 +2543,8 @@ async def create_job(
     word_timestamps: str = Form("false"),
     min_silence_ms: int = Form(2000),
     speech_pad_ms: int = Form(400),
+    diarize: str = Form("false"),
+    speakers: int = Form(0),
 ) -> dict[str, Any]:
     opts = build_opts(
         model,
@@ -1871,6 +2559,8 @@ async def create_job(
         word_timestamps,
         min_silence_ms,
         speech_pad_ms,
+        diarize,
+        speakers,
     )
 
     with JOBS_LOCK:
@@ -1940,6 +2630,8 @@ def retry_job(
     word_timestamps: str = Form("false"),
     min_silence_ms: int = Form(2000),
     speech_pad_ms: int = Form(400),
+    diarize: str = Form("false"),
+    speakers: int = Form(0),
 ) -> dict[str, Any]:
     """Re-run the same source audio with different settings, no re-upload."""
     old = get_job(job_id)
@@ -1966,6 +2658,8 @@ def retry_job(
         word_timestamps,
         min_silence_ms,
         speech_pad_ms,
+        diarize,
+        speakers,
     )
 
     with JOBS_LOCK:
@@ -2330,6 +3024,17 @@ PAGE = r"""<!doctype html>
     font-variant-numeric:tabular-nums;user-select:none;
   }
   .seg .tx{flex:1 1 auto;min-width:0;white-space:pre-wrap}
+  /* Speaker column. Fixed width so names line up down the page, and present
+     even when empty (a job without labels) so rows do not shift when the
+     labels arrive at the end of the run. */
+  .seg .sp{
+    flex:0 0 auto;width:9ch;color:var(--muted);
+    font-family:var(--display);font-size:13px;line-height:1.6;
+    overflow:hidden;text-overflow:ellipsis;white-space:nowrap;user-select:none;
+  }
+  .seg .sp.s0{color:var(--amber)}
+  .seg .sp.s1{color:var(--red)}
+  .seg .sp.s2{color:var(--green)}
   /* Following is on but the view is parked somewhere else: saying so beats
      letting it look broken. */
   .transcript.paused{border-color:var(--amber-dim)}
@@ -2467,7 +3172,21 @@ PAGE = r"""<!doctype html>
         </div>
         <small class="hint">Carrying context forward is off by default: on long
         recordings it's the usual cause of Whisper repeating a phrase for minutes.
-        Word timings cost time, and help if you later run diarization.</small>
+        Word timings cost time, and are switched on for you when you ask for
+        speaker labels.</small>
+
+        <div class="adv-row" id="diarize-row">
+          <label class="field"><input type="checkbox" id="diarize"> Identify speakers</label>
+          <label class="field-block">
+            <span>Speakers</span>
+            <input type="number" id="speakers" value="0" min="0" max="10" step="1">
+          </label>
+        </div>
+        <small class="hint" id="diarize-hint">Labels voices as Speaker 1, 2, 3
+        &mdash; anonymous, and only consistent within this recording; they do not
+        carry over to the next one. Set Speakers to 0 to work the count out from
+        the audio, or to the number you know for a much better result. A second
+        pass over the audio, and the first run downloads ~42 MB of models.</small>
 
         <div class="adv-row" id="vad-tuning">
           <label class="field-block">
@@ -2563,6 +3282,7 @@ async function refreshStatus(){
       ? s.loaded_models.join(", ") : "none";
     MAX_MB = s.max_upload_mb;
     RETRY_OK = s.retry_available;
+    DIARIZE_OK = !!s.allow_diarize;
 
     if(!POPULATED){
       POPULATED = true;
@@ -2572,6 +3292,10 @@ async function refreshStatus(){
       // Precision is a property of this machine, not of a recording. It only
       // appears if the operator explicitly opened it up.
       if(s.allow_precision_choice) el("compute-field").classList.remove("locked");
+      if(!DIARIZE_OK){
+        el("diarize-row").style.display = "none";
+        el("diarize-hint").style.display = "none";
+      }
       if(!s.allow_model_choice){
         el("model").disabled = true;
         el("model").title = "Pinned by the server";
@@ -2587,7 +3311,7 @@ async function refreshStatus(){
 }
 
 /* ---------- upload ---------- */
-let MAX_MB = 0, RETRY_OK = true, POPULATED = false;
+let MAX_MB = 0, RETRY_OK = true, POPULATED = false, DIARIZE_OK = false;
 
 function fill(id, values, selected){
   const node = el(id);
@@ -2614,6 +3338,8 @@ function currentSettings(){
   fd.append("translate", el("translate").checked ? "true" : "false");
   fd.append("condition", el("condition").checked ? "true" : "false");
   fd.append("word_timestamps", el("words").checked ? "true" : "false");
+  fd.append("diarize", (DIARIZE_OK && el("diarize").checked) ? "true" : "false");
+  fd.append("speakers", el("speakers").value || "0");
   fd.append("min_silence_ms", el("min-silence").value || "2000");
   fd.append("speech_pad_ms", el("speech-pad").value || "400");
   return fd;
@@ -2661,6 +3387,19 @@ el("vad").addEventListener("change", () => {
   el("vad-tuning").style.display = el("vad").checked ? "" : "none";
 });
 
+/* Asking for speaker labels asks for word timings, because without them a whole
+   Whisper segment can only be handed to its dominant speaker — which is the
+   version of this feature that is confidently wrong. The box is ticked and
+   locked rather than quietly overridden, so the cost is visible. */
+function syncDiarize(){
+  const on = el("diarize").checked;
+  if(on) el("words").checked = true;
+  el("words").disabled = on;
+  el("words").title = on ? "Required for speaker labels" : "";
+}
+el("diarize").addEventListener("change", syncDiarize);
+syncDiarize();
+
 /* ---------- following the transcript ---------- */
 /* Auto-scroll for the job previews, on by default and remembered for the
    session: a switch that quietly comes back on after every reload is worse
@@ -2695,6 +3434,9 @@ function statusLine(job){
   if(job.state === "queued")  return "Waiting for the GPU";
   if(job.state === "loading") return "Loading " + esc(job.opts.model);
   if(job.state === "running"){
+    // The diarization pass has no useful ETA of its own, and the meter is in
+    // its last tenth by then, so report the phase rather than a wrong guess.
+    if(job.phase === "diarizing") return esc(job.message || "Identifying speakers");
     const pct = Math.round((job.progress||0)*100);
     const eta = job.progress > 0.02
       ? " \u00b7 about " + fmtTime(job.elapsed/job.progress - job.elapsed) + " left"
@@ -2720,6 +3462,10 @@ function jobTags(job){
   if(o.condition) bits.push("context on");
   if(o.word_timestamps) bits.push("word times");
   if(o.has_hotwords) bits.push("terms");
+  const found = new Set((job.segments || [])
+    .map(s => s.speaker).filter(v => v != null));
+  if(o.diarize && found.size)
+    bits.push(found.size + (found.size === 1 ? " speaker" : " speakers"));
   if(job.duration) bits.push(fmtTime(job.duration));
   return bits.join(" \u00b7 ");
 }
@@ -2777,6 +3523,7 @@ function createCard(job){
     shown: 0,
     paused: false,
     live: false,
+    labeled: false,
   };
   /* Scrolling away from the newest line pauses; coming back re-arms. The
      Follow switch stays the authoritative off switch. */
@@ -2794,6 +3541,17 @@ function createCard(job){
    text needs no escaping and cannot become markup. */
 function appendSegments(view, segments, live){
   view.live = live;
+  /* Labels arrive in one batch when the diarization pass ends, so every row
+     already on screen was drawn without them, and counting new segments is not
+     enough to notice. Compare the shape and rebuild once when it changes. */
+  const labeled = segments.length > 0 && segments[0].speaker != null;
+  let rebuilt = false;
+  if(labeled !== view.labeled){
+    view.transcript.textContent = "";
+    view.shown = 0;
+    view.labeled = labeled;
+    rebuilt = true;
+  }
   if(segments.length < view.shown){
     view.transcript.textContent = "";
     view.shown = 0;
@@ -2805,16 +3563,27 @@ function appendSegments(view, segments, live){
     const ts = document.createElement("span");
     ts.className = "ts";
     ts.textContent = fmtStamp(seg.start);
+    const sp = document.createElement("span");
+    sp.className = "sp";
+    if(seg.speaker != null){
+      sp.textContent = "Speaker " + seg.speaker;
+      // Three colours, cycled: enough to tell voices apart at a glance while
+      // staying readable, and no legend to maintain.
+      sp.classList.add("s" + ((seg.speaker - 1) % 3));
+      sp.title = sp.textContent;
+    }
     const tx = document.createElement("span");
     tx.className = "tx";
     tx.textContent = seg.text;
-    row.append(ts, tx);
+    row.append(ts, sp, tx);
     view.transcript.append(row);
   }
   view.shown = segments.length;
   /* Only chase a job that is still producing text: a finished transcript should
-     open at its first line, not at its last. */
-  if(live) stick(view);
+     open at its first line, not at its last. A rebuild is the exception —
+     clearing the transcript resets the scroll, so someone who was following a
+     live job would be thrown back to the top the moment the labels landed. */
+  if(live || rebuilt) stick(view);
 }
 
 function actionsHtml(job){
@@ -3379,6 +4148,7 @@ DEFAULTS: dict[str, Any] = {
     "model_cache": 1,
     "allow_model_choice": True,
     "allow_precision_choice": False,
+    "allow_diarize": True,
     "preload": False,
     "max_upload_mb": 2048,
     "max_queue": 20,
@@ -3417,6 +4187,7 @@ ENV_OPTIONS: dict[str, tuple[str, str]] = {
     "TRANSCRIBE_COMPUTE_TYPE": ("compute_type", "str"),
     "TRANSCRIBE_QUALITY": ("quality", "str"),
     "TRANSCRIBE_MODEL_CACHE": ("model_cache", "int"),
+    "TRANSCRIBE_ALLOW_DIARIZE": ("allow_diarize", "bool"),
     "TRANSCRIBE_PRELOAD": ("preload", "bool"),
     "TRANSCRIBE_MAX_UPLOAD_MB": ("max_upload_mb", "int"),
     "TRANSCRIBE_MAX_QUEUE": ("max_queue", "int"),
@@ -3773,6 +4544,14 @@ def build_parser() -> argparse.ArgumentParser:
         "precision is a property of the machine, not the recording)",
     )
     gpu.add_argument(
+        "--no-diarize",
+        dest="allow_diarize",
+        action="store_false",
+        default=argparse.SUPPRESS,
+        help="remove the speaker-identification control entirely, so the "
+        "diarization models are never fetched or loaded",
+    )
+    gpu.add_argument(
         "--preload",
         action="store_true",
         default=argparse.SUPPRESS,
@@ -3963,6 +4742,7 @@ def startup_snapshot(args: argparse.Namespace, cfg: Path | None) -> dict[str, An
         "preload": args.preload,
         "allow_model_choice": args.allow_model_choice,
         "allow_precision_choice": args.allow_precision_choice,
+        "allow_diarize": args.allow_diarize,
         "auth": bool(args.token),
         "audit": args.audit,
         "audit_reads": args.audit_reads,
@@ -4000,6 +4780,28 @@ def sweep_uploads() -> tuple[int, int]:
     return count, total
 
 
+def probe_diarization() -> None:
+    """Prove the diarizer runs end to end, not merely that it imports.
+
+    Same reasoning as verify_device: these weights are a separate download from
+    the Whisper ones, and a truncated file fails deep inside ONNX Runtime rather
+    than at load. One second of silence exercises the fetch, the checksum, the
+    child process and a real inference — which is all the first job would do.
+    """
+    audio = WORK_DIR / "diarize-probe.wav"
+    audio.parent.mkdir(parents=True, exist_ok=True)
+    with wave.open(str(audio), "wb") as handle:
+        handle.setnchannels(1)
+        handle.setsampwidth(2)
+        handle.setframerate(16000)
+        handle.writeframes(b"\x00\x00" * 16000)
+    try:
+        run_diarizer(str(audio), 0, fetch_diarize_models_or_explain())
+    finally:
+        with contextlib.suppress(OSError):
+            audio.unlink()
+
+
 def preload_model(args: argparse.Namespace) -> None:
     """Load the default model and prove it can encode, or exit with advice.
 
@@ -4022,6 +4824,19 @@ def preload_model(args: argparse.Namespace) -> None:
         print("   Refusing to serve jobs that cannot succeed.\n")
         raise SystemExit(1) from None
     print("Model ready.")
+
+    if not args.allow_diarize:
+        return
+    print("Checking speaker identification ...")
+    try:
+        probe_diarization()
+    except Exception as exc:  # noqa: BLE001
+        print(f"\n!  speaker identification cannot run: {friendly_error(exc)}")
+        print("   Transcription is unaffected. Either start with --no-diarize to")
+        print("   remove the control, or fix the problem above.")
+        print("   Refusing to offer a control that cannot succeed.\n")
+        raise SystemExit(1) from None
+    print("Speaker identification ready.")
 
 
 def main() -> None:
@@ -4158,6 +4973,9 @@ def main() -> None:
         )
     print(f"Device     {args.device}{detail}")
     print(f"VRAM cache {args.model_cache} model(s)")
+    print(
+        f"Speakers   {'available (identify)' if args.allow_diarize else 'disabled'}"
+    )
     print(
         f"Sources    retention={args.source_retention}"
         f"{'  retry enabled' if args.source_retention != 'run' else '  retry disabled'}"
