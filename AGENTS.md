@@ -84,11 +84,18 @@ launcher/transcribe_tray.py --self-test --with-server   # also probes a real ser
 
 ## Constraints
 
-- **`transcribe_server.py` must stay a PEP 723 single-file script.** Its
-  dependencies live in the inline `# /// script` block. Do **not** add a
-  `pyproject.toml`: it would change how `uv run transcribe_server.py` resolves
-  dependencies and break the documented zero-setup path. `ruff.toml` and
-  `pyrightconfig.json` are fine because they only configure tooling.
+- **`transcribe_server.py` stays a PEP 723 script.** Its dependencies live in
+  the inline `# /// script` block. Do **not** add a `pyproject.toml`: it would
+  change how `uv run transcribe_server.py` resolves dependencies and break the
+  documented zero-setup path. `ruff.toml` and `pyrightconfig.json` are fine
+  because they only configure tooling.
+- **The pages live in `static/`**, not in the module. They were extracted from
+  embedded string literals to remove ~1,100 lines from the Python file and, more
+  importantly, to stop `esc()` — the only thing between a filename and stored
+  XSS — existing in two copies. `STATIC_DIR` is anchored to the script, so
+  `static/` must sit next to `transcribe_server.py`; a missing directory is a 500
+  that says so rather than a blank page. Anything that ships the script (the
+  PyInstaller spec, the launcher) has to ship `static/` too.
 - Prefer stdlib. New runtime dependencies must go in the inline metadata.
 
 ## Invariants worth not breaking

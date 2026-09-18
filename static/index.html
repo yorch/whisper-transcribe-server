@@ -1,0 +1,134 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>Transcription</title>
+<link rel="stylesheet" href="/static/app.css">
+<link rel="stylesheet" href="/static/index.css">
+</head>
+<body>
+<div class="wrap">
+
+  <div class="readout">
+    <dl><dt>Device</dt><dd><span class="lamp" id="lamp"></span><span id="r-device">checking</span></dd></dl>
+    <dl><dt>Precision</dt><dd id="r-precision">&mdash;</dd></dl>
+    <dl><dt>ffmpeg</dt><dd id="r-ffmpeg">&mdash;</dd></dl>
+    <dl><dt>Queue</dt><dd id="r-queue">0</dd></dl>
+    <dl><dt>Loaded</dt><dd id="r-loaded">none</dd></dl>
+  </div>
+
+  <h1>Transcribe audio on the workstation</h1>
+  <p class="sub">Drop a recording here and it runs through Whisper on the GPU in this
+  machine. Nothing leaves the network.</p>
+
+  <div class="gate locked" id="gate">
+    <p>This server needs an access token. It was printed in the terminal when the
+    server started.</p>
+    <div class="row">
+      <input type="password" id="gate-token" autocomplete="off" spellcheck="false"
+             placeholder="Access token" aria-label="Access token">
+      <button id="gate-go">Unlock</button>
+    </div>
+    <p class="gate-err locked" id="gate-err">That token was rejected. Check the terminal output.</p>
+  </div>
+
+  <div id="main" class="locked">
+    <div class="intake" id="intake" tabindex="0" role="button"
+         aria-label="Choose files to transcribe">
+      <p>Drop files to transcribe</p>
+      <small>or click to browse &middot; audio and video both work</small>
+      <input type="file" id="picker" multiple
+             accept="audio/*,video/*,.m4a,.mp3,.wav,.mp4,.mov,.mkv,.flac,.ogg,.opus,.webm">
+    </div>
+
+    <div class="controls">
+      <label class="field">Model
+        <select id="model"></select>
+      </label>
+      <label class="field">Language
+        <select id="language">
+          <option value="">Detect</option>
+          <option value="en">English</option>
+          <option value="es">Spanish</option>
+          <option value="pt">Portuguese</option>
+          <option value="fr">French</option>
+          <option value="de">German</option>
+          <option value="he">Hebrew</option>
+        </select>
+      </label>
+      <label class="field">Quality
+        <select id="quality"></select>
+      </label>
+      <label class="field locked" id="compute-field">Precision
+        <select id="compute"></select>
+      </label>
+      <label class="field"><input type="checkbox" id="vad" checked> Skip silence</label>
+      <label class="field"><input type="checkbox" id="follow" checked> Follow</label>
+    </div>
+
+    <details class="advanced">
+      <summary>Advanced</summary>
+      <div class="adv-grid">
+        <label class="field-block">
+          <span>Names and terms to expect</span>
+          <textarea id="hotwords" rows="2" spellcheck="false"
+            placeholder="Kubernetes, CODEOWNERS, MCP gateway, PostgreSQL"></textarea>
+          <small class="hint">Comma-separated. Biases the decoder toward words it would
+          otherwise mangle &mdash; product names, acronyms, people.</small>
+        </label>
+
+        <label class="field-block">
+          <span>Context prompt</span>
+          <textarea id="prompt" rows="2" spellcheck="false"
+            placeholder="A recorded engineering planning call about developer tooling."></textarea>
+          <small class="hint">A sentence describing the recording. Nudges style and
+          vocabulary more broadly than the term list above.</small>
+        </label>
+
+        <div class="adv-row">
+          <label class="field"><input type="checkbox" id="translate"> Translate to English</label>
+          <label class="field"><input type="checkbox" id="words"> Word-level timings</label>
+          <label class="field"><input type="checkbox" id="condition"> Carry context forward</label>
+        </div>
+        <small class="hint">Carrying context forward is off by default: on long
+        recordings it's the usual cause of Whisper repeating a phrase for minutes.
+        Word timings cost time, and are switched on for you when you ask for
+        speaker labels.</small>
+
+        <div class="adv-row" id="diarize-row">
+          <label class="field"><input type="checkbox" id="diarize"> Identify speakers</label>
+          <label class="field-block">
+            <span>Speakers</span>
+            <input type="number" id="speakers" value="0" min="0" max="10" step="1">
+          </label>
+        </div>
+        <small class="hint" id="diarize-hint">Labels voices as Speaker 1, 2, 3
+        &mdash; anonymous, and only consistent within this recording; they do not
+        carry over to the next one. Set Speakers to 0 to work the count out from
+        the audio, or to the number you know for a much better result. A second
+        pass over the audio, and the first run downloads ~42 MB of models.</small>
+
+        <div class="adv-row" id="vad-tuning">
+          <label class="field-block">
+            <span>Min silence (ms)</span>
+            <input type="number" id="min-silence" value="2000" min="100" max="10000" step="100">
+          </label>
+          <label class="field-block">
+            <span>Speech padding (ms)</span>
+            <input type="number" id="speech-pad" value="400" min="0" max="2000" step="50">
+          </label>
+        </div>
+      </div>
+    </details>
+
+    <div id="jobs"></div>
+    <p class="empty" id="empty">No jobs yet.</p>
+  </div>
+</div>
+
+<script src="/static/common.js"></script>
+<script src="/static/index.js"></script>
+</body>
+</html>

@@ -1,7 +1,8 @@
 """Tests for the audit page's gate logic.
 
-The gate is client-side JavaScript inside the `AUDIT_PAGE` string and there is
-no headless browser in this environment, so these run the real `relock()` under
+The gate is client-side JavaScript, and since the pages moved out of the module
+it lives in static/audit.js, sharing helpers with static/common.js. There is no
+headless browser in this environment, so these run the real `relock()` under
 node with a small DOM stub. What they pin is the defect this page had: it
 treated "the audit API is off" and "your token is wrong" as the same state, so
 a server with no audit token showed a prompt that no token could ever satisfy.
@@ -21,7 +22,6 @@ import pytest
 import transcribe_server as s
 
 NODE = shutil.which("node")
-SCRIPT = re.compile(r"<script>\n(.*?)\n</script>", re.S)
 needs_node = pytest.mark.skipif(NODE is None, reason="node is not installed")
 
 # The three elements relock() touches, started in the state the HTML ships
@@ -43,9 +43,11 @@ const MODE = "__MODE__";
 
 
 def page_script() -> str:
-    match = SCRIPT.search(s.AUDIT_PAGE)
-    assert match, "the audit page no longer has a <script> block to check"
-    return match.group(1)
+    """The audit page's JS: the shared helpers plus its own script."""
+    static = s.STATIC_DIR
+    return (static / "common.js").read_text(encoding="utf-8") + "\n" + (
+        static / "audit.js"
+    ).read_text(encoding="utf-8")
 
 
 def node_argv(*args: str) -> list[str]:
@@ -120,9 +122,13 @@ def test_open_mode_only_falls_back_to_the_gate_if_a_token_appears_to_be_needed()
 
 @needs_node
 def test_boot_probes_even_with_no_stored_token():
-    """--audit-open has no token to have, so boot() must not bail out early."""
+    """--audit-open has no token to have, so boot() must not bail out early.
+
+    The token itself moved into common.js's tokenStore, but the intent is
+    unchanged: probe with no token rather than returning before the request.
+    """
     script = page_script()
-    assert "if(!TOKEN) return;" not in script, (
+    assert "if(!TOKENS.get()) return;" not in script, (
         "boot() returning early leaves /audit unusable under --audit-open"
     )
-    assert 'const headers = TOKEN ? {"x-audit-token":TOKEN} : {};' in script
+    assert 'const headers = TOKENS.get() ? {"x-audit-token":TOKENS.get()} : {};' in script
