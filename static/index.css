@@ -320,6 +320,13 @@
 
   .save-group button:focus-visible{position:relative;z-index:1}
 
+  /* A phone is narrower than the group at its natural size, and the card clips
+     what overflows: give the group the row and let the formats share it. */
+  @media (max-width:480px){
+    .save-group{flex:1 1 100%}
+    .save-group button{flex:1 1 auto;padding-left:4px;padding-right:4px}
+  }
+
 
   details.advanced{margin-top:2px;border-top:1px solid var(--panel-lo);padding-top:10px}
 
