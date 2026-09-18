@@ -45,6 +45,14 @@
 
     <div class="staged locked" id="staged" aria-live="polite"></div>
 
+    <div class="uploading locked" id="uploading" role="status">
+      <div class="up-line">
+        <span class="up-name" id="up-name"></span>
+        <span class="up-state" id="up-state"></span>
+      </div>
+      <progress id="up-bar" max="1" value="0" aria-label="Upload progress"></progress>
+    </div>
+
     <div class="controls">
       <label class="field">Model
         <select id="model"></select>

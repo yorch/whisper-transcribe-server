@@ -1377,10 +1377,16 @@ const document = {createElement: (tag) => makeNode(tag)};
 const el = (id) => nodes[id] || (nodes[id] = makeNode(id));
 let MAX_MB = 0;
 const staged = [];
-let alerts = [], uploaded = [], uploadFails = false;
+let alerts = [], uploaded = [], uploadFails = false, shown = [];
 const alert = (message) => { alerts.push(message); };
-async function api(path){
-  uploaded.push(path);
+// The upload goes through postJob (XHR, for progress); report two progress
+// steps the way a browser would, and record what the widget said at each.
+async function postJob(body, onProgress){
+  uploaded.push("/api/jobs");
+  for(const fraction of [0.5, 1]){
+    onProgress(fraction);
+    shown.push(el("up-state").textContent);
+  }
   return {ok: !uploadFails, statusText: "500",
           json: async () => ({detail: "the server said no"})};
 }
@@ -1407,6 +1413,7 @@ def stage_probe(body: str) -> dict:
                 "stage",
                 "unstage",
                 "startJobs",
+                "showUpload",
                 "send",
             )
         )
@@ -1563,6 +1570,28 @@ def test_a_failed_upload_goes_back_to_the_staging_list_in_order():
     ]
     assert probe["names"] == ["a.wav", "b.wav"], "staged order survives a failure"
     assert probe["disabled"] is False, "there is something to retry"
+
+
+@needs_node
+def test_an_upload_says_how_far_it_has_got_and_goes_away_after():
+    """The staged list empties on the press, and the server answers only once it
+    has the whole file: minutes, for an hour of audio over the LAN, during which
+    the page used to show nothing at all."""
+    probe = stage_probe(
+        """
+        stage([{name: "a.wav", size: 4 * 1024 * 1024}, {name: "b.wav", size: 2048}]);
+        await startJobs();
+        return {shown, hidden: el("uploading").classes.has("locked"),
+                bar: el("up-bar").value};
+        """
+    )
+    assert probe["shown"] == [
+        "Uploading 50% of 4.0 MB \u00b7 1 more to send",
+        "Handing over \u00b7 1 more to send",
+        "Uploading 50% of 2 kB",
+        "Handing over",
+    ], probe["shown"]
+    assert probe["hidden"] is True, "nothing on the wire, nothing on screen"
 
 
 # --------------------------------------------------------------------------- #

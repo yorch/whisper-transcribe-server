@@ -70,6 +70,7 @@ def served_markup(page: str) -> str:
 #   - .seg .sp*: main's speaker column, which landed while this branch was open
 #   - .staged*, .runbar, .run-note, #start*: files are staged and sent by a
 #     button now, instead of the drop starting the job on the spot
+#   - .uploading*, .up-*: the file on the wire, with its progress
 INDEX_SELECTORS_ADDED = {
     "#r-ffmpeg.bad",
     ".offscreen",
@@ -89,6 +90,14 @@ INDEX_SELECTORS_ADDED = {
     ".staged-row + .staged-row",
     ".staged-size",
     ".staged-x",
+    ".uploading",
+    ".up-line",
+    ".up-name",
+    ".up-state",
+    ".uploading progress",
+    ".uploading progress::-webkit-progress-bar",
+    ".uploading progress::-webkit-progress-value",
+    ".uploading progress::-moz-progress-bar",
 }
 
 

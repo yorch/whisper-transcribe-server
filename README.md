@@ -378,8 +378,11 @@ when you press it, not when you drop, so you can change the model or the speaker
 count after seeing which file you picked. Each staged row has a **Remove** in
 case you dropped the wrong one.
 
-An upload that fails puts the file back in the list, so a network blip costs you
-a second press rather than a second drag of an hour-long recording.
+While a file is on its way to the server, a bar under the intake shows how far
+it has got and how many files are still to send; the job's card appears once the
+server has the whole file. An upload that fails puts the file back in the list,
+so a network blip costs you a second press rather than a second drag of an
+hour-long recording.
 
 **Main controls**
 

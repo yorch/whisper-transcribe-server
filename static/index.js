@@ -4,15 +4,19 @@
 const TOKENS = tokenStore("tk");
 let unlocked = false;
 
+/* A rejected token puts the gate back. Named, because the upload (XHR, not
+   api()) has to do the same thing. */
+function lockPage(){
+  unlocked = false;
+  el("gate").classList.remove("locked");
+  el("main").classList.add("locked");
+}
+
 const api = makeApi({
   header: "x-token",
   store: TOKENS,
   isUnauthorised: (status) => status === 401,
-  onUnauthorised: () => {
-    unlocked = false;
-    el("gate").classList.remove("locked");
-    el("main").classList.add("locked");
-  },
+  onUnauthorised: lockPage,
 });
 el("gate-go").addEventListener("click", submitToken);
 el("gate-token").addEventListener("keydown", (e) => { if(e.key === "Enter") submitToken(); });
@@ -273,16 +277,55 @@ async function startJobs(){
   await send(files);
 }
 
+/* The upload itself. XHR rather than api(), because fetch cannot report upload
+   progress, and an hour of audio over the LAN is minutes of a page that
+   otherwise says nothing. Same header, same 401 handling; the result is shaped
+   like a fetch Response so send() reads it the same way. */
+function postJob(body, onProgress){
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", "/api/jobs");
+    const token = TOKENS.get();
+    if(token) xhr.setRequestHeader("x-token", token);
+    xhr.upload.onprogress = (e) => { if(e.lengthComputable) onProgress(e.loaded / e.total); };
+    xhr.onerror = () => reject(new Error("the connection failed"));
+    xhr.onload = () => {
+      if(xhr.status === 401){ lockPage(); reject(new Error("unauthorised")); return; }
+      resolve({ok: xhr.status >= 200 && xhr.status < 300, statusText: xhr.statusText,
+               json: async () => JSON.parse(xhr.responseText)});
+    };
+    xhr.send(body);
+  });
+}
+
+/* What is on the wire right now. The staged list is emptied the moment
+   Transcribe is pressed, so without this the page shows nothing at all between
+   the press and the server accepting the file. */
+function showUpload(file, fraction, waiting){
+  const box = el("uploading");
+  if(!file){ box.classList.add("locked"); return; }
+  box.classList.remove("locked");
+  el("up-name").textContent = file.name;
+  el("up-name").title = file.name;
+  // All bytes sent is not accepted yet: the server still has to store it.
+  el("up-state").textContent = (fraction >= 1 ? "Handing over"
+    : `Uploading ${Math.round(fraction * 100)}% of ${fmtSize(file.size)}`)
+    + (waiting ? ` · ${waiting} more to send` : "");
+  el("up-bar").value = fraction;
+}
+
 async function send(files){
-  for(const f of files){
+  for(const [index, f] of files.entries()){
     /* Set once the server has taken the file. A failure after that — the poll
        that follows an upload — must not put it back: the job is already queued,
        and retrying would run the same audio twice. */
     let accepted = false;
+    const waiting = files.length - index - 1;
+    showUpload(f, 0, waiting);
     try{
       const fd = currentSettings();
       fd.append("file", f);
-      const r = await api("/api/jobs", {method:"POST", body:fd});
+      const r = await postJob(fd, (fraction) => showUpload(f, fraction, waiting));
       if(!r.ok){
         let detail = r.statusText;
         try{ detail = (await r.json()).detail || detail; }catch{}
@@ -304,6 +347,7 @@ async function send(files){
       renderStaged();
     }
   }
+  showUpload(null);
 }
 
 el("vad").addEventListener("change", () => {

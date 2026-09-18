@@ -109,6 +109,38 @@
   .staged-x{padding:3px 9px;font-size:12px}
 
 
+  /* The file on the wire. Styled like the staged list it replaces, with the
+     meter's amber so "moving" reads the same everywhere on the page. */
+  .uploading{
+    margin-top:12px;
+    border:1px solid var(--panel-lo);
+    border-left:3px solid var(--amber);
+    border-radius:3px;
+    background:rgba(255,255,255,.5);
+    padding:9px 12px 10px;
+  }
+
+  .up-line{display:flex;align-items:baseline;gap:12px;margin-bottom:7px}
+
+  .up-name{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:14px}
+
+  .up-state{
+    flex:0 0 auto;color:var(--muted);
+    font-family:var(--display);font-size:12.5px;font-variant-numeric:tabular-nums;
+  }
+
+  .uploading progress{
+    display:block;width:100%;height:6px;
+    appearance:none;border:0;border-radius:3px;background:#c9ced3;overflow:hidden;
+  }
+
+  .uploading progress::-webkit-progress-bar{background:#c9ced3}
+
+  .uploading progress::-webkit-progress-value{background:var(--amber);transition:width .2s}
+
+  .uploading progress::-moz-progress-bar{background:var(--amber)}
+
+
   /* The one primary action on the page, so the one thing that is not grey.
      It sits below the controls on purpose: they are read at press time, and
      the layout should say so. Disabled until something is staged. */
