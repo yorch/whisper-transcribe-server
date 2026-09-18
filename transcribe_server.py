@@ -6,6 +6,7 @@
 #     "uvicorn[standard]>=0.27",
 #     "python-multipart>=0.0.9",
 #     "faster-whisper>=1.0.3",
+#     "tomli>=2; python_version < '3.11'",
 #     "nvidia-cublas-cu12; sys_platform != 'darwin'",
 #     "nvidia-cudnn-cu12>=9,<10; sys_platform != 'darwin'",
 # ]
@@ -23,6 +24,13 @@ oversubscribed; everything else waits in a queue.
 Access control is on by default: if you don't supply --token, one is generated
 at startup and printed with the URL. Pass --no-auth to turn it off deliberately.
 
+Options live in three layers, later wins: defaults, a TOML config file
+(~/.transcribe-server/config.toml), command-line flags, then environment
+variables. --config points somewhere else.
+
+The server keeps an append-only audit trail of what the web app did (uploads,
+exports, deletions, worker lifecycle, refused requests) as daily JSONL files.
+
 Dependencies are declared inline (PEP 723), so there is nothing to install
 first and no virtualenv to activate.
 """
@@ -31,10 +39,12 @@ from __future__ import annotations
 
 import argparse
 import gc
+import hashlib
 import hmac
 import json
 import os
 import queue
+import re
 import secrets
 import shutil
 import socket
@@ -43,11 +53,25 @@ import time
 import traceback
 import uuid
 from collections import OrderedDict
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 from urllib.parse import quote
 
 import uvicorn
+
+try:  # tomllib is 3.11+; the inline dependency covers older interpreters
+    import tomllib
+
+    def load_toml(text: str) -> Dict[str, Any]:
+        return tomllib.loads(text)
+
+except ModuleNotFoundError:  # pragma: no cover - 3.10 only
+    import tomli
+
+    def load_toml(text: str) -> Dict[str, Any]:
+        return tomli.loads(text)
+
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 
@@ -76,6 +100,8 @@ ARGS: Optional[argparse.Namespace] = None
 ALLOWED_HOSTS: Set[str] = set()
 ALLOWED_SUFFIXES: Set[str] = set()  # entries like ".trycloudflare.com"
 
+SAFE_JOB_ID = re.compile(r"[A-Za-z0-9_-]{1,64}")
+
 # --------------------------------------------------------------------------- #
 # Job store
 # --------------------------------------------------------------------------- #
@@ -97,6 +123,266 @@ def redact(text: str, limit: int = 300) -> str:
             if variant:
                 text = text.replace(variant, "<path>")
     return text[:limit]
+
+
+# --------------------------------------------------------------------------- #
+# Audit trail
+# --------------------------------------------------------------------------- #
+
+
+def digest(value: str) -> Optional[str]:
+    """Hash for correlating repeated prompts without storing them in the main log."""
+    if not value:
+        return None
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+class AuditLog:
+    """Append-only JSONL trail, one file per UTC day, newest events last.
+
+    Every write is best-effort: a full disk or a locked file must never turn
+    into a failed transcription, so I/O errors degrade to a single warning on
+    stderr and the request carries on.
+
+    Prompt and hotword text is deliberately kept out of the main log (only
+    lengths and hashes go in). The full text lands in prompts/<job_id>.json,
+    which can be expired and permissioned separately.
+    """
+
+    def __init__(
+        self,
+        directory: Path,
+        enabled: bool = True,
+        retain_days: int = 30,
+        prompts: bool = True,
+    ) -> None:
+        self.dir = Path(directory)
+        self.prompts_dir = self.dir / "prompts"
+        self.enabled = enabled
+        self.retain_days = max(0, retain_days)
+        self.store_prompts = prompts
+        self._lock = threading.Lock()
+        self._fh: Optional[Any] = None
+        self._day: Optional[str] = None
+        self._warned = False
+
+    # -- writing ---------------------------------------------------------- #
+
+    def _rotate(self, day: str) -> None:
+        if self._fh is not None:
+            self._fh.close()
+        self.dir.mkdir(parents=True, exist_ok=True)
+        path = self.dir / f"audit-{day}.jsonl"
+        self._fh = path.open("a", encoding="utf-8", buffering=1)
+        try:
+            os.chmod(path, 0o600)  # the trail names files and callers
+        except OSError:
+            pass
+
+    def _warn_once(self, what: str, exc: BaseException) -> None:
+        if not self._warned:
+            self._warned = True
+            print(f"!  Audit {what} failed ({exc}); continuing without it")
+
+    def emit(self, event: str, **fields: Any) -> None:
+        if not self.enabled:
+            return
+        record: Dict[str, Any] = {
+            "ts": datetime.now(timezone.utc)
+            .isoformat(timespec="milliseconds")
+            .replace("+00:00", "Z"),
+            "event": event,
+        }
+        record.update({k: v for k, v in fields.items() if v is not None})
+        try:
+            line = json.dumps(record, ensure_ascii=False, default=str)
+            day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            with self._lock:
+                if self._day != day or self._fh is None:
+                    self._rotate(day)
+                    self._day = day
+                self._fh.write(line + "\n")
+                self._fh.flush()
+        except Exception as exc:  # noqa: BLE001
+            self._warn_once("write", exc)
+
+    def write_prompt(self, job_id: str, payload: Dict[str, Any]) -> None:
+        if not (self.enabled and self.store_prompts):
+            return
+        if not SAFE_JOB_ID.fullmatch(job_id):
+            return
+        try:
+            self.prompts_dir.mkdir(parents=True, exist_ok=True)
+            path = self.prompts_dir / f"{job_id}.json"
+            path.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+            try:
+                os.chmod(path, 0o600)
+            except OSError:
+                pass
+        except Exception as exc:  # noqa: BLE001
+            self._warn_once("sidecar write", exc)
+
+    def read_prompt(self, job_id: str) -> Optional[Dict[str, Any]]:
+        if not SAFE_JOB_ID.fullmatch(job_id):
+            return None
+        try:
+            return json.loads(
+                (self.prompts_dir / f"{job_id}.json").read_text(encoding="utf-8")
+            )
+        except (OSError, ValueError):
+            return None
+
+    # -- reading ---------------------------------------------------------- #
+
+    def dates(self) -> List[str]:
+        try:
+            return sorted(
+                (p.stem[len("audit-") :] for p in self.dir.glob("audit-*.jsonl")),
+                reverse=True,
+            )
+        except OSError:
+            return []
+
+    def read(
+        self,
+        day: str,
+        limit: int = 200,
+        offset: int = 0,
+        job: Optional[str] = None,
+        needle: Optional[str] = None,
+    ) -> Tuple[List[str], int]:
+        """Return (raw lines newest-first, total matching) for one day."""
+        try:
+            fh = (self.dir / f"audit-{day}.jsonl").open(
+                "r", encoding="utf-8", errors="replace"
+            )
+        except OSError:
+            return [], 0
+        lines: List[str] = []
+        low = needle.lower() if needle else None
+        with fh:
+            for raw in fh:
+                raw = raw.strip()
+                if not raw:
+                    continue
+                if low and low not in raw.lower():
+                    continue
+                if job:
+                    try:
+                        rec = json.loads(raw)
+                    except ValueError:
+                        continue
+                    if rec.get("job") != job and rec.get("from_job") != job:
+                        continue
+                lines.append(raw)
+        lines.reverse()
+        return lines[offset : offset + limit], len(lines)
+
+    # -- retention -------------------------------------------------------- #
+
+    def prune(self) -> List[str]:
+        """Delete day files and sidecars past retain_days. 0 keeps everything."""
+        if self.retain_days <= 0:
+            return []
+        cutoff = (
+            datetime.now(timezone.utc) - timedelta(days=self.retain_days)
+        ).strftime("%Y-%m-%d")
+        removed: List[str] = []
+        for path in self.dir.glob("audit-*.jsonl"):
+            if path.stem[len("audit-") :] < cutoff:
+                removed.append(self._unlink(path))
+        for path in self.prompts_dir.glob("*.json"):
+            try:
+                stamp = datetime.fromtimestamp(
+                    path.stat().st_mtime, timezone.utc
+                ).strftime("%Y-%m-%d")
+            except OSError:
+                continue
+            if stamp < cutoff:
+                removed.append(self._unlink(path))
+        return [name for name in removed if name]
+
+    @staticmethod
+    def _unlink(path: Path) -> Optional[str]:
+        try:
+            path.unlink()
+            return path.name
+        except OSError:
+            return None
+
+
+AUDIT: Optional[AuditLog] = None
+
+
+def request_fields(request: Request) -> Dict[str, Any]:
+    """Who and from where, without treating proxy headers as fact.
+
+    Behind a tunnel the TCP peer is always localhost, so the address the proxy
+    claims (CF-Connecting-IP / X-Forwarded-For) is recorded next to it and
+    clearly marked unverified rather than silently trusted.
+    """
+    direct = request.client.host if request.client else None
+    claimed = (request.headers.get("cf-connecting-ip") or "").strip()
+    if not claimed:
+        forwarded = request.headers.get("x-forwarded-for") or ""
+        claimed = forwarded.split(",")[0].strip()
+    return {
+        "client": direct,
+        "client_claimed": claimed if claimed and claimed != direct else None,
+        "host": normalize_host(request.headers.get("host") or "") or None,
+        "method": request.method,
+        "path": request.url.path,
+    }
+
+
+def audit(event: str, request: Optional[Request] = None, **fields: Any) -> None:
+    """Record one event. Never raises, never blocks a response."""
+    if AUDIT is None:
+        return
+    if request is not None:
+        fields = {**request_fields(request), **fields}
+        try:
+            request.state.audit_handled = True  # middleware need not log it again
+        except AttributeError:
+            pass
+    AUDIT.emit(event, **fields)
+
+
+def audit_opts(opts: Dict[str, Any]) -> Dict[str, Any]:
+    """Job options for the main log: knobs verbatim, prompt text only hashed."""
+    out = {k: v for k, v in opts.items() if k not in ("prompt", "hotwords")}
+    out["prompt_len"] = len(opts["prompt"])
+    out["prompt_sha256"] = digest(opts["prompt"])
+    out["hotwords_len"] = len(opts["hotwords"])
+    out["hotwords_sha256"] = digest(opts["hotwords"])
+    return out
+
+
+def store_prompt_sidecar(
+    job_id: str,
+    filename: str,
+    opts: Dict[str, Any],
+    source: str,
+    from_job: Optional[str] = None,
+) -> None:
+    if AUDIT is None or not (opts["prompt"] or opts["hotwords"]):
+        return
+    AUDIT.write_prompt(
+        job_id,
+        {
+            "job": job_id,
+            "ts": datetime.now(timezone.utc)
+            .isoformat(timespec="seconds")
+            .replace("+00:00", "Z"),
+            "filename": filename,
+            "source": source,
+            "from_job": from_job,
+            "prompt": opts["prompt"],
+            "hotwords": opts["hotwords"],
+        },
+    )
 
 
 def new_job(filename: str, path: Path, opts: Dict[str, Any]) -> str:
@@ -170,6 +456,14 @@ def prune_jobs() -> None:
             evicted.append(victim)
     for job in evicted:
         drop_source(job)
+        audit(
+            "job.evicted",
+            job=job["id"],
+            file=job["filename"],
+            state=job["state"],
+            reason="retention-cap",
+            cap=cap,
+        )
 
 
 def job_public(job: Dict[str, Any], include_segments: bool = True) -> Dict[str, Any]:
@@ -269,6 +563,7 @@ def load_model(name: str, device: str, compute_type: str):
 
         model = WhisperModel(name, device=device, compute_type=compute_type)
         _MODEL_CACHE[key] = model
+        audit("model.loaded", model=name, device=device, compute_type=compute_type)
 
         cap = max(1, ARGS.model_cache if ARGS else 1)
         while len(_MODEL_CACHE) > cap:
@@ -276,6 +571,13 @@ def load_model(name: str, device: str, compute_type: str):
             del old_model
             gc.collect()
             print(f"   unloaded {old_key[0]} / {old_key[2]} to free VRAM")
+            audit(
+                "model.unloaded",
+                model=old_key[0],
+                device=old_key[1],
+                compute_type=old_key[2],
+                reason="vram-cache",
+            )
         return model
 
 
@@ -309,6 +611,15 @@ def run_job(job_id: str) -> None:
         model = load_model(opts["model"], ARGS.device, opts["compute_type"])
     except Exception as exc:  # noqa: BLE001
         traceback.print_exc()
+        audit(
+            "job.error",
+            job=job_id,
+            file=job["filename"],
+            stage="load-model",
+            reason=type(exc).__name__,
+            message=redact(str(exc)),
+            opts=audit_opts(opts),
+        )
         patch_job(
             job_id,
             state="error",
@@ -369,8 +680,28 @@ def run_job(job_id: str) -> None:
             finished=time.time(),
             message=f"{len(collected)} segments",
         )
+        audit(
+            "job.done",
+            job=job_id,
+            file=job["filename"],
+            model=opts["model"],
+            compute_type=opts["compute_type"],
+            language=getattr(info, "language", None),
+            duration=round(duration, 2),
+            segments=len(collected),
+            elapsed=round(time.time() - (job.get("started") or time.time()), 1),
+        )
     except Exception as exc:  # noqa: BLE001
         traceback.print_exc()
+        audit(
+            "job.error",
+            job=job_id,
+            file=job["filename"],
+            stage="transcribe",
+            reason=type(exc).__name__,
+            message=redact(str(exc)),
+            opts=audit_opts(opts),
+        )
         patch_job(
             job_id,
             state="error",
@@ -394,6 +725,13 @@ def worker_loop() -> None:
             run_job(job_id)
         except Exception as exc:  # noqa: BLE001
             traceback.print_exc()
+            audit(
+                "job.error",
+                job=job_id,
+                stage="worker",
+                reason=type(exc).__name__,
+                message=redact(str(exc)),
+            )
             patch_job(
                 job_id,
                 state="error",
@@ -508,10 +846,13 @@ async def guard(request: Request, call_next):
     if ARGS is None:
         return JSONResponse({"detail": "Server not configured"}, status_code=503)
 
+    started = time.perf_counter()
+
     raw_host = request.headers.get("host")
     if not host_allowed(raw_host):
         seen = (raw_host or "").strip()[:100]
         print(f"!  Rejected Host header {seen!r} (add it with --allow-host)")
+        audit("security.host_rejected", request, reason=seen or "missing", status=421)
         return JSONResponse(
             {
                 "detail": f"Unrecognised Host header {seen!r}. "
@@ -526,16 +867,45 @@ async def guard(request: Request, call_next):
         # reach these endpoints even with a CORS-safelisted body type.
         site = request.headers.get("sec-fetch-site")
         if site and site not in ("same-origin", "none"):
+            audit("security.cross_site", request, reason=site, status=403)
             return JSONResponse(
                 {"detail": "Cross-site request refused"}, status_code=403
             )
 
-        if ARGS.token:
+        if path.startswith("/api/audit"):
+            # The audit trail has its own credential, deliberately independent
+            # of the app token: one can be handed out without the other.
+            if not ARGS.audit_token:
+                return JSONResponse(
+                    {"detail": "Audit API disabled: set --audit-token"},
+                    status_code=404,
+                )
+            supplied = request.headers.get("x-audit-token") or ""
+            if not hmac.compare_digest(supplied.encode(), ARGS.audit_token.encode()):
+                audit(
+                    "security.auth_failed",
+                    request,
+                    scope="audit",
+                    reason="bad-token" if supplied else "missing-token",
+                    status=401,
+                )
+                return JSONResponse(
+                    {"detail": "Bad or missing audit token"}, status_code=401
+                )
+        elif ARGS.token:
             supplied = request.headers.get("x-token") or ""
             if not hmac.compare_digest(supplied.encode(), ARGS.token.encode()):
+                audit(
+                    "security.auth_failed",
+                    request,
+                    scope="app",
+                    reason="bad-token" if supplied else "missing-token",
+                    status=401,
+                )
                 return JSONResponse({"detail": "Bad or missing token"}, status_code=401)
 
     response = await call_next(request)
+    elapsed = round((time.perf_counter() - started) * 1000, 1)
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["Referrer-Policy"] = "no-referrer"
@@ -543,12 +913,35 @@ async def guard(request: Request, call_next):
         "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; "
         "connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'"
     )
+
+    # Polling endpoints are chatty, so reads are opt-in. Everything that
+    # changes state or moves a transcript out logs itself at the source.
+    if path.startswith("/api/") and not path.startswith("/api/audit"):
+        if response.status_code >= 400:
+            if not getattr(request.state, "audit_handled", False):
+                audit(
+                    "request.rejected",
+                    request,
+                    status=response.status_code,
+                    ms=elapsed,
+                )
+        elif ARGS.audit_reads and request.method == "GET":
+            # Endpoints that already logged something specific (an export, say)
+            # set audit_handled; don't repeat them as a generic read.
+            if not getattr(request.state, "audit_handled", False):
+                audit("api.read", request, status=response.status_code, ms=elapsed)
     return response
 
 
 @app.get("/", response_class=HTMLResponse)
 def index() -> str:
     return PAGE
+
+
+@app.get("/audit", response_class=HTMLResponse)
+def audit_ui() -> str:
+    """The page is public like `/`; the data behind it needs the audit token."""
+    return AUDIT_PAGE
 
 
 @app.get("/api/status")
@@ -601,6 +994,7 @@ def status() -> Dict[str, Any]:
 
 @app.post("/api/jobs")
 async def create_job(
+    request: Request,
     file: UploadFile = File(...),
     model: str = Form(None),
     compute_type: str = Form(None),
@@ -635,6 +1029,7 @@ async def create_job(
             1 for j in JOBS.values() if j["state"] in ("queued", "loading", "running")
         )
     if pending >= ARGS.max_queue:
+        audit("job.rejected", request, reason="queue-full", status=429)
         raise HTTPException(
             status_code=429, detail=f"Queue is full ({ARGS.max_queue} jobs)"
         )
@@ -651,6 +1046,14 @@ async def create_job(
             while chunk := await file.read(1024 * 1024):
                 written += len(chunk)
                 if written > limit:
+                    audit(
+                        "job.rejected",
+                        request,
+                        file=raw_name[:200],
+                        bytes=written,
+                        reason="upload-too-large",
+                        status=413,
+                    )
                     raise HTTPException(
                         status_code=413,
                         detail=f"File exceeds the {ARGS.max_upload_mb} MB limit",
@@ -662,12 +1065,22 @@ async def create_job(
 
     job_id = new_job(filename=raw_name[:200], path=dest, opts=opts)
     JOB_QUEUE.put(job_id)
+    audit(
+        "job.created",
+        request,
+        job=job_id,
+        file=raw_name[:200],
+        bytes=written,
+        opts=audit_opts(opts),
+    )
+    store_prompt_sidecar(job_id, raw_name[:200], opts, source="upload")
     return {"id": job_id}
 
 
 @app.post("/api/jobs/{job_id}/retry")
 async def retry_job(
     job_id: str,
+    request: Request,
     model: str = Form(None),
     compute_type: str = Form(None),
     language: str = Form(""),
@@ -685,6 +1098,7 @@ async def retry_job(
     old = get_job(job_id)
     source = Path(old["path"])
     if not source.exists():
+        audit("job.retry_rejected", request, job=job_id, reason="source-gone", status=409)
         raise HTTPException(
             status_code=409,
             detail="The source audio is no longer on disk; re-upload it",
@@ -710,12 +1124,24 @@ async def retry_job(
             1 for j in JOBS.values() if j["state"] in ("queued", "loading", "running")
         )
     if pending >= ARGS.max_queue:
+        audit("job.retry_rejected", request, job=job_id, reason="queue-full", status=429)
         raise HTTPException(
             status_code=429, detail=f"Queue is full ({ARGS.max_queue} jobs)"
         )
 
     new_id = new_job(filename=old["filename"], path=source, opts=opts)
     JOB_QUEUE.put(new_id)
+    audit(
+        "job.retried",
+        request,
+        job=new_id,
+        from_job=job_id,
+        file=old["filename"],
+        opts=audit_opts(opts),
+    )
+    store_prompt_sidecar(
+        new_id, old["filename"], opts, source="retry", from_job=job_id
+    )
     return {"id": new_id}
 
 
@@ -732,21 +1158,49 @@ def job_detail(job_id: str) -> Dict[str, Any]:
 
 
 @app.delete("/api/jobs/{job_id}")
-def delete_job(job_id: str) -> Dict[str, Any]:
+def delete_job(job_id: str, request: Request) -> Dict[str, Any]:
     job = get_job(job_id)
     if job["state"] in ("queued", "loading", "running"):
         patch_job(job_id, state="cancelled", message="Cancelled")
+        audit(
+            "job.cancelled",
+            request,
+            job=job_id,
+            file=job["filename"],
+            state=job["state"],
+        )
     else:
         with JOBS_LOCK:
             JOBS.pop(job_id, None)
+        audit(
+            "job.deleted",
+            request,
+            job=job_id,
+            file=job["filename"],
+            state=job["state"],
+            segments=len(job["segments"]),
+        )
     drop_source(job)
     return {"ok": True}
 
 
 @app.get("/api/jobs/{job_id}/text")
-def job_text(job_id: str, format: str = "txt", download: int = 0) -> Response:
+def job_text(
+    job_id: str, request: Request, format: str = "txt", download: int = 0
+) -> Response:
     job = get_job(job_id)
     body, mime = render(job, format)
+    # The moment a transcript leaves the machine is the interesting one.
+    audit(
+        "transcript.exported",
+        request,
+        job=job_id,
+        file=job["filename"],
+        format=format,
+        download=bool(download),
+        segments=len(job["segments"]),
+        bytes=len(body),
+    )
     headers = {}
     if download:
         ext = {"timestamped": "txt"}.get(format, format)
@@ -754,6 +1208,87 @@ def job_text(job_id: str, format: str = "txt", download: int = 0) -> Response:
             Path(job["filename"]).stem, ext
         )
     return Response(content=body, media_type=mime, headers=headers)
+
+
+# --------------------------------------------------------------------------- #
+# Audit API
+# --------------------------------------------------------------------------- #
+
+
+@app.get("/api/audit")
+def audit_query(
+    request: Request,
+    date: str = "",
+    limit: int = 200,
+    offset: int = 0,
+    job: str = "",
+    q: str = "",
+    include_prompts: int = 0,
+) -> Dict[str, Any]:
+    if AUDIT is None:
+        raise HTTPException(status_code=503, detail="Audit trail unavailable")
+
+    limit = clamp(int(limit or 200), 1, 1000)
+    offset = max(0, int(offset or 0))
+    days = AUDIT.dates()
+    day = (date or "").strip() or (
+        days[0] if days else datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    )
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", day):
+        raise HTTPException(status_code=400, detail="date must be YYYY-MM-DD")
+
+    job = job.strip()
+    if job and not SAFE_JOB_ID.fullmatch(job):
+        raise HTTPException(status_code=400, detail="Malformed job id")
+
+    needle = q.strip() or None
+    raw, total = AUDIT.read(day, limit=limit, offset=offset, job=job or None, needle=needle)
+
+    events: List[Dict[str, Any]] = []
+    for line in raw:
+        try:
+            events.append(json.loads(line))
+        except ValueError:
+            events.append({"event": "unparsable", "raw": line[:500]})
+
+    if include_prompts:
+        for rec in events:
+            side = AUDIT.read_prompt(str(rec.get("job") or ""))
+            if side:
+                rec["prompt_text"] = side.get("prompt") or ""
+                rec["hotwords_text"] = side.get("hotwords") or ""
+
+    audit(
+        "audit.accessed",
+        request,
+        date=day,
+        returned=len(events),
+        matched=total,
+        search=needle,
+        job=job or None,
+        include_prompts=bool(include_prompts),
+    )
+    return {
+        "date": day,
+        "dates": days,
+        "events": events,
+        "total": total,
+        "offset": offset,
+        "limit": limit,
+        "retain_days": AUDIT.retain_days,
+        "prompts_available": AUDIT.store_prompts,
+    }
+
+
+@app.get("/api/audit/prompts/{job_id}")
+def audit_prompt(job_id: str, request: Request) -> Dict[str, Any]:
+    if AUDIT is None:
+        raise HTTPException(status_code=503, detail="Audit trail unavailable")
+    side = AUDIT.read_prompt(job_id)
+    if side is None:
+        raise HTTPException(status_code=404, detail="No stored prompt for that job")
+    audit("audit.prompt_read", request, job=job_id)
+    return side
 
 
 # --------------------------------------------------------------------------- #
@@ -1450,6 +1985,346 @@ setInterval(refreshStatus, 5000);
 """
 
 
+AUDIT_PAGE = r"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>Audit trail</title>
+<style>
+  :root{
+    --panel:#dcdfe3;--panel-hi:#eef0f2;--panel-lo:#c3c8cd;
+    --ink:#1b2027;--muted:#5c646e;--amber:#b9610f;--amber-dim:#d9b48a;
+    --green:#36704a;--red:#9d3427;
+    --display:"Bahnschrift","DIN Alternate","Roboto Condensed",system-ui,sans-serif;
+    --body:"Segoe UI Variable Text","Segoe UI",system-ui,-apple-system,sans-serif;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0}
+  body{
+    background:var(--panel);
+    background-image:linear-gradient(180deg,#e3e6e9 0%,#d3d7dc 100%);
+    color:var(--ink);font-family:var(--body);font-size:15px;line-height:1.55;
+    min-height:100vh;padding:28px 20px 72px;
+  }
+  .wrap{max-width:1040px;margin:0 auto}
+  .topbar{display:flex;align-items:baseline;gap:16px;flex-wrap:wrap}
+  h1{font-family:var(--display);font-weight:600;font-size:30px;letter-spacing:-.01em;margin:0;flex:1}
+  a.back{font-family:var(--display);font-size:13px;color:var(--muted);text-decoration:none}
+  a.back:hover{color:var(--amber)}
+  .sub{color:var(--muted);margin:6px 0 22px;max-width:70ch}
+
+  .gate{
+    border:1px solid var(--panel-lo);border-left:3px solid var(--amber);
+    background:rgba(255,255,255,.5);border-radius:3px;padding:16px 18px;margin-bottom:22px;
+  }
+  .gate p{margin:0 0 12px}
+  .gate .row{display:flex;gap:8px;flex-wrap:wrap}
+  input[type=password],input[type=text]{
+    flex:1;min-width:180px;font-family:var(--body);font-size:15px;padding:6px 9px;
+    border:1px solid #a9b0b8;border-radius:3px;background:#fff;color:var(--ink);
+  }
+  input[type=password]:focus-visible,input[type=text]:focus-visible{outline:2px solid var(--amber);outline-offset:1px}
+  .gate-err{color:var(--red);font-size:13.5px;margin:10px 0 0}
+
+  .controls{
+    display:flex;flex-wrap:wrap;gap:12px 18px;align-items:center;
+    padding:12px 14px;border:1px solid var(--panel-lo);border-radius:3px;
+    background:linear-gradient(180deg,#e9ebee,#dde1e5);
+    box-shadow:inset 0 1px 0 rgba(255,255,255,.7);
+  }
+  label.field{display:flex;align-items:center;gap:7px;font-size:13.5px;color:var(--muted)}
+  select,input[type=number]{
+    font-family:var(--display);font-size:14px;color:var(--ink);background:#fff;
+    border:1px solid #a9b0b8;border-radius:3px;padding:5px 8px;
+  }
+  select:focus-visible,input[type=number]:focus-visible{outline:2px solid var(--amber);outline-offset:1px}
+  input[type=checkbox]{accent-color:var(--amber);width:15px;height:15px}
+  button{
+    font-family:var(--display);font-size:13px;letter-spacing:.03em;color:var(--ink);
+    background:linear-gradient(180deg,#f4f5f6,#dfe3e7);border:1px solid #a9b0b8;
+    border-radius:3px;padding:6px 12px;cursor:pointer;
+  }
+  button:hover{background:linear-gradient(180deg,#fff,#e7ebef)}
+  button:active{background:#d8dce0}
+  button:focus-visible{outline:2px solid var(--amber);outline-offset:1px}
+  button.ghost{background:none;border-color:transparent;color:var(--muted)}
+  button.ghost:hover{background:rgba(0,0,0,.05);color:var(--ink)}
+
+  .meta{font-family:var(--display);font-size:12.5px;color:var(--muted);margin:14px 2px 10px;letter-spacing:.02em}
+  #events{display:flex;flex-direction:column;gap:8px}
+  .ev{
+    border:1px solid var(--panel-lo);border-top-color:var(--panel-hi);border-radius:3px;
+    background:linear-gradient(180deg,#eceef1,#e2e5e9);padding:10px 14px;
+    box-shadow:inset 0 1px 0 rgba(255,255,255,.7);border-left:3px solid #b6bcc3;
+  }
+  .ev.bad{border-left-color:var(--red)}
+  .ev.warn{border-left-color:var(--amber)}
+  .ev.good{border-left-color:var(--green)}
+  .ev-head{display:flex;gap:12px;align-items:baseline;flex-wrap:wrap}
+  .ev-time{font-family:var(--display);font-size:12.5px;color:var(--muted)}
+  .ev-event{font-family:var(--display);font-size:14px;letter-spacing:.01em}
+  .ev-src{font-family:var(--display);font-size:12.5px;color:var(--muted);flex:1;text-align:right}
+  .chips{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}
+  .chip{
+    font-size:12px;background:rgba(255,255,255,.7);border:1px solid #c9ced3;
+    border-radius:3px;padding:2px 7px;color:var(--muted);
+    max-width:100%;overflow-wrap:anywhere;
+  }
+  .chip b{font-family:var(--display);font-weight:600;color:var(--ink);margin-right:5px}
+  .prompt{
+    margin-top:8px;background:#fbfbfc;border:1px solid #c9ced3;border-radius:3px;
+    padding:9px 11px;font-size:13.5px;white-space:pre-wrap;word-break:break-word;
+  }
+  .prompt b{font-family:var(--display);font-size:11px;letter-spacing:.12em;
+    text-transform:uppercase;color:var(--muted);margin-right:8px}
+  .empty{margin-top:22px;color:var(--muted);font-size:14px}
+  .locked{display:none}
+  @media (prefers-reduced-motion:reduce){*{transition:none!important}}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="topbar">
+    <h1>Audit trail</h1>
+    <a class="back" href="/">&larr; Transcription</a>
+  </div>
+  <p class="sub">Every action the web app took &mdash; uploads, exports, deletions,
+  worker lifecycle and refused requests &mdash; newest first. This page needs the
+  audit token, which is separate from the app token.</p>
+
+  <div class="gate" id="gate">
+    <p>Paste the audit token. It is printed in the terminal when the server starts
+    with <code>--audit-token</code> or <code>TRANSCRIBE_AUDIT_TOKEN</code>.</p>
+    <div class="row">
+      <input type="password" id="gate-token" autocomplete="off" spellcheck="false"
+             placeholder="Audit token" aria-label="Audit token">
+      <button id="gate-go">Unlock</button>
+    </div>
+    <p class="gate-err locked" id="gate-err">That token was rejected.</p>
+  </div>
+
+  <div id="main" class="locked">
+    <div class="controls">
+      <label class="field">Day <select id="date"></select></label>
+      <label class="field">Rows
+        <select id="limit">
+          <option>100</option><option selected>200</option>
+          <option>500</option><option>1000</option>
+        </select>
+      </label>
+      <label class="field">Job <input type="text" id="job" size="10"
+        placeholder="job id" spellcheck="false"></label>
+      <label class="field">Search <input type="text" id="q" size="14"
+        placeholder="substring" spellcheck="false"></label>
+      <label class="field"><input type="checkbox" id="prompts"> Prompts</label>
+      <label class="field"><input type="checkbox" id="auto" checked> Auto</label>
+      <button id="reload">Reload</button>
+      <button class="ghost" id="more">Load more</button>
+    </div>
+    <p class="meta" id="meta">&nbsp;</p>
+    <div id="events"></div>
+    <p class="empty locked" id="empty">No events for this day.</p>
+  </div>
+</div>
+
+<script>
+"use strict";
+const el = (id) => document.getElementById(id);
+const ESCAPES = {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;","`":"&#96;"};
+const esc = (v) => String(v == null ? "" : v).replace(/[&<>"'`]/g, (c) => ESCAPES[c]);
+
+/* Same trick as the main page: the token rides in a header, never a URL, and
+   a URL copy is stripped from history immediately. */
+let TOKEN = sessionStorage.getItem("atk") || "";
+{
+  const fromUrl = new URLSearchParams(location.search).get("token");
+  if(fromUrl){
+    TOKEN = fromUrl;
+    sessionStorage.setItem("atk", TOKEN);
+    history.replaceState(null, "", location.pathname);
+  }
+}
+
+let unlocked = false, offset = 0, timer = null;
+
+async function api(path){
+  const headers = {};
+  if(TOKEN) headers["x-audit-token"] = TOKEN;
+  const r = await fetch(path, {headers, credentials:"omit"});
+  if(r.status === 401 || r.status === 404){
+    unlocked = false;
+    el("gate").classList.remove("locked");
+    el("main").classList.add("locked");
+    throw new Error("unauthorised");
+  }
+  return r;
+}
+
+function level(event){
+  if(!event) return "";
+  if(event.startsWith("security.") || event === "request.rejected" || event.endsWith("error")) return "bad";
+  if(event.endsWith("rejected")) return "warn";
+  if(event === "job.done" || event === "server.started") return "good";
+  return "";
+}
+
+const SKIP = new Set(["ts","event","client","client_claimed","host","method","path",
+                      "prompt_text","hotwords_text"]);
+
+function fmtVal(v){
+  if(v === null || v === undefined) return "";
+  if(typeof v === "object") return JSON.stringify(v);
+  return String(v);
+}
+
+function row(rec){
+  const time = String(rec.ts || "").slice(11, 19);
+  const where = [];
+  if(rec.method) where.push(rec.method + " " + (rec.path || ""));
+  if(rec.client_claimed) where.push("via " + rec.client_claimed);
+  if(rec.client) where.push(rec.client);
+  if(rec.host) where.push(rec.host);
+  if(rec.status) where.push("HTTP " + rec.status);
+  if(rec.ms !== undefined && rec.ms !== null) where.push(rec.ms + "ms");
+
+  const chips = Object.entries(rec)
+    .filter(([k, v]) => !SKIP.has(k) && v !== null && v !== undefined && v !== "")
+    .map(([k, v]) => '<span class="chip"><b>' + esc(k) + "</b>" + esc(fmtVal(v)) + "</span>")
+    .join("");
+
+  let prompt = "";
+  if(rec.hotwords_text)
+    prompt += '<div><b>hotwords</b>' + esc(rec.hotwords_text) + "</div>";
+  if(rec.prompt_text)
+    prompt += '<div><b>prompt</b>' + esc(rec.prompt_text) + "</div>";
+
+  return '<div class="ev ' + level(rec.event) + '">' +
+    '<div class="ev-head">' +
+      '<span class="ev-time">' + esc(time) + "</span>" +
+      '<span class="ev-event">' + esc(rec.event) + "</span>" +
+      '<span class="ev-src">' + esc(where.join(" \u00b7 ")) + "</span>" +
+    "</div>" +
+    (chips ? '<div class="chips">' + chips + "</div>" : "") +
+    (prompt ? '<div class="prompt">' + prompt + "</div>" : "") +
+  "</div>";
+}
+
+function fillDates(dates, selected){
+  const node = el("date");
+  const current = node.value;
+  const wanted = selected || current;
+  node.textContent = "";
+  if(!dates.length){
+    const o = document.createElement("option");
+    o.value = o.textContent = selected || "";
+    node.append(o);
+    return;
+  }
+  for(const d of dates){
+    const o = document.createElement("option");
+    o.value = o.textContent = d;
+    if(d === wanted) o.selected = true;
+    node.append(o);
+  }
+}
+
+async function load(more){
+  if(!unlocked) return;
+  if(!more) offset = 0;
+  const params = new URLSearchParams();
+  params.set("date", el("date").value);
+  params.set("limit", el("limit").value);
+  params.set("offset", String(offset));
+  if(el("job").value.trim()) params.set("job", el("job").value.trim());
+  if(el("q").value.trim()) params.set("q", el("q").value.trim());
+  if(el("prompts").checked) params.set("include_prompts", "1");
+
+  try{
+    const r = await api("/api/audit?" + params.toString());
+    if(!r.ok){
+      let detail = r.statusText;
+      try{ detail = (await r.json()).detail || detail; }catch(_){}
+      throw new Error(detail);
+    }
+    const data = await r.json();
+    unlocked = true;
+    el("gate").classList.add("locked");
+    el("main").classList.remove("locked");
+    fillDates(data.dates, data.date);
+
+    if(!more) el("events").textContent = "";
+    el("events").insertAdjacentHTML("beforeend", data.events.map(row).join(""));
+    offset += data.events.length;
+
+    el("empty").classList.toggle("locked", data.total > 0);
+    el("more").disabled = offset >= data.total;
+    el("meta").textContent = data.total + " event(s) on " + data.date
+      + " \u00b7 showing " + Math.min(offset, data.total)
+      + " \u00b7 retention " + (data.retain_days ? data.retain_days + " days" : "unlimited")
+      + (data.prompts_available ? "" : " \u00b7 prompts not stored");
+  }catch(err){
+    if(err.message === "unauthorised") return;
+    el("meta").textContent = "Could not load the audit trail: " + err.message;
+  }
+}
+
+function schedule(){
+  clearInterval(timer);
+  if(el("auto").checked) timer = setInterval(() => {
+    if(offset <= Number(el("limit").value)) load(false);
+  }, 5000);
+}
+
+el("gate-go").addEventListener("click", submitToken);
+el("gate-token").addEventListener("keydown", (e) => { if(e.key === "Enter") submitToken(); });
+
+async function submitToken(){
+  const value = el("gate-token").value.trim();
+  if(!value) return;
+  TOKEN = value;
+  try{
+    const r = await fetch("/api/audit?limit=1", {headers:{"x-audit-token":TOKEN}, credentials:"omit"});
+    if(!r.ok) throw new Error("rejected");
+    sessionStorage.setItem("atk", TOKEN);
+    el("gate-err").classList.add("locked");
+    el("gate-token").value = "";
+    unlocked = true;
+    await load(false);
+    schedule();
+  }catch(e){
+    el("gate-err").classList.remove("locked");
+  }
+}
+
+el("reload").addEventListener("click", () => load(false));
+// Changing the day starts a fresh page; "Load more" only ever appends.
+el("more").addEventListener("click", () => load(true));
+el("date").addEventListener("change", () => load(false));
+el("job").addEventListener("change", () => load(false));
+el("prompts").addEventListener("change", () => load(false));
+el("q").addEventListener("keydown", (e) => { if(e.key === "Enter") load(false); });
+el("auto").addEventListener("change", schedule);
+
+(async function boot(){
+  if(!TOKEN) return;
+  try{
+    const r = await fetch("/api/audit?limit=1", {headers:{"x-audit-token":TOKEN}, credentials:"omit"});
+    if(!r.ok) throw new Error("rejected");
+    unlocked = true;
+    await load(false);
+    schedule();
+  }catch(e){
+    el("gate").classList.remove("locked");
+  }
+})();
+</script>
+</body>
+</html>
+"""
+
+
 # --------------------------------------------------------------------------- #
 # Entry point
 # --------------------------------------------------------------------------- #
@@ -1490,30 +2365,196 @@ def local_names(bind_host: str, extra: List[str]) -> tuple[Set[str], Set[str]]:
     return names, suffixes
 
 
-def main() -> None:
-    global ARGS, ALLOWED_HOSTS, ALLOWED_SUFFIXES
-    p = argparse.ArgumentParser(description="LAN transcription server (faster-whisper)")
+# --------------------------------------------------------------------------- #
+# Configuration
+# --------------------------------------------------------------------------- #
+
+# Every option the server understands. Config file keys, flag names and env
+# vars all resolve into this shape; anything not listed here is rejected rather
+# than silently ignored.
+DEFAULTS: Dict[str, Any] = {
+    "config": None,
+    "work_dir": None,
+    "host": "0.0.0.0",
+    "port": 8765,
+    "token": "",
+    "no_auth": False,
+    "allow_host": [],
+    "model": "large-v3",
+    "device": "cuda",
+    "compute_type": "float16",
+    "quality": "balanced",
+    "model_cache": 1,
+    "allow_model_choice": True,
+    "allow_precision_choice": False,
+    "preload": False,
+    "max_upload_mb": 2048,
+    "max_queue": 20,
+    "max_jobs": 60,
+    "source_retention": "job",
+    "audit": True,
+    "audit_dir": None,
+    "audit_reads": False,
+    "audit_prompts": True,
+    "audit_retain_days": 30,
+    "audit_token": "",
+}
+
+CHOICES: Dict[str, List[str]] = {
+    "model": MODELS,
+    "device": ["cuda", "cpu", "auto"],
+    "compute_type": COMPUTE_TYPES,
+    "quality": list(QUALITIES),
+    "source_retention": RETENTION,
+}
+
+# Environment wins over both the config file and the flags, so a service
+# wrapper can override whatever is on disk without rewriting it.
+ENV_OPTIONS: Dict[str, Tuple[str, str]] = {
+    "TRANSCRIBE_CONFIG": ("config", "str"),
+    "TRANSCRIBE_WORK_DIR": ("work_dir", "str"),
+    "TRANSCRIBE_HOST": ("host", "str"),
+    "TRANSCRIBE_PORT": ("port", "int"),
+    "TRANSCRIBE_TOKEN": ("token", "str"),
+    "TRANSCRIBE_NO_AUTH": ("no_auth", "bool"),
+    "TRANSCRIBE_ALLOW_HOST": ("allow_host", "list"),
+    "TRANSCRIBE_MODEL": ("model", "str"),
+    "TRANSCRIBE_DEVICE": ("device", "str"),
+    "TRANSCRIBE_COMPUTE_TYPE": ("compute_type", "str"),
+    "TRANSCRIBE_QUALITY": ("quality", "str"),
+    "TRANSCRIBE_MODEL_CACHE": ("model_cache", "int"),
+    "TRANSCRIBE_PRELOAD": ("preload", "bool"),
+    "TRANSCRIBE_MAX_UPLOAD_MB": ("max_upload_mb", "int"),
+    "TRANSCRIBE_MAX_QUEUE": ("max_queue", "int"),
+    "TRANSCRIBE_MAX_JOBS": ("max_jobs", "int"),
+    "TRANSCRIBE_SOURCE_RETENTION": ("source_retention", "str"),
+    "TRANSCRIBE_AUDIT": ("audit", "bool"),
+    "TRANSCRIBE_AUDIT_DIR": ("audit_dir", "str"),
+    "TRANSCRIBE_AUDIT_READS": ("audit_reads", "bool"),
+    "TRANSCRIBE_AUDIT_PROMPTS": ("audit_prompts", "bool"),
+    "TRANSCRIBE_AUDIT_RETAIN_DAYS": ("audit_retain_days", "int"),
+    "TRANSCRIBE_AUDIT_TOKEN": ("audit_token", "str"),
+}
+
+
+def as_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in ("1", "true", "yes", "on")
+
+
+def as_list(value: Any) -> List[str]:
+    if isinstance(value, (list, tuple)):
+        return [str(v) for v in value]
+    return [part.strip() for part in str(value).split(",") if part.strip()]
+
+
+CONVERTERS = {"str": str, "int": int, "bool": as_bool, "list": as_list}
+
+
+def config_path(explicit: Optional[str]) -> Tuple[Path, bool]:
+    """Return (path, required). Only an explicit path must exist."""
+    if explicit:
+        return Path(explicit).expanduser(), True
+    env = os.environ.get("TRANSCRIBE_CONFIG")
+    if env:
+        return Path(env).expanduser(), True
+    base = os.environ.get("TRANSCRIBE_WORK_DIR")
+    root = Path(base).expanduser() if base else Path.home() / ".transcribe-server"
+    return root / "config.toml", False
+
+
+# Natural spellings for options whose flat name carries its section, so
+# [audit] reads = true means audit_reads. The bare name still works too.
+CONFIG_ALIASES: Dict[str, str] = {
+    "audit.enabled": "audit",
+    "audit.reads": "audit_reads",
+    "audit.dir": "audit_dir",
+    "audit.prompts": "audit_prompts",
+    "audit.retain_days": "audit_retain_days",
+    "audit.token": "audit_token",
+}
+
+
+def load_config_file(path: Path, required: bool) -> Dict[str, Any]:
+    """Flatten [section] tables into one dict of option names."""
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        if required:
+            raise SystemExit(f"!  No config file at {path}") from None
+        return {}
+    except OSError as exc:
+        raise SystemExit(f"!  Could not read {path}: {exc}") from exc
+
+    try:
+        raw = load_toml(text)
+    except Exception as exc:  # noqa: BLE001 - tomllib raises several types
+        raise SystemExit(f"!  {path} is not valid TOML: {exc}") from exc
+
+    flat: Dict[str, Any] = {}
+    for section, values in raw.items():
+        if not isinstance(values, dict):
+            raise SystemExit(f"!  {path}: [{section}] must be a table of options")
+        prefix = section.strip().replace("-", "_").lower()
+        for key, value in values.items():
+            name = key.strip().replace("-", "_").lower()
+            name = CONFIG_ALIASES.get(f"{prefix}.{name}", name)
+            if name not in DEFAULTS or name == "config":
+                name = f"{prefix}_{name}"
+            if name not in DEFAULTS or name == "config":
+                raise SystemExit(f"!  {path}: unknown option {section}.{key}")
+            flat[name] = value
+    return flat
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """Flags use SUPPRESS so an unset flag is absent, letting the config file
+    and environment fill it in rather than a hard-coded argparse default."""
+    p = argparse.ArgumentParser(
+        description="LAN transcription server (faster-whisper)",
+        epilog="Options may also come from a TOML config file "
+        "(default: <work dir>/config.toml) and from TRANSCRIBE_* "
+        "environment variables, which win over flags.",
+    )
 
     net = p.add_argument_group("network and access")
     net.add_argument(
-        "--host", default="0.0.0.0", help="bind address (default: all interfaces)"
+        "--config",
+        metavar="PATH",
+        default=argparse.SUPPRESS,
+        help="TOML config file (default: <work dir>/config.toml)",
     )
-    net.add_argument("--port", type=int, default=8765)
+    net.add_argument(
+        "--work-dir",
+        metavar="PATH",
+        default=argparse.SUPPRESS,
+        help="state directory for uploads and the audit trail "
+        "(default: ~/.transcribe-server)",
+    )
+    net.add_argument(
+        "--host",
+        default=argparse.SUPPRESS,
+        help="bind address (default: all interfaces)",
+    )
+    net.add_argument("--port", type=int, default=argparse.SUPPRESS)
     net.add_argument(
         "--token",
-        default=os.environ.get("TRANSCRIBE_TOKEN", ""),
+        default=argparse.SUPPRESS,
         help="access token; one is generated if omitted (prefer TRANSCRIBE_TOKEN "
         "over the flag, which is visible in the process list)",
     )
     net.add_argument(
         "--no-auth",
         action="store_true",
+        default=argparse.SUPPRESS,
         help="serve without a token (only on a network you control)",
     )
     net.add_argument(
         "--allow-host",
         action="append",
-        default=[],
+        default=argparse.SUPPRESS,
+        metavar="NAME",
         help="extra Host header value to accept; repeatable. "
         'Prefix with "." for a suffix match, e.g. --allow-host '
         ".trycloudflare.com for Cloudflare tunnels.",
@@ -1521,26 +2562,31 @@ def main() -> None:
 
     gpu = p.add_argument_group("model and hardware")
     gpu.add_argument(
-        "--model", default="large-v3", choices=MODELS, help="default model"
+        "--model",
+        default=argparse.SUPPRESS,
+        choices=MODELS,
+        help="default model",
     )
-    gpu.add_argument("--device", default="cuda", choices=["cuda", "cpu", "auto"])
+    gpu.add_argument(
+        "--device", default=argparse.SUPPRESS, choices=["cuda", "cpu", "auto"]
+    )
     gpu.add_argument(
         "--compute-type",
-        default="float16",
+        default=argparse.SUPPRESS,
         choices=COMPUTE_TYPES,
         help="float16 needs compute capability 7.0+; use int8 or float32 "
         "on Pascal and older",
     )
     gpu.add_argument(
         "--quality",
-        default="balanced",
+        default=argparse.SUPPRESS,
         choices=list(QUALITIES),
         help="default beam size: fast=1, balanced=5, thorough=8",
     )
     gpu.add_argument(
         "--model-cache",
         type=int,
-        default=1,
+        default=argparse.SUPPRESS,
         metavar="N",
         help="models held in VRAM at once (default 1; raising this lets "
         "several model/precision combinations stay resident)",
@@ -1549,52 +2595,194 @@ def main() -> None:
         "--allow-model-choice",
         dest="allow_model_choice",
         action="store_true",
-        default=True,
+        default=argparse.SUPPRESS,
         help="let clients pick the model (default)",
     )
     gpu.add_argument(
         "--pin-model",
         dest="allow_model_choice",
         action="store_false",
+        default=argparse.SUPPRESS,
         help="force every job to use --model",
     )
     gpu.add_argument(
         "--allow-precision-choice",
         dest="allow_precision_choice",
         action="store_true",
-        default=False,
+        default=argparse.SUPPRESS,
         help="expose the precision selector in the UI (off by default: "
         "precision is a property of the machine, not the recording)",
     )
     gpu.add_argument(
         "--preload",
         action="store_true",
+        default=argparse.SUPPRESS,
         help="load the default model at startup instead of on first job",
     )
 
     lim = p.add_argument_group("limits and storage")
     lim.add_argument(
-        "--max-upload-mb", type=int, default=2048, help="per-file upload ceiling"
+        "--max-upload-mb",
+        type=int,
+        default=argparse.SUPPRESS,
+        help="per-file upload ceiling",
     )
     lim.add_argument(
-        "--max-queue", type=int, default=20, help="max jobs pending at once"
+        "--max-queue",
+        type=int,
+        default=argparse.SUPPRESS,
+        help="max jobs pending at once",
     )
     lim.add_argument(
         "--max-jobs",
         type=int,
-        default=60,
+        default=argparse.SUPPRESS,
         help="finished job records retained before the oldest are evicted",
     )
     lim.add_argument(
         "--source-retention",
-        default="job",
+        default=argparse.SUPPRESS,
         choices=RETENTION,
         help="'run' deletes the upload right after transcription (no retry), "
         "'job' keeps it while the job record exists (default), "
         "'forever' never deletes it",
     )
 
-    args = p.parse_args()
+    aud = p.add_argument_group("audit trail")
+    aud.add_argument(
+        "--audit-dir",
+        metavar="PATH",
+        default=argparse.SUPPRESS,
+        help="where daily audit-YYYY-MM-DD.jsonl files live "
+        "(default: <work dir>/audit)",
+    )
+    aud.add_argument(
+        "--no-audit",
+        dest="audit",
+        action="store_false",
+        default=argparse.SUPPRESS,
+        help="stop recording the audit trail (existing files stay readable)",
+    )
+    aud.add_argument(
+        "--audit-reads",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="also log status/list/detail polls (chatty; off by default)",
+    )
+    aud.add_argument(
+        "--no-audit-prompts",
+        dest="audit_prompts",
+        action="store_false",
+        default=argparse.SUPPRESS,
+        help="never write prompt/hotword text to the sidecar files",
+    )
+    aud.add_argument(
+        "--audit-retain-days",
+        type=int,
+        default=argparse.SUPPRESS,
+        metavar="N",
+        help="delete audit files older than N days at startup (default 30; "
+        "0 keeps everything)",
+    )
+    aud.add_argument(
+        "--audit-token",
+        default=argparse.SUPPRESS,
+        help="separate token for GET /audit and /api/audit; unset disables "
+        "the audit API entirely (prefer TRANSCRIBE_AUDIT_TOKEN)",
+    )
+    return p
+
+
+def resolve_args(argv: Optional[List[str]] = None) -> Tuple[argparse.Namespace, Path, bool]:
+    """Layer defaults, config file, flags and environment, in that order."""
+    cli = vars(build_parser().parse_args(argv))
+
+    path, required = config_path(cli.get("config"))
+    merged: Dict[str, Any] = dict(DEFAULTS)
+    merged.update(load_config_file(path, required))
+    merged.update(cli)
+
+    for env_name, (name, kind) in ENV_OPTIONS.items():
+        raw = os.environ.get(env_name)
+        if raw is None or raw == "":
+            continue
+        try:
+            merged[name] = CONVERTERS[kind](raw)
+        except (TypeError, ValueError):
+            raise SystemExit(
+                f"!  {env_name}={raw!r} is not a valid {kind}"
+            ) from None
+
+    # TOML is typed already, but a quoted "8765" should still work.
+    for name, default in DEFAULTS.items():
+        value = merged.get(name)
+        if value is None:
+            continue
+        if isinstance(default, bool):
+            merged[name] = as_bool(value)
+        elif isinstance(default, int):
+            try:
+                merged[name] = int(value)
+            except (TypeError, ValueError):
+                raise SystemExit(
+                    f"!  {name} must be an integer, got {value!r}"
+                ) from None
+        elif isinstance(default, list):
+            merged[name] = as_list(value)
+
+    for name, allowed in CHOICES.items():
+        if merged[name] not in allowed:
+            raise SystemExit(
+                f"!  {name}={merged[name]!r} is not one of: {', '.join(allowed)}"
+            )
+
+    if not 0 < merged["port"] < 65536:
+        raise SystemExit(f"!  port must be 1-65535, got {merged['port']}")
+    for name in (
+        "model_cache",
+        "max_upload_mb",
+        "max_queue",
+        "max_jobs",
+        "audit_retain_days",
+    ):
+        if merged[name] < 0:
+            raise SystemExit(f"!  {name} cannot be negative, got {merged[name]}")
+
+    return argparse.Namespace(**merged), path, required
+
+
+def startup_snapshot(args: argparse.Namespace, cfg: Optional[Path]) -> Dict[str, Any]:
+    """How the server was running, for later forensics. Tokens never appear."""
+    return {
+        "config": redact(str(cfg), 500) if cfg else None,
+        "host": args.host,
+        "port": args.port,
+        "work_dir": redact(str(WORK_DIR), 500),
+        "device": args.device,
+        "model": args.model,
+        "compute_type": args.compute_type,
+        "quality": args.quality,
+        "model_cache": args.model_cache,
+        "preload": args.preload,
+        "allow_model_choice": args.allow_model_choice,
+        "allow_precision_choice": args.allow_precision_choice,
+        "auth": bool(args.token),
+        "audit": args.audit,
+        "audit_reads": args.audit_reads,
+        "audit_prompts": args.audit_prompts,
+        "audit_retain_days": args.audit_retain_days,
+        "audit_api": bool(args.audit_token),
+        "max_upload_mb": args.max_upload_mb,
+        "max_queue": args.max_queue,
+        "max_jobs": args.max_jobs,
+        "source_retention": args.source_retention,
+        "allowed_hosts": sorted(ALLOWED_HOSTS | ALLOWED_SUFFIXES),
+    }
+
+
+def main() -> None:
+    global ARGS, ALLOWED_HOSTS, ALLOWED_SUFFIXES, AUDIT, WORK_DIR, UPLOAD_DIR
+    args, cfg_path, cfg_required = resolve_args()
 
     if args.no_auth:
         args.token = ""
@@ -1604,10 +2792,28 @@ def main() -> None:
         if generated:
             args.token = secrets.token_urlsafe(24)
 
+    WORK_DIR = (
+        Path(args.work_dir).expanduser()
+        if args.work_dir
+        else Path.home() / ".transcribe-server"
+    )
+    UPLOAD_DIR = WORK_DIR / "uploads"
+    audit_dir = (
+        Path(args.audit_dir).expanduser() if args.audit_dir else WORK_DIR / "audit"
+    )
+    AUDIT = AuditLog(
+        audit_dir,
+        enabled=args.audit,
+        retain_days=args.audit_retain_days,
+        prompts=args.audit_prompts,
+    )
+
+    args.model_cache = max(1, args.model_cache)
     ARGS = args
     ALLOWED_HOSTS, ALLOWED_SUFFIXES = local_names(args.host, args.allow_host)
 
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    pruned = AUDIT.prune()
 
     if not shutil.which("ffmpeg"):
         print("!  ffmpeg not found on PATH. Most formats will fail to decode.")
@@ -1621,6 +2827,11 @@ def main() -> None:
         print("Model ready.")
 
     print()
+    if cfg_path.exists():
+        print(f"Config     {cfg_path}")
+    elif cfg_required:
+        print(f"!  Config     {cfg_path} (missing)")
+
     if args.token:
         print(f"Access token: {args.token}")
         if generated:
@@ -1647,8 +2858,33 @@ def main() -> None:
         f"Sources    retention={args.source_retention}"
         f"{'  retry enabled' if args.source_retention != 'run' else '  retry disabled'}"
     )
+
+    if args.audit:
+        print(f"\nAudit      {audit_dir}")
+        print(
+            f"           reads={'logged' if args.audit_reads else 'skipped'}"
+            f"  prompts={'stored' if args.audit_prompts else 'omitted'}"
+            f"  retention={args.audit_retain_days}d"
+        )
+        if pruned:
+            print(f"           pruned {len(pruned)} expired file(s)")
+        if args.audit_token:
+            print(f"Audit token: {args.audit_token}")
+            print(
+                f"Audit UI:  http://<this-machine-ip>:{args.port}/audit"
+                "?token=<audit-token>"
+            )
+        else:
+            print(
+                "Audit API  disabled (set --audit-token or TRANSCRIBE_AUDIT_TOKEN)"
+            )
+    else:
+        print("\nAudit      disabled (--no-audit)")
+
     print(f"\nAccepting Host: {', '.join(sorted(ALLOWED_HOSTS | ALLOWED_SUFFIXES))}")
     print("(add more with --allow-host)\n")
+
+    audit("server.started", **startup_snapshot(args, cfg_path if cfg_path.exists() else None))
 
     uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
 

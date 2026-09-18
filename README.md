@@ -85,11 +85,131 @@ Useful flags:
 | `--max-queue 20`              | max jobs pending before uploads are refused                                                                                 |
 | `--max-jobs 60`               | finished job records retained before eviction                                                                               |
 | `--source-retention job`      | `run` deletes audio after transcribing (no retry), `job` keeps it while the record lives (default), `forever` never deletes |
+| `--work-dir PATH`             | where uploads and the audit trail live (default `~/.transcribe-server`)                                                     |
+| `--config PATH`               | TOML config file (default `<work dir>/config.toml`)                                                                         |
+| `--audit-dir PATH`            | where daily audit files live (default `<work dir>/audit`)                                                                   |
+| `--audit-token`               | separate token for `/audit` and `/api/audit`; unset disables the audit API                                                  |
+| `--audit-reads`               | also log status/list/detail polls (chatty; off by default)                                                                  |
+| `--no-audit`                  | stop recording the audit trail (existing files stay readable)                                                               |
+| `--no-audit-prompts`          | never write prompt/hotword text to the sidecar files                                                                        |
+| `--audit-retain-days 30`      | delete audit files older than N days at startup (`0` keeps everything)                                                      |
 
-`--help` groups these under network/access, model/hardware, and limits/storage.
+`--help` groups these under network/access, model/hardware, limits/storage and
+audit trail.
 
 First run with a given model downloads it from Hugging Face (a few GB for
 `large-v3`) into the HuggingFace cache. After that it's local.
+
+## Configuration file
+
+Anything settable by a flag can also live in a TOML file, which is what you
+want on a machine you don't want to re-type a long command line for:
+
+```toml
+# %USERPROFILE%\.transcribe-server\config.toml
+[server]
+host = "0.0.0.0"
+port = 8765
+allow_host = [".trycloudflare.com"]
+
+[model]
+model = "large-v3-turbo"
+device = "cuda"
+compute_type = "float16"
+quality = "balanced"
+preload = true
+
+[limits]
+max_upload_mb = 2048
+max_queue = 20
+source_retention = "job"
+
+[audit]
+enabled = true
+reads = false
+prompts = true
+retain_days = 30
+```
+
+Precedence, lowest to highest: **defaults → config file → flags → environment
+variables.** Environment names are the option uppercased with a `TRANSCRIBE_`
+prefix (`TRANSCRIBE_PORT`, `TRANSCRIBE_AUDIT_TOKEN`, `TRANSCRIBE_ALLOW_HOST` as
+a comma-separated list, and so on). An unknown or misspelled key is a startup
+error rather than a silent no-op, so a typo can't quietly leave auth off.
+
+## Audit trail
+
+The server records what the web app did, one JSON object per line, in daily
+files under `<work dir>/audit/`:
+
+```
+audit-2026-09-18.jsonl      # the events
+prompts/<job_id>.json       # full prompt/hotword text, 0600, separate
+```
+
+Events cover uploads, retries, deletions, transcript exports, worker
+start/finish/error, VRAM evictions, model loads, every refused request
+(`421` host, `403` cross-site, `401` auth) and a `server.started` snapshot of
+how the process was configured. Tokens never appear, and transcript text never
+appears.
+
+```json
+{"ts":"2026-09-18T02:01:57.677Z","event":"job.created","client":"127.0.0.1",
+ "host":"127.0.0.1","method":"POST","path":"/api/jobs","job":"24abc1713890",
+ "file":"standup.m4a","bytes":4194304,
+ "opts":{"model":"base","quality":"fast","prompt_len":53,
+         "prompt_sha256":"c89cb56d74…","hotwords_len":21,"hotwords_sha256":"8319d23d9f…"}}
+```
+
+Prompts and hotwords routinely contain real names, so the main log carries only
+their length and SHA-256. The text itself goes to `prompts/<job_id>.json`, which
+can be permissioned and expired independently. Correlate the two with the job
+id or the hash. Set `--no-audit-prompts` to never write that text at all.
+
+Reads (`GET /api/status`, `/api/jobs`, `/api/jobs/{id}`) are skipped by default
+because the UI polls them every few seconds; `--audit-reads` turns them on.
+Exports are always logged, because that is the moment a transcript leaves the
+machine.
+
+### Reading it
+
+Two ways in, deliberately independent:
+
+```powershell
+# 1. the files
+Get-Content $env:USERPROFILE\.transcribe-server\audit\audit-2026-09-18.jsonl | Select-String "exported"
+
+# 2. the API + UI, with its own token
+$env:TRANSCRIBE_AUDIT_TOKEN = "some-other-long-secret"
+uv run transcribe_server.py --preload
+```
+
+Then open `http://<host>:8765/audit?token=<audit-token>` for a filterable view
+(day, job id, substring search, prompts on/off), or query directly:
+
+```http
+GET /api/audit?date=2026-09-18&limit=200&offset=0&job=<id>&q=exported&include_prompts=1
+GET /api/audit/prompts/<job_id>
+```
+
+Both need `x-audit-token`, which is checked separately from the app token —
+you can hand out one without the other. With no audit token configured the
+whole audit API returns `404`, so it is off unless you ask for it.
+
+Files older than `audit_retain_days` (30 by default) are deleted at startup,
+sidecars included; `0` keeps everything.
+
+### Origin attribution behind a tunnel
+
+Behind `cloudflared`, every request arrives from localhost, so `client` is the
+TCP peer and the proxy's claim is recorded next to it, unverified:
+
+```json
+{"client":"127.0.0.1","client_claimed":"203.0.113.7"}
+```
+
+Treat `client_claimed` as a hint, not as fact: on direct LAN access a client can
+send that header itself. `client` is always trustworthy.
 
 ## Open it from the Mac
 
@@ -230,6 +350,9 @@ What's enforced:
 - Error messages are redacted of local paths; full tracebacks go to the console
   only.
 - Response headers set `nosniff`, `DENY` framing, `no-referrer`, and a CSP.
+- **The audit trail has its own token**, so read access to "who did what" is
+  separable from the ability to transcribe. Job ids are validated before they
+  reach a filename, and audit files are written `0600`.
 
 What it still doesn't do, by design:
 
@@ -240,6 +363,10 @@ What it still doesn't do, by design:
 - **No rate limiting** beyond the queue cap.
 - Untrusted media still goes into native decoders (libav), which is real attack
   surface. Keep ffmpeg current.
+- **The audit trail is not tamper-proof.** It is an append-only file on the same
+  machine, written by the same process it describes. Anyone with filesystem
+  access can edit or delete it. It answers "what did the web app do", not "prove
+  it to a third party".
 
 ## Notes and limits
 
@@ -251,6 +378,7 @@ What it still doesn't do, by design:
   deleted when the record is removed or evicted. Use `--source-retention run` if
   you'd rather meeting audio not sit on disk at all.
 - Transcripts live in memory only — they're gone when you restart the server, so
-  save what you want to keep.
+  save what you want to keep. The audit trail does not change that: it records
+  that an export happened, never the text.
 - Finished jobs are evicted past `--max-jobs` (60) to keep memory bounded.
 - Job state resets on restart. This is a workstation tool, not a service.
