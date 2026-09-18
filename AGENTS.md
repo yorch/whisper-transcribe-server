@@ -29,7 +29,7 @@ push failure as a blocker.
 ## Tests
 
 ```bash
-.venv/bin/pytest -q                    # 170 tests
+.venv/bin/pytest -q                    # 192 tests (2 skip without the CUDA wheels)
 uvx ruff check .                       # configured by ruff.toml
 uvx pyright --project pyrightconfig.json
 ```
@@ -38,6 +38,11 @@ uvx pyright --project pyrightconfig.json
 with no `.venv` and no CUDA wheels; the two `tests/test_gpu.py` tests that need
 the real wheels skip there. Use it for a quick check, and the `.venv` when you
 want the wheel-dependent tests to actually execute.
+
+`tests/test_ui_preview.py` covers the transcript preview. Most of it needs
+`node` (the embedded page script is parsed and its preview functions are run
+against a stub DOM) and skips without it; a browser is still the only way to
+check how the preview looks and scrolls for real.
 
 `.venv` is created by hand (see the README's Tests section) and is gitignored.
 Tests never start the worker thread, so they queue uploads without loading a

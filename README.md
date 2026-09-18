@@ -328,6 +328,9 @@ drop applies to that job.
   `thorough` buys a little accuracy for noticeably more time.
 - **Skip silence** — VAD filtering. Speeds up meetings with long dead air and
   reduces hallucinated text during silence. Worth leaving on.
+- **Follow** — keeps the newest line of every live preview in view. Remembered
+  for the browser session. Scrolling up pauses it (the preview border goes
+  amber) and scrolling back to the bottom resumes; the switch is the off switch.
 
 **Advanced**
 
@@ -356,10 +359,12 @@ re-runs the same file with whatever the controls say _now_ — so you can fix a 
 transcript by adding the term list and retrying, without re-uploading an hour of
 audio. Disabled by `--source-retention run`.
 
-Transcripts stream in live as segments finish, with a rough ETA. When a job
-completes you can copy the text or save `.txt`, timestamped `.txt`, `.srt`,
-`.vtt`, or `.json` (segment timings, word timings if requested, and the exact
-options used).
+Transcripts stream in live as segments finish, with a rough ETA. Each segment
+lands in the preview with its start time in a quiet left gutter — the same clock
+as the timestamped export, without the milliseconds — so you can read along and
+note where something was said. When a job completes you can copy the text or
+save `.txt`, timestamped `.txt`, `.srt`, `.vtt`, or `.json` (segment timings,
+word timings if requested, and the exact options used).
 
 Jobs run one at a time regardless of how many files you drop, so the GPU isn't
 fighting itself. Drop five files and walk away.

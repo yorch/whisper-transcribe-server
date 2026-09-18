@@ -2288,10 +2288,22 @@ PAGE = r"""<!doctype html>
     max-height:300px;
     overflow:auto;
     font-size:14.5px;
-    white-space:pre-wrap;
     word-break:break-word;
   }
   .transcript:empty{display:none}
+  /* One row per segment: a quiet time gutter, then the text. The gutter keeps
+     its width so the words line up down the page instead of stepping in and
+     out with the clock. */
+  .seg{display:flex;gap:10px;padding:1px 0}
+  .seg .ts{
+    flex:0 0 auto;width:9ch;color:var(--muted);
+    font-family:var(--display);font-size:13px;line-height:1.6;
+    font-variant-numeric:tabular-nums;user-select:none;
+  }
+  .seg .tx{flex:1 1 auto;min-width:0;white-space:pre-wrap}
+  /* Following is on but the view is parked somewhere else: saying so beats
+     letting it look broken. */
+  .transcript.paused{border-color:var(--amber-dim)}
   .actions{display:flex;flex-wrap:wrap;gap:8px;margin-top:12px}
   button{
     font-family:var(--display);
@@ -2397,6 +2409,7 @@ PAGE = r"""<!doctype html>
         <select id="compute"></select>
       </label>
       <label class="field"><input type="checkbox" id="vad" checked> Skip silence</label>
+      <label class="field"><input type="checkbox" id="follow" checked> Follow</label>
     </div>
 
     <details class="advanced">
@@ -2619,9 +2632,21 @@ el("vad").addEventListener("change", () => {
   el("vad-tuning").style.display = el("vad").checked ? "" : "none";
 });
 
+/* ---------- following the transcript ---------- */
+/* Auto-scroll for the job previews, on by default and remembered for the
+   session: a switch that quietly comes back on after every reload is worse
+   than not having one. */
+const FOLLOW_KEY = "follow";
+try{ el("follow").checked = sessionStorage.getItem(FOLLOW_KEY) !== "0"; }catch(_){}
+el("follow").addEventListener("change", () => setFollow(el("follow").checked));
+
 /* ---------- rendering ---------- */
 const TICKS = 40;
 const known = new Map();
+/* One entry per card. The transcript keeps its DOM between polls so a running
+   job can be read while it grows: replacing the whole card every 1.2s (what
+   this used to do) threw away the scroll position and any selection. */
+const views = new Map();
 
 function meter(job){
   const lit = Math.round((job.progress || 0) * TICKS);
@@ -2670,44 +2695,132 @@ function jobTags(job){
   return bits.join(" \u00b7 ");
 }
 
-function render(job){
-  const id = "job-" + job.id;
-  let node = document.getElementById(id);
-  if(!node){
-    node = document.createElement("div");
-    node.className = "job";
-    node.id = id;
-    el("jobs").prepend(node);
+/* Seconds to HH:MM:SS: the clock of the timestamped export without the
+   milliseconds, which are noise on screen. */
+function fmtStamp(seconds){
+  const total = Math.max(0, Math.floor(seconds || 0));
+  const pad = (n) => String(n).padStart(2,"0");
+  return pad(Math.floor(total/3600)) + ":" + pad(Math.floor(total/60)%60)
+       + ":" + pad(total%60);
+}
+
+function followOn(){ return el("follow").checked; }
+
+function setPaused(view, paused){
+  view.paused = paused;
+  view.transcript.classList.toggle("paused", paused);
+  view.transcript.title = paused
+    ? "Following paused \u2014 scroll back to the bottom to catch up" : "";
+}
+
+/* Keep the newest line in view, unless Following is off or the operator has
+   scrolled away from the bottom. */
+function stick(view){
+  if(!followOn() || view.paused) return;
+  view.transcript.scrollTop = view.transcript.scrollHeight;
+}
+
+function setFollow(on){
+  try{ sessionStorage.setItem(FOLLOW_KEY, on ? "1" : "0"); }catch(_){}
+  for(const view of views.values()){
+    setPaused(view, false);
+    if(on && view.live) stick(view);   // catch up now, not at the next segment
   }
+}
+
+function createCard(job){
+  const node = document.createElement("div");
+  node.className = "job";
+  node.id = "job-" + job.id;
+  node.innerHTML =
+    '<div class="job-head"></div>' +
+    '<div class="meter-slot"></div>' +
+    '<div class="job-body">' +
+      '<p class="status"></p>' +
+      '<div class="transcript"></div>' +
+      '<div class="actions"></div>' +
+    "</div>";
+  el("jobs").prepend(node);
+
+  const view = {
+    node,
+    transcript: node.querySelector(".transcript"),
+    shown: 0,
+    paused: false,
+    live: false,
+  };
+  /* Scrolling away from the newest line pauses; coming back re-arms. The
+     Follow switch stays the authoritative off switch. */
+  view.transcript.addEventListener("scroll", () => {
+    const atBottom = view.transcript.scrollHeight - view.transcript.scrollTop
+                     - view.transcript.clientHeight <= 8;
+    if(atBottom === view.paused) setPaused(view, !atBottom);
+  });
+  views.set(job.id, view);
+  return view;
+}
+
+/* Append only what is new. The server grows job["segments"] and never rewrites
+   one, so counting is enough. textContent rather than innerHTML: transcript
+   text needs no escaping and cannot become markup. */
+function appendSegments(view, segments, live){
+  view.live = live;
+  if(segments.length < view.shown){
+    view.transcript.textContent = "";
+    view.shown = 0;
+  }
+  for(let i = view.shown; i < segments.length; i++){
+    const seg = segments[i];
+    const row = document.createElement("div");
+    row.className = "seg";
+    const ts = document.createElement("span");
+    ts.className = "ts";
+    ts.textContent = fmtStamp(seg.start);
+    const tx = document.createElement("span");
+    tx.className = "tx";
+    tx.textContent = seg.text;
+    row.append(ts, tx);
+    view.transcript.append(row);
+  }
+  view.shown = segments.length;
+  /* Only chase a job that is still producing text: a finished transcript should
+     open at its first line, not at its last. */
+  if(live) stick(view);
+}
+
+function actionsHtml(job){
   const dl = (fmt, label) =>
     '<button data-dl="' + fmt + '" data-id="' + esc(job.id) + '">' + label + "</button>";
+  return (job.state === "done"
+      ? '<button data-copy="' + esc(job.id) + '">Copy text</button>' +
+        dl("txt","Save .txt") + dl("timestamped","Save timestamped") +
+        dl("srt","Save .srt") + dl("vtt","Save .vtt") + dl("json","Save .json")
+      : "") +
+    (RETRY_OK && job.can_retry
+      ? '<button data-retry="' + esc(job.id) + '">Retry with these settings</button>'
+      : "") +
+    '<button class="ghost" data-del="' + esc(job.id) + '">' +
+      (["queued","loading","running"].includes(job.state) ? "Cancel" : "Remove") +
+    "</button>";
+}
 
-  const text = (job.segments || []).map(s => s.text).join(" ");
+function render(job){
+  const id = "job-" + job.id;
+  let view = views.get(id);
+  if(!view || !view.node.isConnected) view = createCard(job);
+
   const name = esc(job.filename);
+  view.node.querySelector(".job-head").innerHTML =
+    '<span class="job-name" title="' + name + '">' + name + "</span>" +
+    '<span class="job-meta">' + esc(jobTags(job)) + "</span>";
+  view.node.querySelector(".meter-slot").innerHTML = meter(job);
+  const status = view.node.querySelector(".status");
+  status.className = "status" + (job.state === "error" ? " err" : "");
+  status.innerHTML = statusLine(job);
+  view.node.querySelector(".actions").innerHTML = actionsHtml(job);
 
-  node.innerHTML =
-    '<div class="job-head">' +
-      '<span class="job-name" title="' + name + '">' + name + "</span>" +
-      '<span class="job-meta">' + esc(jobTags(job)) + "</span>" +
-    "</div>" +
-    meter(job) +
-    '<div class="job-body">' +
-      '<p class="status' + (job.state === "error" ? " err" : "") + '">' + statusLine(job) + "</p>" +
-      '<div class="transcript">' + esc(text) + "</div>" +
-      '<div class="actions">' +
-        (job.state === "done"
-          ? '<button data-copy="' + esc(job.id) + '">Copy text</button>' +
-            dl("txt","Save .txt") + dl("timestamped","Save timestamped") +
-            dl("srt","Save .srt") + dl("vtt","Save .vtt") + dl("json","Save .json")
-          : "") +
-        (RETRY_OK && job.can_retry
-          ? '<button data-retry="' + esc(job.id) + '">Retry with these settings</button>'
-          : "") +
-        '<button class="ghost" data-del="' + esc(job.id) + '">' +
-          (["queued","loading","running"].includes(job.state) ? "Cancel" : "Remove") +
-        "</button>" +
-      "</div>" +
-    "</div>";
+  appendSegments(view, job.segments || [],
+                 ["queued","loading","running"].includes(job.state));
 }
 
 /* Downloads go through fetch so the token stays in a header, never a URL. */
@@ -2787,6 +2900,7 @@ async function tick(){
       const n = document.getElementById("job-" + stale);
       if(n) n.remove();
       known.delete(stale);
+      views.delete(stale);
     }
 
     for(const summary of jobs){
