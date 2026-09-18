@@ -78,6 +78,7 @@ except ModuleNotFoundError:  # pragma: no cover - 3.10 only
     def load_toml(text: str) -> dict[str, Any]:
         return tomli.loads(text)
 
+
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 from starlette.concurrency import run_in_threadpool
@@ -922,9 +923,7 @@ def request_fields(request: Request) -> dict[str, Any]:
         claimed = forwarded.split(",")[0].strip()
     return {
         "client": (direct or "")[:64] or None,
-        "client_claimed": (
-            claimed[:64] if claimed and claimed != direct else None
-        ),
+        "client_claimed": (claimed[:64] if claimed and claimed != direct else None),
         "host": (normalize_host(request.headers.get("host") or "") or None),
         "method": request.method[:16],
         "path": request.url.path[:200],
@@ -1137,9 +1136,7 @@ def public_opts(opts: dict[str, Any]) -> dict[str, Any]:
 
 
 def job_public(job: dict[str, Any], include_segments: bool = True) -> dict[str, Any]:
-    out = {
-        k: v for k, v in job.items() if k not in ("path", "segments", "opts")
-    }
+    out = {k: v for k, v in job.items() if k not in ("path", "segments", "opts")}
     out["opts"] = public_opts(job["opts"])
     now = time.time()
     started = job.get("started")
@@ -1920,7 +1917,9 @@ def retry_job(
     old = get_job(job_id)
     source = Path(old["path"])
     if not source.exists():
-        audit_rejection("job.retry_rejected", request, job=job_id, reason="source-gone", status=409)
+        audit_rejection(
+            "job.retry_rejected", request, job=job_id, reason="source-gone", status=409
+        )
         raise HTTPException(
             status_code=409,
             detail="The source audio is no longer on disk; re-upload it",
@@ -1946,7 +1945,9 @@ def retry_job(
             1 for j in JOBS.values() if j["state"] in ("queued", "loading", "running")
         )
     if pending >= ARGS.max_queue:
-        audit_rejection("job.retry_rejected", request, job=job_id, reason="queue-full", status=429)
+        audit_rejection(
+            "job.retry_rejected", request, job=job_id, reason="queue-full", status=429
+        )
         raise HTTPException(
             status_code=429, detail=f"Queue is full ({ARGS.max_queue} jobs)"
         )
@@ -1961,9 +1962,7 @@ def retry_job(
         file=old["filename"],
         opts=audit_opts(opts),
     )
-    store_prompt_sidecar(
-        new_id, old["filename"], opts, source="retry", from_job=job_id
-    )
+    store_prompt_sidecar(new_id, old["filename"], opts, source="retry", from_job=job_id)
     return {"id": new_id}
 
 
@@ -2064,7 +2063,9 @@ def audit_query(
         raise HTTPException(status_code=400, detail="Malformed job id")
 
     needle = q.strip() or None
-    raw, total = AUDIT.read(day, limit=limit, offset=offset, job=job or None, needle=needle)
+    raw, total = AUDIT.read(
+        day, limit=limit, offset=offset, job=job or None, needle=needle
+    )
 
     events: list[dict[str, Any]] = []
     for line in raw:
@@ -3643,7 +3644,9 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
-def resolve_args(argv: list[str] | None = None) -> tuple[argparse.Namespace, Path, bool]:
+def resolve_args(
+    argv: list[str] | None = None,
+) -> tuple[argparse.Namespace, Path, bool]:
     """Layer defaults, config file, flags and environment, in that order."""
     cli = vars(build_parser().parse_args(argv))
 
@@ -3664,9 +3667,7 @@ def resolve_args(argv: list[str] | None = None) -> tuple[argparse.Namespace, Pat
         try:
             merged[name] = CONVERTERS[kind](raw)
         except (TypeError, ValueError):
-            raise SystemExit(
-                f"!  {env_name}={raw!r} is not a valid {kind}"
-            ) from None
+            raise SystemExit(f"!  {env_name}={raw!r} is not a valid {kind}") from None
 
     # --allow-host is repeatable, so it accumulates across every layer instead
     # of a flag silently replacing the configured tunnel hostname.
@@ -3890,10 +3891,7 @@ def main() -> None:
         print("   every transcript and upload files to this machine.")
         print(f"\nOpen:  http://<this-machine-ip>:{args.port}/")
 
-    print(
-        f"\nModel      {args.model}"
-        f"{'' if args.allow_model_choice else '  (pinned)'}"
-    )
+    print(f"\nModel      {args.model}{'' if args.allow_model_choice else '  (pinned)'}")
     print(
         f"Precision  {args.compute_type}"
         f"{'  (selectable)' if args.allow_precision_choice else '  (pinned)'}"
@@ -3928,9 +3926,7 @@ def main() -> None:
                 "?token=<audit-token>"
             )
         else:
-            print(
-                "Audit API  disabled (set --audit-token or TRANSCRIBE_AUDIT_TOKEN)"
-            )
+            print("Audit API  disabled (set --audit-token or TRANSCRIBE_AUDIT_TOKEN)")
     else:
         print("\nAudit      disabled (--no-audit)")
 
