@@ -97,6 +97,12 @@ launcher/transcribe_tray.py --self-test --with-server   # also probes a real ser
   the transcript: `run_job` catches it, records `job.diarize_failed`, and
   finishes the job unlabelled with the reason in its message. A model download
   or a child process going wrong must not cost an hour of transcription.
+- **`--preload` warns about diarization, and does not exit.** Same reasoning one
+  level up: the most likely failure is a machine that cannot reach github.com
+  for the weights, where transcription works fine. `--preload`'s exit code means
+  "a job will genuinely run", and a job does run — it just has no labels. Exit 1
+  here would contradict the invariant above, and under a service wrapper it buys
+  a restart loop instead of a diagnosis.
 - **Alignment splits on speaker change, so `word_timestamps` is not optional.**
   Asking for diarization forces it on. Without word timings a whole segment can
   only go to its dominant speaker, which is the version of the feature that is

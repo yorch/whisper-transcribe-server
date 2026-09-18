@@ -162,6 +162,10 @@ releases rather than Hugging Face — no account or licence click-through. Those
 models are only downloaded if a job actually asks for speaker labels, or by
 `--preload`. `--no-diarize` removes the feature and its downloads entirely.
 
+If `--preload` cannot set speaker identification up — no network for the
+weights, most likely — it says so and carries on. Transcription does not depend
+on it, and a job that cannot label speakers still finishes with its transcript.
+
 ## Configuration file
 
 The first run writes a starter file to `<work dir>/config.toml`. Every key in

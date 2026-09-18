@@ -536,11 +536,17 @@ def test_preload_proves_diarization_when_it_is_offered(configured, monkeypatch):
     assert calls == ["probe"], "--no-diarize must not fetch 42 MB of models"
 
 
-def test_preload_refuses_to_offer_a_control_that_cannot_work(
+def test_preload_warns_but_still_starts_when_diarization_is_unavailable(
     configured, monkeypatch, capsys
 ):
-    """Same reasoning as the CUDA check: exiting 1 with advice beats serving a
-    checkbox that fails on every job."""
+    """A degraded feature must not take the server with it.
+
+    The likeliest cause is a machine that cannot reach github.com for the 42 MB
+    of weights, where transcription works perfectly. run_job already treats a
+    failed diarization pass as a degraded job, so refusing to start here would
+    contradict that -- and under a service wrapper, exit 1 means a restart loop
+    instead of a diagnosis.
+    """
     monkeypatch.setattr(s, "load_model", lambda *a: object())
     monkeypatch.setattr(s, "verify_device", lambda *a: None)
 
@@ -549,10 +555,31 @@ def test_preload_refuses_to_offer_a_control_that_cannot_work(
 
     monkeypatch.setattr(s, "probe_diarization", boom)
 
-    with pytest.raises(SystemExit) as caught:
-        s.preload_model(preload_args(allow_diarize=True))
-    assert caught.value.code == 1
-    assert "--no-diarize" in capsys.readouterr().out
+    s.preload_model(preload_args(allow_diarize=True))  # must not raise
+
+    out = capsys.readouterr().out
+    assert "Model ready." in out, "transcription is still fine"
+    assert "no route to host" in out, "but say what went wrong"
+    assert "--no-diarize" in out, "and how to stop it being attempted"
+    assert "Speaker identification ready" not in out, "no false all-clear"
+
+
+def test_preload_reports_a_missing_sherpa_onnx_in_plain_words(
+    configured, monkeypatch
+):
+    """Not the child's ModuleNotFoundError several frames deep: the fix is a
+    different command, not a different file."""
+    real_find_spec = importlib.util.find_spec
+    monkeypatch.setattr(
+        s.importlib.util,
+        "find_spec",
+        lambda name, *a, **k: None
+        if name == "sherpa_onnx"
+        else real_find_spec(name, *a, **k),
+    )
+
+    with pytest.raises(RuntimeError, match="uv run transcribe_server.py"):
+        s.run_diarizer("meeting.wav", 0, FAKE_MODELS)
 
 
 def test_preload_still_fails_when_the_transcriber_cannot_encode(

@@ -1307,8 +1307,13 @@ DIARIZE_MIN_DURATION_ON = 0.3
 DIARIZE_MIN_DURATION_OFF = 0.5
 
 # A healthy child emits progress at least once per percent, so this much silence
-# means it is wedged rather than busy.
-DIARIZE_STALL_SECONDS = 120
+# means it is wedged rather than busy -- with one deliberate exception. The
+# callback reports segmentation progress, and then clustering runs to completion
+# emitting nothing, so on a long recording the quiet stretch at the end is the
+# second-slowest part of the job rather than a hang. The guard therefore has to
+# clear the whole clustering phase for a multi-hour file on a slow CPU, which is
+# minutes; 120s was not enough, and killed healthy runs.
+DIARIZE_STALL_SECONDS = 600
 DIARIZE_MARK = "@@DIARIZE@@"
 
 # Pinned by SHA-256 on purpose. A truncated .onnx fails deep inside ONNX Runtime
@@ -1676,6 +1681,16 @@ def run_diarizer(
 
     if stopped():
         return None
+
+    # Say this in the parent's words rather than letting the child die with a
+    # ModuleNotFoundError several frames deep: the fix is a different command,
+    # not a different file.
+    if importlib.util.find_spec("sherpa_onnx") is None:
+        raise RuntimeError(
+            "sherpa-onnx is not installed for this interpreter. It is declared "
+            "in the script's inline dependencies, so run it through uv "
+            "(uv run transcribe_server.py); otherwise pip install sherpa-onnx"
+        )
 
     command = [
         sys.executable,
@@ -4831,12 +4846,18 @@ def preload_model(args: argparse.Namespace) -> None:
     try:
         probe_diarization()
     except Exception as exc:  # noqa: BLE001
+        # A warning, not a refusal. Transcription is unaffected, and the failure
+        # this is most likely to hit in practice -- a machine that cannot reach
+        # github.com for the 42 MB of weights -- would otherwise take a working
+        # server down with it. run_job treats a failed diarization as a degraded
+        # job, so exiting 1 here would contradict that, and a service wrapper
+        # would restart-loop without ever showing anyone why.
         print(f"\n!  speaker identification cannot run: {friendly_error(exc)}")
-        print("   Transcription is unaffected. Either start with --no-diarize to")
-        print("   remove the control, or fix the problem above.")
-        print("   Refusing to offer a control that cannot succeed.\n")
-        raise SystemExit(1) from None
-    print("Speaker identification ready.")
+        print("   Transcription is unaffected; jobs will finish without labels.")
+        print("   Fix the problem above, or start with --no-diarize to remove the")
+        print("   control and stop it being attempted.\n")
+    else:
+        print("Speaker identification ready.")
 
 
 def main() -> None:

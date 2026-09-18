@@ -578,10 +578,15 @@ Three things this project's style demands:
   inside ONNX Runtime, exactly the shape of the cuBLAS bug this repo already
   fixed once. Pin SHA-256 per file.
 - **Make `--preload` prove it**, per the AGENTS.md invariant ("`--preload` must
-  *prove* the device can encode"). If diarization is enabled, `--preload` should
-  build a diarization session and run `process()` on a second of silence, so a
-  broken download fails at startup with an actionable message instead of on the
-  first job.
+  *prove* the device can encode"). If diarization is enabled, `--preload` builds
+  a diarization session and runs `process()` on a second of silence, so a broken
+  download is reported at startup instead of on the first job. It **warns and
+  carries on** rather than exiting: transcription is unaffected, and the failure
+  this is most likely to hit in practice — a machine that cannot reach github.com
+  for the 42 MB — would otherwise take a working server down with it. That also
+  keeps `--preload`'s exit code meaning one thing: "a job will genuinely run". A
+  job does run; it just has no labels. See §7.3 for why that is the same choice
+  `run_job` makes.
 - **Fail loudly and early if the download can't happen.** An on-LAN machine with
   no internet should get "diarization needs a one-time 46 MB download; run X, or
   uncheck the box" — not a traceback from `urllib`.
@@ -671,7 +676,8 @@ single calibrated constant with the measurement next to it.
   with pinned SHA-256s; the embedded `DIARIZE_WORKER` child; `run_diarizer` with
   a stall guard, a cancel path and Windows `CREATE_NO_WINDOW`; `align_speakers`;
   `render` output for txt/timestamped/srt/vtt/json; `--no-diarize`; the
-  `--preload` probe; `job.diarized` / `job.diarize_failed` audit events.
+  `--preload` probe, which reports diarization trouble without refusing to
+  start; `job.diarized` / `job.diarize_failed` audit events.
 - `tests/test_diarization.py` — the GIL-isolation regression test, the child
   protocol, an alignment case per failure mode, the export shapes, and an
   opt-in test against the real model.
