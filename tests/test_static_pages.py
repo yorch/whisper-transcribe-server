@@ -72,6 +72,7 @@ def served_markup(page: str) -> str:
 #     button now, instead of the drop starting the job on the spot
 #   - .uploading*, .up-*: the file on the wire, with its progress
 #   - .jobs-head*: the cards' header, which the Follow switch moved into
+#   - .save-*, .actions > button*: the formats as one group, Remove kept apart
 #   - .transcript:not(.labeled) .seg .sp: no speaker column until there are labels
 INDEX_SELECTORS_ADDED = {
     "#r-ffmpeg.bad",
@@ -102,6 +103,13 @@ INDEX_SELECTORS_ADDED = {
     ".uploading progress::-moz-progress-bar",
     ".jobs-head",
     ".jobs-head h2",
+    ".actions > button.ghost:last-child",
+    ".actions > button.armed",
+    ".save-group",
+    ".save-label",
+    ".save-group button",
+    ".save-group button:last-child",
+    ".save-group button:focus-visible",
     ".transcript:not(.labeled) .seg .sp",
 }
 

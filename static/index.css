@@ -295,7 +295,30 @@
   
   .transcript.paused{border-color:var(--amber-dim)}
 
-  .actions{display:flex;flex-wrap:wrap;gap:8px;margin-top:12px}
+  .actions{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin-top:12px}
+
+  /* Cancel / Remove, always last: kept apart from the buttons that keep work. */
+  .actions > button.ghost:last-child{margin-left:auto}
+
+  .actions > button.armed{color:var(--red);background:rgba(157,52,39,.08)}
+
+  /* The five formats as one segmented control behind a single "Save" label. */
+  .save-group{display:inline-flex;align-items:stretch}
+
+  .save-label{
+    display:flex;align-items:center;
+    padding:0 9px;
+    font-family:var(--display);font-size:11px;letter-spacing:.12em;text-transform:uppercase;
+    color:var(--muted);
+    border:1px solid #a9b0b8;border-right:0;border-radius:3px 0 0 3px;
+    background:rgba(255,255,255,.35);
+  }
+
+  .save-group button{border-radius:0;margin-left:-1px}
+
+  .save-group button:last-child{border-radius:0 3px 3px 0}
+
+  .save-group button:focus-visible{position:relative;z-index:1}
 
 
   details.advanced{margin-top:2px;border-top:1px solid var(--panel-lo);padding-top:10px}

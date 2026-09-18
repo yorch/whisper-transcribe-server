@@ -151,9 +151,10 @@ const jobsBox = {children: [], prepend: (kid) => { jobsBox.children.unshift(kid)
 const domIds = new Map();
 function makeNode(){
   const node = {
-    className: "", title: "", dataset: {}, children: [],
+    className: "", title: "", dataset: {}, children: [], attributes: {},
     isConnected: true, scrollHeight: 0, scrollTop: 0, clientHeight: 100,
     _text: "", _id: "",
+    setAttribute(name, value){ node.attributes[name] = value; },
     append(...kids){
       node.children.push(...kids);
       if(node.className === "transcript") node.scrollHeight = node.children.length * 20;
@@ -475,7 +476,7 @@ def test_a_failed_read_of_the_last_change_is_retried_not_forgotten():
         """
     )
     assert probe["status"].startswith("Finished"), probe["status"]
-    assert "Save .txt" in probe["buttons"], probe["buttons"]
+    assert probe["buttons"][0] == "Copy text", probe["buttons"]
 
 
 @needs_node
@@ -829,11 +830,15 @@ def test_the_actions_are_buttons_a_handler_can_read_back():
     has to put the same keys there the markup string used to."""
     probe = card_probe(
         """
+        // Buttons in order, reaching into the Save group; its label is not one.
+        const flat = (node) => node.children.flatMap(kid =>
+          kid.className === "save-group" ? flat(kid)
+          : kid.className === "save-label" ? [] : [kid]);
         const buttons = (job) => {
           const view = createCard(job);
           render(job);
-          return view.actions.children.map(b => [b.textContent,
-            JSON.stringify(b.dataset), b.className]);
+          return flat(view.actions).map(b => [b.textContent,
+            JSON.stringify(b.dataset), b.className, b.attributes["aria-label"] || ""]);
         };
         return {
           done: buttons({id: "d", filename: "x", state: "done", opts: {model: "m"},
@@ -847,19 +852,31 @@ def test_the_actions_are_buttons_a_handler_can_read_back():
     labels = [row[0] for row in probe["done"]]
     assert labels == [
         "Copy text",
+        ".txt",
+        "timestamped",
+        ".srt",
+        ".vtt",
+        ".json",
+        "Remove",
+    ], labels
+    # The short labels sit behind a "Save" heading; a screen reader gets it back.
+    assert [row[3] for row in probe["done"][1:6]] == [
         "Save .txt",
         "Save timestamped",
         "Save .srt",
         "Save .vtt",
         "Save .json",
-        "Remove",
-    ], labels
+    ]
     assert json.loads(probe["done"][1][1]) == {"dl": "txt", "id": "d"}
     assert json.loads(probe["done"][0][1]) == {"copy": "d"}
+    # Removing a finished transcript loses it, so that button asks first.
+    assert json.loads(probe["done"][-1][1]) == {"del": "d", "confirm": "1"}
     # A live job is cancelled, not removed, and the ghost class rides along.
     assert [row[0] for row in probe["running"]] == ["Cancel"]
     assert probe["running"][0][2] == "ghost"
-    assert json.loads(probe["running"][0][1]) == {"del": "r"}
+    assert json.loads(probe["running"][0][1]) == {"del": "r"}, (
+        "Cancel does not ask twice: the job can be retried afterwards"
+    )
 
 
 # --------------------------------------------------------------------------- #

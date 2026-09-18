@@ -459,7 +459,13 @@ lands in the preview with its start time in a quiet left gutter — the same clo
 as the timestamped export, without the milliseconds — so you can read along and
 note where something was said. When a job completes you can copy the text or
 save `.txt`, timestamped `.txt`, `.srt`, `.vtt`, or `.json` (segment timings,
-word timings if requested, and the exact options used).
+word timings if requested, and the exact options used). A copy or save that
+fails says so on the button.
+
+**Remove** on a finished job asks once more (the button turns red and reads
+_Remove?_ for a few seconds) because the transcript lives only in the server's
+memory, and removing it is final. **Cancel** on a running job does not ask: the
+record stays, and the job can be retried.
 
 Jobs run one at a time regardless of how many files you stage, so the GPU isn't
 fighting itself. Stage five files, press Transcribe, and walk away.

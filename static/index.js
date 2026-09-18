@@ -604,26 +604,64 @@ function appendSegments(view, segments, live, total, labeled){
    to be escaped to be safe here. */
 function actions(node, job){
   node.textContent = "";
-  const add = (label, data, ghost) => {
+  const add = (parent, label, data, ghost) => {
     const button = document.createElement("button");
     button.textContent = label;
     Object.assign(button.dataset, data);
     if(ghost) button.className = "ghost";
-    node.append(button);
+    parent.append(button);
+    return button;
   };
   if(job.state === "done"){
-    add("Copy text", {copy: job.id});
-    for(const [fmt, label] of [["txt", "Save .txt"],
-                               ["timestamped", "Save timestamped"],
-                               ["srt", "Save .srt"],
-                               ["vtt", "Save .vtt"],
-                               ["json", "Save .json"]])
-      add(label, {dl: fmt, id: job.id});
+    add(node, "Copy text", {copy: job.id});
+    /* One labelled group, not five "Save ..." buttons: the format is a single
+       choice, and five full buttons pushed the row onto a second line. The
+       aria-label gives each its full name back, since ".srt" alone does not
+       say what the button does. */
+    const group = document.createElement("div");
+    group.className = "save-group";
+    group.setAttribute("role", "group");
+    group.setAttribute("aria-label", "Save the transcript");
+    const label = document.createElement("span");
+    label.className = "save-label";
+    label.textContent = "Save";
+    group.append(label);
+    for(const [fmt, text] of [["txt", ".txt"],
+                              ["timestamped", "timestamped"],
+                              ["srt", ".srt"],
+                              ["vtt", ".vtt"],
+                              ["json", ".json"]])
+      add(group, text, {dl: fmt, id: job.id}).setAttribute("aria-label", "Save " + text);
+    node.append(group);
   }
   if(RETRY_OK && job.can_retry)
-    add("Retry with these settings", {retry: job.id});
-  add(["queued","loading","running"].includes(job.state) ? "Cancel" : "Remove",
-      {del: job.id}, true);
+    /* Short, so the row fits on one line; what "these settings" means goes in
+       the tooltip, where it has room to be exact. */
+    add(node, "Retry", {retry: job.id}).title =
+      "Run this audio again with the controls as they are set now";
+  const live = ["queued","loading","running"].includes(job.state);
+  /* A finished transcript lives only in the server's memory, so Remove is the
+     one click that loses it for good: it asks twice. */
+  add(node, live ? "Cancel" : "Remove",
+      job.state === "done" ? {del: job.id, confirm: "1"} : {del: job.id}, true);
+}
+
+/* A short-lived label on a button that did something with no other visible
+   result: "Copied", or a failure that would otherwise pass in silence. */
+function flash(button, text, ms = 1600){
+  const was = button.dataset.label || button.textContent;
+  button.dataset.label = was;
+  button.textContent = text;
+  clearTimeout(button.flashTimer);
+  button.flashTimer = setTimeout(() => {
+    button.textContent = was;
+    delete button.dataset.label;
+    if(button.dataset.armed){
+      delete button.dataset.armed;
+      button.classList.remove("armed");
+      button.title = "";
+    }
+  }, ms);
 }
 
 function render(job){
@@ -655,7 +693,7 @@ function render(job){
 async function download(jobId, fmt){
   const r = await api("/api/jobs/" + encodeURIComponent(jobId)
                       + "/text?format=" + encodeURIComponent(fmt) + "&download=1");
-  if(!r.ok) return;
+  if(!r.ok) throw new Error("save failed");
   const blob = await r.blob();
   const cd = r.headers.get("content-disposition") || "";
   let name = "transcript." + (fmt === "timestamped" ? "txt" : fmt);
@@ -677,9 +715,15 @@ el("jobs").addEventListener("click", async (e) => {
   const b = e.target.closest("button");
   if(!b) return;
   try{
-    if(b.dataset.dl) await download(b.dataset.id, b.dataset.dl);
+    if(b.dataset.dl){
+      try{ await download(b.dataset.id, b.dataset.dl); }
+      catch(err){ if(err.message !== "unauthorised") flash(b, "Failed"); }
+    }
     if(b.dataset.copy){
       const r = await api("/api/jobs/" + encodeURIComponent(b.dataset.copy) + "/text?format=txt");
+      /* Without this an error body ({"detail": ...}) went to the clipboard and
+         the button still said "Copied". */
+      if(!r.ok){ flash(b, "Copy failed"); return; }
       const body = await r.text();
       if(navigator.clipboard && window.isSecureContext){
         await navigator.clipboard.writeText(body);
@@ -693,8 +737,7 @@ el("jobs").addEventListener("click", async (e) => {
         document.execCommand("copy");
         ta.remove();
       }
-      b.textContent = "Copied";
-      setTimeout(() => (b.textContent = "Copy text"), 1400);
+      flash(b, "Copied");
     }
     if(b.dataset.retry){
       b.disabled = true;
@@ -709,6 +752,16 @@ el("jobs").addEventListener("click", async (e) => {
       await tick();
     }
     if(b.dataset.del){
+      /* Asked twice, inline: a dialog would block the page's polling too. The
+         armed label stays as short as "Remove", or the row reflows and moves
+         the button out from under the pointer that has to click it again. */
+      if(b.dataset.confirm && !b.dataset.armed){
+        b.dataset.armed = "1";
+        b.classList.add("armed");
+        b.title = "Click again to delete this transcript from the server";
+        flash(b, "Remove?", 4000);
+        return;
+      }
       await api("/api/jobs/" + encodeURIComponent(b.dataset.del), {method:"DELETE"});
       await tick();
     }
