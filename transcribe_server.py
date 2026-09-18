@@ -947,19 +947,71 @@ class AuditLog:
         enabled: bool = True,
         retain_days: int = 30,
         prompts: bool = True,
+        max_mb: int = 0,
     ) -> None:
         self.dir = Path(directory)
         self.prompts_dir = self.dir / "prompts"
         self.enabled = enabled
         self.retain_days = max(0, retain_days)
         self.store_prompts = prompts
+        self.max_mb = max(0, max_mb)
+        self.max_bytes = self.max_mb * 1024 * 1024
         self._lock = threading.Lock()
+        # Sidecars get their own lock: a read-modify-write (a rename) must not
+        # interleave with the plain write of a prompt, and the day-file lock is
+        # held across a rotation plus a retention sweep.
+        self._sidecar_lock = threading.Lock()
         self._fh: Any | None = None
         self._day: str | None = None
         self._warned: set[tuple[str, str]] = set()
         self.last_error: str | None = None
+        # Events dropped since the last successful write, and for the life of
+        # the process. A failed write is otherwise invisible: the trail simply
+        # has less in it, and an empty-looking day is indistinguishable from a
+        # broken sink. The next record that does land attests to the gap.
+        self.lost = 0
+        self.lost_total = 0
+        # Set by the byte cap (see emit): the day file hit its ceiling and is
+        # deliberately no longer taking events.
+        self.full = False
+        # Chain state for the day the handle is open on. `_seq` numbers records
+        # within the day; `_chain` is the previous record's hash; `_carry` is
+        # the previous day's final hash, stamped on the first record of a day so
+        # the two days can still be tied together; `_chain_reset` says the
+        # resume could not link to what was already on disk.
+        self._seq = 0
+        self._chain: str | None = None
+        self._carry: str | None = None
+        self._chain_reset = False
+        self._bytes = 0
+        self.suppressed = 0
+
+    def degraded(self) -> bool:
+        """True while the trail is not keeping up: events are being dropped,
+        or the day file has hit its ceiling. A past failure that a later record
+        already attested to is not degraded -- the gap is in the file."""
+        return bool(self.lost) or self.full
 
     # -- writing ---------------------------------------------------------- #
+
+    @staticmethod
+    def _chain_hash(record: dict[str, Any]) -> str:
+        """One record's link value: a hash of it, minus its own hash.
+
+        Canonical form (sorted keys, compact separators) so a verifier can
+        rebuild the same bytes from a parsed line. `prev` is inside the hashed
+        body, which is what makes this a chain and not a pile of checksums.
+        """
+        body = {k: v for k, v in record.items() if k != "chain"}
+        return hashlib.sha256(
+            json.dumps(
+                body,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            ).encode("utf-8")
+        ).hexdigest()
 
     def _rotate(self, day: str) -> Any:
         if self._fh is not None:
@@ -971,10 +1023,139 @@ class AuditLog:
             # A no-op for ACLs on Windows; best effort elsewhere.
             with contextlib.suppress(OSError):
                 os.chmod(target, 0o700 if target.is_dir() else 0o600)
+        self._resume(day, path)
+        self.full = False
+        self.suppressed = 0
+        try:
+            self._bytes = path.stat().st_size
+        except OSError:
+            self._bytes = 0
         # Retention also runs on rotation: a process that stays up for weeks
         # would otherwise never prune again after startup.
         self.prune()
         return self._fh
+
+    def _resume(self, day: str, path: Path) -> None:
+        """Recover chain state for a day that may already hold records.
+
+        A restart mid-day must continue the day's chain, not begin a second one.
+        A genuinely new day carries the previous day's final hash forward as
+        `carry`. A file whose tail cannot be read -- a torn write, or records
+        from before the chain existed -- starts fresh and marks its first record
+        so the discontinuity is stated rather than implied.
+        """
+        tail = self._tail_chain(path)
+        self._carry = None
+        self._chain_reset = False
+        if tail is not None:
+            self._seq, self._chain = tail
+            return
+        self._seq = 0
+        self._chain = None
+        try:
+            existing = path.stat().st_size > 0
+        except OSError:
+            existing = False
+        if existing:
+            self._chain_reset = True
+        else:
+            self._carry = self._previous_chain(day)
+
+    @staticmethod
+    def _tail_chain(path: Path) -> tuple[int, str] | None:
+        """(seq, chain) of a file's last record, or None if it has none.
+
+        Reads only the tail: the file can be large, and this runs once per day
+        and once per restart. A torn final line fails to parse, which is exactly
+        the signal _resume needs to reset the chain.
+        """
+        try:
+            size = path.stat().st_size
+        except OSError:
+            return None
+        if size <= 0:
+            return None
+        window = min(size, 262144)
+        try:
+            with path.open("rb") as fh:
+                fh.seek(size - window)
+                chunk = fh.read(window)
+        except OSError:
+            return None
+        lines = chunk.decode("utf-8", errors="replace").splitlines()
+        if size > window and lines:
+            lines = lines[1:]  # the first is a partial line
+        for raw in reversed(lines):
+            raw = raw.strip()
+            if not raw:
+                continue
+            try:
+                rec = json.loads(raw)
+            except ValueError:
+                return None
+            seq, chain = rec.get("seq"), rec.get("chain")
+            if isinstance(seq, int) and isinstance(chain, str):
+                return seq, chain
+            return None
+        return None
+
+    def _previous_chain(self, day: str) -> str | None:
+        """The final hash of the nearest earlier day, if it can be read.
+
+        Only the nearest: skipping past an unreadable day would carry a link
+        that never existed. A missing or broken earlier day yields no carry,
+        which is itself visible as a gap in the sequence of days.
+        """
+        for path in sorted(
+            self.dir.glob("audit-*.jsonl"), key=lambda p: p.stem, reverse=True
+        ):
+            other = path.stem[len("audit-") :]
+            if other >= day:
+                continue
+            tail = self._tail_chain(path)
+            return tail[1] if tail is not None else None
+        return None
+
+    def _append(self, fh: Any, record: dict[str, Any]) -> None:
+        """Number, link and write one record. The caller holds `_lock`.
+
+        Nothing is committed until the write returns: a failed append must
+        leave `_seq` and `_chain` exactly where the last good record left them,
+        or the next record would carry a sequence gap its own verifier reads as
+        tampering.
+        """
+        seq = self._seq + 1
+        record["seq"] = seq
+        record["prev"] = self._chain
+        if seq == 1 and self._carry is not None:
+            record["carry"] = self._carry
+        if seq == 1 and self._chain_reset:
+            record["chain_reset"] = True
+        record["chain"] = self._chain_hash(record)
+        line = json.dumps(record, ensure_ascii=False, default=str)
+        fh.write(line + "\n")
+        fh.flush()
+        self._seq = seq
+        self._chain = record["chain"]
+        self._chain_reset = False
+        self._bytes += len(line.encode("utf-8")) + 1
+
+    def _rollback(self) -> None:
+        """Drop a torn record left by a failed write.
+
+        A half-written line would sit in the file forever and make every later
+        verification fail on a record that was never meant to be there. Cutting
+        back to the last known-good length keeps the file verifiable, and the
+        lost event is still attested by the next record's `lost` field.
+        """
+        fh = self._fh
+        if fh is None:
+            return
+        # A closed or stub handle raises ValueError/AttributeError, and a full
+        # disk raises OSError: none of them may escape a best-effort write path.
+        with contextlib.suppress(OSError, ValueError, AttributeError):
+            fh.truncate(self._bytes)
+            fh.flush()
 
     def _warn_once(self, what: str, exc: BaseException) -> None:
         """Warn once per (path, exception type), not once per process.
@@ -1000,8 +1181,12 @@ class AuditLog:
             "event": event,
         }
         record.update({k: v for k, v in fields.items() if v is not None})
+        # The gap, stamped onto the first record that actually lands after it.
+        # Riding the next real event beats a synthetic marker: it cannot loop,
+        # and it cannot itself be the thing that gets lost.
+        if self.lost:
+            record["lost"] = self.lost
         try:
-            line = json.dumps(record, ensure_ascii=False, default=str)
             with self._lock:
                 day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
                 if self._day is not None and day < self._day:
@@ -1011,9 +1196,32 @@ class AuditLog:
                     self._day = day
                 else:
                     fh = self._fh
-                fh.write(line + "\n")
-                fh.flush()
+                if self.max_bytes and self._bytes >= self.max_bytes:
+                    # The day file is full. Say so once, in the file, then stop
+                    # taking events: a bounded trail that states its own gap
+                    # beats a full disk, and the cap resets at the next day.
+                    if self.full:
+                        self.suppressed += 1
+                        return
+                    self.full = True
+                    marker: dict[str, Any] = {
+                        "ts": record["ts"],
+                        "event": "audit.full",
+                        "max_mb": self.max_mb,
+                        "bytes": self._bytes,
+                    }
+                    if self.lost:
+                        marker["lost"] = self.lost
+                    self._append(fh, marker)
+                    self.suppressed += 1
+                    self.lost = 0
+                    return
+                self._append(fh, record)
+            self.lost = 0
         except Exception as exc:  # noqa: BLE001
+            self.lost += 1
+            self.lost_total += 1
+            self._rollback()
             self._warn_once("write", exc)
 
     def write_prompt(self, job_id: str, payload: dict[str, Any]) -> None:
@@ -1021,22 +1229,65 @@ class AuditLog:
             return
         if not SAFE_JOB_ID.fullmatch(job_id):
             return
+        with self._sidecar_lock:
+            self._write_prompt_locked(job_id, payload)
+
+    def amend_prompt(
+        self,
+        job_id: str,
+        default: dict[str, Any],
+        changes: dict[str, Any],
+    ) -> None:
+        """Read-modify-write a sidecar under one lock.
+
+        A rename and a merge both touch the same file, and a plain read
+        followed by a plain write loses whichever landed first. The lock is
+        what makes the pair look atomic to the other writer.
+        """
+        if not (self.enabled and self.store_prompts):
+            return
+        if not SAFE_JOB_ID.fullmatch(job_id):
+            return
+        with self._sidecar_lock:
+            record = self._read_prompt_locked(job_id) or dict(default)
+            record.update(changes)
+            self._write_prompt_locked(job_id, record)
+
+    def _write_prompt_locked(self, job_id: str, payload: dict[str, Any]) -> None:
+        """Write the sidecar by atomic replace, never by truncate-in-place.
+
+        A reader that catches a half-written JSON file would see the prompt as
+        missing, which is the one thing a trail must not do. A crash between
+        the write and the replace leaves the previous copy intact.
+        """
+        tmp: Path | None = None
         try:
             self.prompts_dir.mkdir(parents=True, exist_ok=True)
             with contextlib.suppress(OSError):
                 os.chmod(self.prompts_dir, 0o700)
             path = self.prompts_dir / f"{job_id}.json"
-            path.write_text(
-                json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
-            )
-            with contextlib.suppress(OSError):
-                os.chmod(path, 0o600)
+            tmp = self.prompts_dir / f".{job_id}.json.tmp"
+            # The mode is set at creation, so there is no window where the text
+            # is readable by another local account.
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(json.dumps(payload, ensure_ascii=False, indent=2))
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, path)
+            tmp = None
         except Exception as exc:  # noqa: BLE001
             self._warn_once("sidecar write", exc)
+            if tmp is not None:
+                with contextlib.suppress(OSError):
+                    tmp.unlink()
 
     def read_prompt(self, job_id: str) -> dict[str, Any] | None:
         if not SAFE_JOB_ID.fullmatch(job_id):
             return None
+        return self._read_prompt_locked(job_id)
+
+    def _read_prompt_locked(self, job_id: str) -> dict[str, Any] | None:
         try:
             return json.loads(
                 (self.prompts_dir / f"{job_id}.json").read_text(encoding="utf-8")
@@ -1054,6 +1305,101 @@ class AuditLog:
             )
         except OSError:
             return []
+
+    def head(self, day: str) -> dict[str, Any]:
+        """The last link of a day, for keeping an anchor off this machine."""
+        tail = self._tail_chain(self.dir / f"audit-{day}.jsonl")
+        if tail is None:
+            return {"seq": None, "chain": None}
+        return {"seq": tail[0], "chain": tail[1]}
+
+    def verify(self, day: str) -> dict[str, Any]:
+        """Recompute a day's chain and report the first place it breaks.
+
+        Detects an edited record, a deleted or reordered line, and truncation.
+        It cannot stop someone with write access from rewriting the tail and
+        recomputing every hash after it; an anchor kept off this machine is what
+        closes that, which is why the response carries the head value.
+        """
+        out: dict[str, Any] = {
+            "date": day,
+            "ok": False,
+            "checked": 0,
+            "legacy": 0,
+            "first_bad_line": None,
+            "first_bad_seq": None,
+            "reason": None,
+            "head": None,
+            "carry": None,
+            "carry_ok": None,
+        }
+        try:
+            fh = (self.dir / f"audit-{day}.jsonl").open(
+                "r", encoding="utf-8", errors="replace"
+            )
+        except OSError:
+            out["reason"] = "No such day"
+            return out
+        expected_seq = 1
+        expected_prev: str | None = None
+        first_reset = False
+        line_no = 0
+        with fh:
+            for raw in fh:
+                line_no += 1
+                raw = raw.strip()
+                if not raw:
+                    continue
+                try:
+                    rec = json.loads(raw)
+                except ValueError:
+                    out["first_bad_line"] = line_no
+                    out["reason"] = "Unparsable record (torn write or edited line)"
+                    return out
+                if "chain" not in rec:
+                    # Predates the chain. It cannot be checked, and it must not
+                    # make the whole day look broken.
+                    out["legacy"] += 1
+                    continue
+                seq, prev, chain = rec.get("seq"), rec.get("prev"), rec.get("chain")
+                if rec.get("chain_reset"):
+                    # A declared discontinuity: the writer could not link to what
+                    # was on disk. Accept it, because it says so here.
+                    if isinstance(seq, int):
+                        expected_seq = seq
+                    expected_prev = prev
+                    if out["checked"] == 0:
+                        first_reset = True
+                if seq != expected_seq:
+                    out["first_bad_line"] = line_no
+                    out["first_bad_seq"] = expected_seq
+                    out["reason"] = "Sequence gap"
+                    return out
+                if prev != expected_prev:
+                    out["first_bad_line"] = line_no
+                    out["first_bad_seq"] = expected_seq
+                    out["reason"] = "Broken link to the previous record"
+                    return out
+                if self._chain_hash(rec) != chain:
+                    out["first_bad_line"] = line_no
+                    out["first_bad_seq"] = expected_seq
+                    out["reason"] = "Record contents do not match their hash"
+                    return out
+                out["checked"] += 1
+                out["head"] = chain
+                if out["checked"] == 1:
+                    out["carry"] = rec.get("carry")
+                expected_seq += 1
+                expected_prev = chain
+        out["ok"] = out["first_bad_line"] is None
+        # Tie the day to the one before it, when both can still be read.
+        if out["carry"] is not None:
+            previous = self._previous_chain(day)
+            out["carry_ok"] = previous is not None and previous == out["carry"]
+        elif out["checked"] and not first_reset:
+            if self._previous_chain(day) is not None:
+                out["carry_ok"] = False  # a previous day exists but was not carried
+        return out
 
     def read(
         self,
@@ -1126,6 +1472,17 @@ class AuditLog:
                 name = self._unlink(path)
                 if name:
                     removed.append(name)
+        # A temp file left by a crash mid-write. Age-gated so an in-flight
+        # write can never have its scratch file swept out from under it.
+        for path in self.prompts_dir.glob(".*.json.tmp"):
+            try:
+                age = datetime.now(timezone.utc) - datetime.fromtimestamp(
+                    path.stat().st_mtime, timezone.utc
+                )
+            except OSError:
+                continue
+            if age > timedelta(days=1):
+                self._unlink(path)
         return removed
 
     @staticmethod
@@ -1167,38 +1524,71 @@ def request_fields(request: Request) -> dict[str, Any]:
 # Refusals are written before any credential is checked, so an unauthenticated
 # client could otherwise fill the disk by looping on a bad token. The first few
 # per source per window are logged individually; the rest are summarised once.
+# Actions an *authenticated* client can repeat -- an export in a loop -- share
+# the window with a higher budget: the byte cap is the hard guarantee, this just
+# keeps a loop from reaching it.
 REJECT_LOG_LIMIT = 5
+REPEAT_LOG_LIMIT = 20
 REJECT_WINDOW = 60.0
 REJECT_MAX_SOURCES = 1000
 _REJECT_STATE: dict[tuple[str, str], tuple[float, int, int]] = {}
 _REJECT_LOCK = threading.Lock()
 
 
-def audit_rejection(event: str, request: Request, **fields: Any) -> None:
-    """Record a refused request, collapsing a burst from one source."""
-    client = (request.client.host if request.client else "-")[:64]
-    key = (event, client)
+def _collapse_logged(key: tuple[str, str], limit: int) -> tuple[bool, int]:
+    """Windowed per-source counter: (log this one, suppressed since last window).
+
+    Bounded in memory by clearing under a flood of distinct sources. The point
+    is to keep a loop from becoming unbounded lines on disk, not to be an exact
+    rate limiter; the summary is reported at the start of the next window.
+    """
     now = time.monotonic()
-    log_now = False
-    suppressed = 0
     with _REJECT_LOCK:
         if len(_REJECT_STATE) > REJECT_MAX_SOURCES:
             _REJECT_STATE.clear()  # bounded memory under a spoofed-source flood
         window_start, count, logged = _REJECT_STATE.get(key, (now, 0, 0))
+        suppressed = 0
         if now - window_start > REJECT_WINDOW:
             suppressed = count - logged
             window_start, count, logged = now, 0, 0
         count += 1
-        if logged < REJECT_LOG_LIMIT:
+        log_now = logged < limit
+        if log_now:
             logged += 1
-            log_now = True
         _REJECT_STATE[key] = (window_start, count, logged)
+    return log_now, suppressed
 
+
+def audit_rejection(event: str, request: Request, **fields: Any) -> None:
+    """Record a refused request, collapsing a burst from one source."""
+    client = (request.client.host if request.client else "-")[:64]
+    log_now, suppressed = _collapse_logged((event, client), REJECT_LOG_LIMIT)
     if log_now:
         audit(event, request, **fields)
     if suppressed:
         audit(
             "security.rejected_summary",
+            request,
+            scope=event,
+            suppressed=suppressed,
+        )
+
+
+def audit_repeated(event: str, request: Request, **fields: Any) -> None:
+    """Record an action a client can repeat, collapsing a burst from one source.
+
+    Unlike a refusal this loses a real action when it collapses, so the count is
+    preserved in a summary record rather than dropped silently.
+    """
+    client = (request.client.host if request.client else "-")[:64]
+    log_now, suppressed = _collapse_logged(
+        (f"repeat:{event}", client), REPEAT_LOG_LIMIT
+    )
+    if log_now:
+        audit(event, request, **fields)
+    if suppressed:
+        audit(
+            "audit.repeated_summary",
             request,
             scope=event,
             suppressed=suppressed,
@@ -1850,8 +2240,9 @@ def ensure_diarize_models(embedding: str | None = None) -> dict[str, Path]:
             with contextlib.suppress(OSError):
                 stage.unlink()
             with contextlib.suppress(OSError):
-                if dest.is_file() and _sha256_file(dest) != spec["sha256"]:
-                    dest.unlink()
+                if dest.is_file():
+                    if _sha256_file(dest) != spec["sha256"]:
+                        dest.unlink()
             raise
         resolved[key] = dest
     return resolved
@@ -3063,6 +3454,10 @@ def status() -> dict[str, Any]:
         "allow_speaker_model_choice": ARGS.diarization_embedding_choice,
         "prompt_limit": PROMPT_LIMIT,
         "hotwords_limit": HOTWORDS_LIMIT,
+        # Only a boolean here: the audit dir and the failure text stay behind the
+        # audit token. An operator watching transcription still needs to know
+        # the trail is dropping events.
+        "audit_degraded": AUDIT is not None and AUDIT.degraded(),
     }
 
 
@@ -3529,8 +3924,10 @@ def job_text(
 ) -> Response:
     job = get_job(job_id)
     body, mime = render(job, format)
-    # The moment a transcript leaves the machine is the interesting one.
-    audit(
+    # The moment a transcript leaves the machine is the interesting one. It is
+    # also the event an app-token holder can repeat in a loop, so a burst from
+    # one source is collapsed rather than written out in full.
+    audit_repeated(
         "transcript.exported",
         request,
         job=job_id,
@@ -3569,6 +3966,7 @@ def audit_query(
 
     limit = clamp(as_int(limit, 200), 1, 1000)
     offset = max(0, as_int(offset, 0))
+    prompt_jobs: list[str] = []
     days = AUDIT.dates()
     day = (date or "").strip() or (
         days[0] if days else datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -3593,11 +3991,20 @@ def audit_query(
             events.append({"event": "unparsable", "raw": line[:500]})
 
     if include_prompts:
+        # Which jobs' text this read actually disclosed. The aggregate flag is
+        # not enough: prompt text is the one thing the audit token gates, so a
+        # bulk read has to name what it handed over, exactly as the single-job
+        # route does. Never the text itself.
+        seen_jobs: set[str] = set()
         for rec in events:
-            side = AUDIT.read_prompt(str(rec.get("job") or ""))
+            jid = str(rec.get("job") or "")
+            side = AUDIT.read_prompt(jid)
             if side:
                 rec["prompt_text"] = side.get("prompt") or ""
                 rec["hotwords_text"] = side.get("hotwords") or ""
+                if jid and jid not in seen_jobs:
+                    seen_jobs.add(jid)
+                    prompt_jobs.append(jid)
 
     audit(
         "audit.accessed",
@@ -3611,6 +4018,8 @@ def audit_query(
         search_sha256=digest(needle or ""),
         job=job or None,
         include_prompts=bool(include_prompts),
+        prompts_returned=len(prompt_jobs) or None,
+        prompt_jobs=prompt_jobs[:50] or None,
     )
     return {
         "date": day,
@@ -3621,7 +4030,74 @@ def audit_query(
         "limit": limit,
         "retain_days": AUDIT.retain_days,
         "prompts_available": AUDIT.store_prompts,
+        "last_error": AUDIT.last_error,
+        "lost_total": AUDIT.lost_total,
+        "degraded": AUDIT.degraded(),
+        "full": AUDIT.full,
+        "suppressed": AUDIT.suppressed,
+        "max_mb": AUDIT.max_mb,
     }
+
+
+def audit_day_or_400(date: str) -> str:
+    """The day to act on: the requested one, else the newest that exists."""
+    days = AUDIT.dates() if AUDIT is not None else []
+    day = (date or "").strip() or (
+        days[0] if days else datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    )
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", day):
+        raise HTTPException(status_code=400, detail="date must be YYYY-MM-DD")
+    return day
+
+
+@app.get("/api/audit/verify")
+def audit_verify(request: Request, date: str = "") -> dict[str, Any]:
+    """Recompute one day's hash chain and report the first break.
+
+    Read-only over the day file; the audit credential gates it like the rest of
+    /api/audit, because naming what was edited is itself trail material.
+    """
+    if AUDIT is None:
+        raise HTTPException(status_code=503, detail="Audit trail unavailable")
+    day = audit_day_or_400(date)
+    if day not in AUDIT.dates():
+        raise HTTPException(status_code=404, detail="No audit file for that date")
+    result = AUDIT.verify(day)
+    # The verdict describes the content that was verified, so it is recorded
+    # after the walk. Its `head` is therefore the verified head, not the head
+    # including this record; /api/audit/head is the endpoint for anchoring.
+    audit(
+        "audit.verified",
+        request,
+        date=day,
+        ok=result["ok"],
+        checked=result["checked"],
+        legacy=result["legacy"],
+        reason=result["reason"],
+    )
+    return result
+
+
+@app.get("/api/audit/head")
+def audit_head(request: Request, date: str = "") -> dict[str, Any]:
+    """One day's final link, for keeping an anchor off this machine.
+
+    The chain alone cannot stop someone with write access from recomputing it;
+    a head value copied somewhere else is what turns an edit into a detectable
+    one.
+    """
+    if AUDIT is None:
+        raise HTTPException(status_code=503, detail="Audit trail unavailable")
+    day = audit_day_or_400(date)
+    if day not in AUDIT.dates():
+        raise HTTPException(status_code=404, detail="No audit file for that date")
+    # Log the read before answering. The access record lands in today's file, so
+    # reading today's head would otherwise return a value the very next write
+    # invalidates -- and the head is meant to be copied somewhere else as an
+    # anchor, so it has to be the state a caller would see on disk.
+    audit("audit.head_read", request, date=day)
+    head = AUDIT.head(day)
+    return {"date": day, **head}
 
 
 @app.get("/api/audit/prompts/{job_id}")
@@ -3717,6 +4193,9 @@ DEFAULTS: dict[str, Any] = {
     "audit_reads": False,
     "audit_prompts": True,
     "audit_retain_days": 30,
+    # Per-day ceiling on a day file, in MB; 0 keeps everything. A bounded trail
+    # that says where it stopped beats a full disk.
+    "audit_max_mb": 1024,
     "audit_open": False,
     "audit_token": "",
 }
@@ -3761,6 +4240,7 @@ ENV_OPTIONS: dict[str, tuple[str, str]] = {
     "TRANSCRIBE_AUDIT_READS": ("audit_reads", "bool"),
     "TRANSCRIBE_AUDIT_PROMPTS": ("audit_prompts", "bool"),
     "TRANSCRIBE_AUDIT_RETAIN_DAYS": ("audit_retain_days", "int"),
+    "TRANSCRIBE_AUDIT_MAX_MB": ("audit_max_mb", "int"),
     "TRANSCRIBE_AUDIT_OPEN": ("audit_open", "bool"),
     "TRANSCRIBE_AUDIT_TOKEN": ("audit_token", "str"),
 }
@@ -3806,6 +4286,7 @@ CONFIG_ALIASES: dict[str, str] = {
     "audit.dir": "audit_dir",
     "audit.prompts": "audit_prompts",
     "audit.retain_days": "audit_retain_days",
+    "audit.max_mb": "audit_max_mb",
     "audit.open": "audit_open",
     "audit.token": "audit_token",
 }
@@ -3953,6 +4434,9 @@ CONFIG_TEMPLATE = """\
 # prompts = true
 # Delete audit files older than this many days at startup; 0 keeps everything.
 # retain_days = 30
+# Stop recording once a day file reaches this many MB, after writing one
+# audit.full marker; the cap resets at the next day. 0 keeps everything.
+# max_mb = 1024
 # Serve the trail with no credential at all, prompt and hotword text included.
 # Only on a network you control. Refused together with the token below.
 # open = false
@@ -4246,6 +4730,14 @@ def build_parser() -> argparse.ArgumentParser:
         "0 keeps everything)",
     )
     aud.add_argument(
+        "--audit-max-mb",
+        type=int,
+        default=argparse.SUPPRESS,
+        metavar="N",
+        help="stop recording once a day file reaches N MB, after one "
+        "audit.full marker (default 1024; 0 keeps everything)",
+    )
+    aud.add_argument(
         "--audit-open",
         action="store_true",
         default=argparse.SUPPRESS,
@@ -4327,7 +4819,7 @@ def resolve_args(
     for name in ("max_upload_mb", "max_queue"):
         if merged[name] < 1:
             raise SystemExit(f"!  {name} must be at least 1, got {merged[name]}")
-    for name in ("model_cache", "max_jobs", "audit_retain_days"):
+    for name in ("model_cache", "max_jobs", "audit_retain_days", "audit_max_mb"):
         if merged[name] < 0:
             raise SystemExit(f"!  {name} cannot be negative, got {merged[name]}")
     # Unset follows the model: each embedding has its own distance scale.
@@ -4377,7 +4869,9 @@ def resolve_args(
     return argparse.Namespace(**merged), path, required
 
 
-def startup_snapshot(args: argparse.Namespace, cfg: Path | None) -> dict[str, Any]:
+def startup_snapshot(
+    args: argparse.Namespace, cfg: Path | None, audit_generated: bool = False
+) -> dict[str, Any]:
     """How the server was running, for later forensics. Tokens never appear."""
     return {
         "config": redact(str(cfg), 500) if cfg else None,
@@ -4400,9 +4894,15 @@ def startup_snapshot(args: argparse.Namespace, cfg: Path | None) -> dict[str, An
         "diarization_fold_share": args.diarization_fold_share,
         "auth": bool(args.token),
         "audit": args.audit,
+        # Where the trail actually wrote itself, and whether the credential was
+        # ephemeral. Without these, a run with a custom --audit-dir or a
+        # generated audit token cannot be told apart after the fact.
+        "audit_dir": redact(str(AUDIT.dir), 500) if AUDIT is not None else None,
+        "audit_generated": audit_generated,
         "audit_reads": args.audit_reads,
         "audit_prompts": args.audit_prompts,
         "audit_retain_days": args.audit_retain_days,
+        "audit_max_mb": args.audit_max_mb,
         "audit_api": audit_api_mode(args),
         "max_upload_mb": args.max_upload_mb,
         "max_queue": args.max_queue,
@@ -4535,6 +5035,7 @@ def main() -> None:
         enabled=args.audit,
         retain_days=args.audit_retain_days,
         prompts=args.audit_prompts,
+        max_mb=args.audit_max_mb,
     )
 
     args.model_cache = max(1, args.model_cache)
@@ -4661,6 +5162,7 @@ def main() -> None:
             f"           reads={'logged' if args.audit_reads else 'skipped'}"
             f"  prompts={'stored' if args.audit_prompts else 'omitted'}"
             f"  retention={args.audit_retain_days}d"
+            f"  cap={str(args.audit_max_mb) + 'MB/day' if args.audit_max_mb else 'none'}"
         )
         if pruned:
             print(f"           pruned {len(pruned)} expired file(s)")
@@ -4695,7 +5197,9 @@ def main() -> None:
     print(f"\nAccepting Host: {', '.join(sorted(ALLOWED_HOSTS | ALLOWED_SUFFIXES))}")
     print("(add more with --allow-host)\n")
 
-    snapshot = startup_snapshot(args, cfg_path if cfg_path.exists() else None)
+    snapshot = startup_snapshot(
+        args, cfg_path if cfg_path.exists() else None, audit_generated
+    )
     if args.audit:
         audit("server.started", **snapshot)
     else:

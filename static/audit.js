@@ -37,7 +37,7 @@ function level(event){
 }
 
 const SKIP = new Set(["ts","event","client","client_claimed","host","method","path",
-                      "prompt_text","hotwords_text"]);
+                      "prompt_text","hotwords_text","seq","prev","chain","carry"]);
 
 function fmtVal(v){
   if(v === null || v === undefined) return "";
@@ -46,7 +46,11 @@ function fmtVal(v){
 }
 
 function row(rec){
-  const time = String(rec.ts || "").slice(11, 19);
+  // Times are UTC, like the day files. Say so: an operator reads an unlabelled
+  // clock as local time and mis-orders a day.
+  const stamp = String(rec.ts || "");
+  const time = (stamp ? stamp.slice(11, 19) + " UTC" : "")
+    + (rec.seq ? " \u00b7 #" + rec.seq : "");
   const where = [];
   if(rec.method) where.push(rec.method + " " + (rec.path || ""));
   // client_claimed is whatever the proxy said; the TCP peer is the fact.
@@ -112,7 +116,7 @@ async function load(more){
     const r = await api("/api/audit?" + params.toString());
     if(!r.ok){
       let detail = r.statusText;
-      try{ detail = (await r.json()).detail || detail; }catch(_){}
+      try{ detail = (await r.json()).detail || detail; }catch{}
       throw new Error(detail);
     }
     const data = await r.json();
@@ -122,15 +126,30 @@ async function load(more){
     fillDates(data.dates, data.date);
 
     if(!more) el("events").textContent = "";
+    // The page's one deliberate HTML sink. Every field row() interpolates --
+    // event name, source, chips, prompt text -- goes through esc(), which is
+    // the boundary the CSP and the whole static/ split exist to keep honest.
+    // pi-lens-ignore: no-inner-html
     el("events").insertAdjacentHTML("beforeend", data.events.map(row).join(""));
     offset += data.events.length;
 
     el("empty").classList.toggle("locked", data.total > 0);
     el("more").disabled = offset >= data.total;
     el("meta").textContent = data.total + " event(s) on " + data.date
-      + " \u00b7 showing " + Math.min(offset, data.total)
+      + " UTC \u00b7 showing " + Math.min(offset, data.total)
       + " \u00b7 retention " + (data.retain_days ? data.retain_days + " days" : "unlimited")
       + (data.prompts_available ? "" : " \u00b7 prompts not stored");
+    // A sink that is failing still serves reads, so the page can -- and must --
+    // say the trail it is showing has holes in it.
+    const warn = el("degraded");
+    warn.classList.toggle("locked", !data.degraded);
+    if(data.degraded){
+      const bits = [];
+      if(data.lost_total) bits.push(data.lost_total + " event(s) dropped");
+      if(data.last_error) bits.push(data.last_error);
+      warn.textContent = "The audit trail is not keeping up: " + (bits.join(" \u00b7 ") || "unknown")
+        + ". Events are being lost until the sink is fixed.";
+    }
   }catch(err){
     if(err.message === "unauthorised") return;
     el("meta").textContent = "Could not load the audit trail: " + err.message;
@@ -142,6 +161,41 @@ function schedule(){
   if(el("auto").checked) timer = setInterval(() => {
     if(offset <= Number(el("limit").value)) load(false);
   }, 5000);
+}
+
+async function verify(){
+  const out = el("verify-out");
+  out.textContent = "Verifying\u2026";
+  try{
+    const day = el("date").value;
+    const r = await api("/api/audit/verify?date=" + encodeURIComponent(day));
+    if(!r.ok){
+      let detail = r.statusText;
+      try{ detail = (await r.json()).detail || detail; }catch{}
+      throw new Error(detail);
+    }
+    const v = await r.json();
+    const head = v.head ? v.head.slice(0, 12) + "\u2026" : "none";
+    if(!v.ok){
+      out.textContent = "Chain broken on " + v.date + " at line " + v.first_bad_line
+        + " (expected #" + v.first_bad_seq + "): " + v.reason;
+      return;
+    }
+    if(!v.checked){
+      out.textContent = "Nothing to verify on " + v.date + ": "
+        + v.legacy + " record(s) predate the chain.";
+      return;
+    }
+    let text = "Verified " + v.checked + " record(s) on " + v.date
+      + (v.legacy ? " (" + v.legacy + " legacy skipped)" : "")
+      + " \u00b7 head " + head;
+    if(v.carry_ok === true) text += " \u00b7 linked to the previous day";
+    else if(v.carry_ok === false) text += " \u00b7 carry does NOT match the previous day";
+    out.textContent = text;
+  }catch(err){
+    if(err.message === "unauthorised") return;
+    out.textContent = "Could not verify: " + err.message;
+  }
 }
 
 el("gate-go").addEventListener("click", submitToken);
@@ -159,12 +213,13 @@ async function submitToken(){
     unlocked = true;
     await load(false);
     schedule();
-  }catch(e){
+  }catch{
     el("gate-err").classList.remove("locked");
   }
 }
 
 el("reload").addEventListener("click", () => load(false));
+el("verify").addEventListener("click", verify);
 // Changing the day starts a fresh page; "Load more" only ever appends.
 el("more").addEventListener("click", () => load(true));
 el("date").addEventListener("change", () => load(false));
@@ -183,7 +238,7 @@ el("auto").addEventListener("change", schedule);
     unlocked = true;
     await load(false);
     schedule();
-  }catch(e){
+  }catch{
     relock();
   }
 })();

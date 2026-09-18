@@ -37,6 +37,7 @@
   </div>
 
   <div id="main" class="locked">
+    <p class="degraded locked" id="degraded"></p>
     <div class="controls">
       <label class="field">Day <select id="date"></select></label>
       <label class="field">Rows
@@ -53,8 +54,10 @@
       <label class="field"><input type="checkbox" id="auto" checked> Auto</label>
       <button id="reload">Reload</button>
       <button class="ghost" id="more">Load more</button>
+      <button class="ghost" id="verify">Verify chain</button>
     </div>
     <p class="meta" id="meta">&nbsp;</p>
+    <p class="meta" id="verify-out">&nbsp;</p>
     <div id="events"></div>
     <p class="empty locked" id="empty">No events for this day.</p>
   </div>

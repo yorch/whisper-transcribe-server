@@ -68,7 +68,13 @@ model or touching a GPU.
 
 Note: pi-lens's own pyright runner does not use the project venv, so it reports
 `fastapi`/`uvicorn`/`pystray`/`PIL` as unresolved imports. `uv run pyright` is
-the authoritative check.
+the authoritative check. `.pi-lens.json` disables one rule,
+`unchecked-throwing-call-python`, whose ast-grep pattern fires on every bare
+`int()`/`float()` in the file — 26 pre-existing hits and no true positives,
+because this codebase handles those at the worker boundary. Its scope is a
+non-`include`d directory and its `scripts/` findings are for the same reason
+ignorable: `transcribe_server.py`, `tests` and `launcher` are what pyright
+checks.
 
 ## Packaging
 
@@ -171,6 +177,22 @@ launcher/transcribe_tray.py --self-test --with-server   # also probes a real ser
   transition and returns `False`; callers must respect the return value.
 - **The audit trail records hashes, not content.** Never write prompt text,
   transcript text, tokens, or a caller-supplied search string into the main log.
+- **The audit chain commits only after the write returns.** `_append` sets
+  `_seq`/`_chain` *after* `fh.write`, and `emit` truncates back to the last
+  known-good length on failure. Moving that commit earlier would make a dropped
+  event look like a sequence gap, and `verify` would report a lost write as
+  tampering — the exact false positive the `lost: N` field exists to avoid.
+  `tests/test_audit_chain.py::test_a_failed_write_is_attested_and_does_not_gap_the_chain`
+  pins it.
+- **Never return an audit token, and never let the app token reach the trail's
+  detail.** `audit_degraded` on `/api/status` is a boolean on purpose: the
+  `last_error` text and the audit dir stay behind the audit credential.
+- **Reading the head is itself an audit event**, so `/api/audit/head` writes the
+  read *before* computing the head; otherwise the value it returns is already
+  one write stale and cannot serve as an anchor.
+- **`audit_max_mb` is a storage bound, not a rate limit.** Hitting it writes one
+  `audit.full` marker and then stops recording for that day, which is only
+  acceptable because `degraded`/`full` surface it. Do not make the stop silent.
 - **Refusals are logged before authentication**, so anything logged on that path
   goes through `audit_rejection` (burst-collapsed), never `audit` directly.
 - `--preload` must *prove* the device can encode, not merely load a model. A

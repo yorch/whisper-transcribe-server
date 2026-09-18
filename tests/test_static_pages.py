@@ -207,6 +207,7 @@ AUDIT_SELECTORS_BEFORE = {
     ".chip b",
     ".chips",
     ".controls",
+    ".degraded",
     ".empty",
     ".ev",
     ".ev-event",

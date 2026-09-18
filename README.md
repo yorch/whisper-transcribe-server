@@ -152,6 +152,7 @@ Useful flags:
 | `--no-audit`                  | stop recording the audit trail (existing files stay readable)                                                               |
 | `--no-audit-prompts`          | never write prompt/hotword text to the sidecar files                                                                        |
 | `--audit-retain-days 30`      | delete audit files older than N days at startup (`0` keeps everything)                                                      |
+| `--audit-max-mb 1024`         | stop a day file at N MB, after one `audit.full` marker (`0` keeps everything)                                               |
 
 `--help` groups these under network/access, model/hardware, limits/storage and
 audit trail.
@@ -226,6 +227,7 @@ enabled = true
 reads = false
 prompts = true
 retain_days = 30
+max_mb = 1024
 open = false    # true serves the trail with no credential at all
 ```
 
@@ -256,7 +258,8 @@ appear, and transcript text never appears.
  "host":"127.0.0.1","method":"POST","path":"/api/jobs","job":"24abc1713890",
  "file":"standup.m4a","bytes":4194304,
  "opts":{"model":"base","quality":"fast","prompt_len":53,
-         "prompt_sha256":"c89cb56d74…","hotwords_len":21,"hotwords_sha256":"8319d23d9f…"}}
+         "prompt_sha256":"c89cb56d74…","hotwords_len":21,"hotwords_sha256":"8319d23d9f…"},
+ "seq":1,"prev":null,"chain":"9f2c7b1e…"}
 ```
 
 Prompts and hotwords routinely contain real names, so the main log carries only
@@ -298,9 +301,10 @@ across restarts. `--audit-open` is the only way to serve the trail with no
 credential at all.
 
 Files older than `audit_retain_days` (30 by default) are deleted at startup
-**and** on each daily rollover, sidecars included; `0` keeps everything. With
-`--no-audit` nothing is pruned at all, so turning auditing off can never delete
-a trail it is not managing.
+**and** on each daily rollover, sidecars included; `0` keeps everything. A day
+file also stops at `audit_max_mb` (1 GB by default) rather than filling the
+disk — see **Integrity** below. With `--no-audit` nothing is pruned at all, so
+turning auditing off can never delete a trail it is not managing.
 
 Two details worth knowing:
 
@@ -318,6 +322,48 @@ from one source is collapsed: the first five per source per minute are recorded
 individually and the rest are summarised in one `security.rejected_summary`
 record. Without that, an unauthenticated client could fill the disk by looping
 on a bad token.
+
+### Integrity and limits
+
+Every record carries a `seq` (its number within the day file) and a `prev` (the
+previous record's `chain`), and `chain` is a SHA-256 over the record with its own
+hash removed. The first record of a day also carries `carry`, the previous day's
+final hash, so consecutive days are tied together. Verification recomputes every
+hash, checks the links and the numbering, and reports the first line that does
+not match:
+
+```http
+GET /api/audit/verify?date=2026-09-18   # {ok, checked, legacy, first_bad_line, reason, head}
+GET /api/audit/head?date=2026-09-18     # {date, seq, chain} -- the anchor
+```
+
+The **Verify chain** button on `/audit` runs the same check for the selected day.
+Records written before the chain existed are counted as `legacy` and skipped,
+never reported as a break, so a day from before the feature does not read as
+tampered.
+
+This makes the trail **tamper-evident, not tamper-proof**. It detects an edited
+record, a deleted or reordered line, and a truncated file. It cannot stop someone
+with write access from rewriting the tail and recomputing every hash after it —
+an unkeyed chain holds no secret that would make that impossible. What closes
+that hole is the anchor: copy the `chain` from `/api/audit/head` somewhere off
+this machine, and an altered record no longer matches the value you kept. The
+trail answers "what did the web app do, and has the file changed since", not
+"prove it to a third party".
+
+A write that fails is counted rather than lost quietly: the next record that
+lands carries `lost: N`, and `/api/audit` reports `last_error`, `lost_total` and
+`degraded`. `/api/status` carries `audit_degraded` as a plain boolean, so the
+app side can warn without the app token seeing the audit path or the failure
+text.
+
+`audit_max_mb` bounds a single day file. When it is reached, one `audit.full`
+record is written and the day then takes no further events; the cap resets at the
+next day, and `0` removes it. Actions an app token can repeat — an export in a
+loop — are collapsed the same way refusals are, with the count preserved in
+`audit.repeated_summary`. One thing the cap deliberately does **not** bound:
+`prompts/` sidecars, which outlive their jobs by design and are removed only by
+retention. If prompt text must never accumulate, use `--no-audit-prompts`.
 
 ### Origin attribution behind a tunnel
 
@@ -661,10 +707,11 @@ What it still doesn't do, by design:
 - **No rate limiting** beyond the queue cap.
 - Untrusted media still goes into native decoders (libav), which is real attack
   surface. Keep ffmpeg current.
-- **The audit trail is not tamper-proof.** It is an append-only file on the same
-  machine, written by the same process it describes. Anyone with filesystem
-  access can edit or delete it. It answers "what did the web app do", not "prove
-  it to a third party".
+- **The audit trail is tamper-evident, not tamper-proof.** It is an append-only
+  file on the same machine, written by the same process it describes. It detects
+  an edited record, a deleted line and a truncated file, and a copy of the chain
+  head kept off-box makes a full rewrite detectable too. It still answers "what
+  did the web app do", not "prove it to a third party".
 
 ## Notes and limits
 

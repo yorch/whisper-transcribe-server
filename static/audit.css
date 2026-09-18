@@ -79,3 +79,10 @@
     text-transform:uppercase;color:var(--muted);margin-right:8px}
 
   .empty{margin-top:22px;color:var(--muted);font-size:14px}
+
+  /* A trail that is dropping events must not look like a quiet day. */
+  .degraded{
+    margin:0 0 14px;padding:10px 14px;border-radius:3px;
+    border:1px solid #d8b48a;border-left:3px solid var(--red);
+    background:#fdf6ee;color:var(--ink);font-size:13.5px;overflow-wrap:anywhere;
+  }
