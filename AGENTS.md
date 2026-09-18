@@ -140,6 +140,12 @@ launcher/transcribe_tray.py --self-test --with-server   # also probes a real ser
   under a single hold of `JOBS_LOCK` (no `get_job`/`patch_job` inside), and
   bumps `labels_rev` -- the page's poll signature includes it, because a merge
   changes nothing else a poll can see.
+- **Speaker names never reach the main audit log.** A name is visible to the
+  app (it renders the transcript), but `job.speaker_named` records only
+  `name_len` and `name_sha256`; the text lives in the job's sidecar via
+  `store_speaker_names`, which reads and amends the record so a stored prompt
+  survives, and which `--no-audit-prompts` silences like prompts.
+  `tests/test_speaker_names.py` scans the whole trail for the name.
 - **Alignment splits on speaker change, so `word_timestamps` is not optional.**
   Asking for diarization forces it on. Without word timings a whole segment can
   only go to its dominant speaker, which is the version of the feature that is

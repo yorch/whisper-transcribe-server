@@ -564,6 +564,12 @@ function createCard(job){
   return view;
 }
 
+/* The operator's name for a speaker, else "Speaker N" -- the server's rule, so
+   the card and the exports never disagree. */
+function speakerName(names, speaker){
+  return (names && names[String(speaker)]) || "Speaker " + speaker;
+}
+
 /* Append only what is new. The server grows job["segments"] and never rewrites
    one, so counting is enough. textContent rather than innerHTML: transcript
    text needs no escaping and cannot become markup. */
@@ -603,7 +609,7 @@ function appendSegments(view, segments, live, total, labeled){
     const sp = document.createElement("span");
     sp.className = "sp";
     if(seg.speaker != null){
-      sp.textContent = "Speaker " + seg.speaker;
+      sp.textContent = speakerName(view.names, seg.speaker);
       // Three colours, cycled: enough to tell voices apart at a glance while
       // staying readable, and no legend to maintain.
       sp.classList.add("s" + ((seg.speaker - 1) % 3));
@@ -641,7 +647,8 @@ function speakerChips(node, jobId, people){
   }
 }
 
-/* The editor for one speaker: merge into another. Only one is open per card. */
+/* The editor for one speaker: name them, or merge them into another. Only one
+   is open per card. */
 function openSpeakerEdit(view, jobId, speaker){
   const open = view.people.querySelector(".speaker-edit");
   if(open) open.remove();
@@ -651,6 +658,23 @@ function openSpeakerEdit(view, jobId, speaker){
   box.dataset.speaker = String(speaker);
   const others = view.peopleList.filter(p => p.speaker !== speaker);
   const me = view.peopleList.find(p => p.speaker === speaker);
+  const naming = document.createElement("label");
+  naming.className = "field";
+  naming.append("Name");
+  const input = document.createElement("input");
+  input.type = "text";
+  input.className = "speaker-name";
+  input.maxLength = 60;
+  input.placeholder = "Speaker " + speaker;
+  input.value = (view.names && view.names[String(speaker)]) || "";
+  input.setAttribute("aria-label", "Name for speaker " + speaker);
+  naming.append(input);
+  const save = document.createElement("button");
+  save.type = "button";
+  save.textContent = "Save name";
+  save.dataset.name = jobId;
+  save.dataset.speaker = String(speaker);
+  box.append(naming, save);
   if(others.length){
     const label = document.createElement("label");
     label.className = "field";
@@ -771,6 +795,8 @@ function render(job){
     speakerChips(view.people, job.id, people);
   }
   view.labelsRev = job.labels_rev || 0;
+  // Before the rows are drawn: a rename arrives as a refetch from zero.
+  view.names = job.speaker_names || {};
   /* Rebuilt only when the set of buttons changes. A running job renders every
      poll, and a fresh Cancel under the pointer each time ate any click whose
      press and release straddled a poll, and threw keyboard focus off it. */
@@ -855,6 +881,21 @@ el("jobs").addEventListener("click", async (e) => {
     if(b.dataset.closeEdit){
       const box = b.closest(".speaker-edit");
       if(box) box.remove();
+    }
+    if(b.dataset.name){
+      const fd = new FormData();
+      fd.append("speaker", b.dataset.speaker);
+      fd.append("name", b.closest(".speaker-edit").querySelector(".speaker-name").value);
+      b.disabled = true;
+      const r = await api("/api/jobs/" + encodeURIComponent(b.dataset.name)
+                          + "/speakers/name", {method:"POST", body:fd});
+      if(!r.ok){
+        let detail = r.statusText;
+        try{ detail = (await r.json()).detail || detail; }catch{}
+        alert("Could not save the name: " + detail);
+        b.disabled = false;
+      }
+      await tick();
     }
     if(b.dataset.merge){
       const into = b.closest(".speaker-edit").querySelector(".merge-into").value;

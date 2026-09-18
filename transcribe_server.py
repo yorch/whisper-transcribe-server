@@ -1251,6 +1251,31 @@ def store_prompt_sidecar(
     )
 
 
+def store_speaker_names(job_id: str, filename: str, names: dict[str, str]) -> None:
+    """Keep a job's speaker names in its audit sidecar, beside any prompt.
+
+    The sidecar is the one place the audit trail holds sensitive text in clear,
+    readable only with the audit token; the main log has a hash. Read, amend
+    and rewrite, so a prompt already stored for the job survives.
+    --no-audit-prompts turns this off along with the prompts.
+    """
+    if AUDIT is None:
+        return
+    record = AUDIT.read_prompt(job_id) or {
+        "job": job_id,
+        "filename": filename,
+        "source": "names",
+        "from_job": None,
+        "prompt": "",
+        "hotwords": "",
+    }
+    record["speaker_names"] = names
+    record["ts"] = (
+        datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+    )
+    AUDIT.write_prompt(job_id, record)
+
+
 def new_job(filename: str, path: Path, opts: dict[str, Any]) -> str:
     job_id = uuid.uuid4().hex[:12]
     try:
@@ -1850,8 +1875,9 @@ def renumber_segments(
     return out, order
 
 
-def speaker_label(speaker: int) -> str:
-    return f"Speaker {speaker}"
+def speaker_label(speaker: int, names: dict[str, str] | None = None) -> str:
+    """The operator's name for a speaker if they gave one, else "Speaker N"."""
+    return (names or {}).get(str(speaker)) or f"Speaker {speaker}"
 
 
 def segment_speaker(segment: dict[str, Any]) -> int | None:
@@ -2567,7 +2593,9 @@ def _stamp(seconds: float, comma: bool = False) -> str:
     return f"{h:02d}:{m:02d}:{s:02d}{sep}{ms:03d}"
 
 
-def speaker_summary(segs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def speaker_summary(
+    segs: list[dict[str, Any]], names: dict[str, str] | None = None
+) -> list[dict[str, Any]]:
     """Per-speaker totals, or an empty list when the job was not diarized."""
     totals: dict[int, dict[str, Any]] = {}
     for segment in segs:
@@ -2578,7 +2606,7 @@ def speaker_summary(segs: list[dict[str, Any]]) -> list[dict[str, Any]]:
             speaker,
             {
                 "speaker": speaker,
-                "label": speaker_label(speaker),
+                "label": speaker_label(speaker, names),
                 "segments": 0,
                 "seconds": 0.0,
             },
@@ -2599,12 +2627,13 @@ def render(job: dict[str, Any], fmt: str) -> tuple[str, str]:
     to the plain transcript.
     """
     segs = job["segments"]
+    names = job.get("speaker_names")
 
     def spoken(segment: dict[str, Any]) -> str:
         speaker = segment_speaker(segment)
         if speaker is None:
             return str(segment["text"])
-        return f"{speaker_label(speaker)}: {segment['text']}"
+        return f"{speaker_label(speaker, names)}: {segment['text']}"
 
     if fmt == "txt":
         return "\n".join(spoken(s) for s in segs) + "\n", "text/plain; charset=utf-8"
@@ -2631,7 +2660,7 @@ def render(job: dict[str, Any], fmt: str) -> tuple[str, str]:
             text = (
                 s["text"]
                 if speaker is None
-                else f"<v {speaker_label(speaker)}>{s['text']}"
+                else f"<v {speaker_label(speaker, names)}>{s['text']}"
             )
             blocks.append(f"{_stamp(s['start'])} --> {_stamp(s['end'])}\n{text}\n")
         return "\n".join(blocks), "text/vtt; charset=utf-8"
@@ -2646,7 +2675,7 @@ def render(job: dict[str, Any], fmt: str) -> tuple[str, str]:
             "options": public_opts(job["opts"]),
             "segments": segs,
         }
-        speakers = speaker_summary(segs)
+        speakers = speaker_summary(segs, names)
         if speakers:
             # Only present when there is something to say, so the shape of a
             # plain export does not change.
@@ -3258,6 +3287,17 @@ def merge_speakers(
         job["segments"], renumbered = renumber_segments(moved)
         job["labels_rev"] = job.get("labels_rev", 0) + 1
         filename = job["filename"]
+        # The target keeps its own name, or takes the merged speaker's when it
+        # had none; then every name follows its speaker's new number.
+        names = dict(job.get("speaker_names") or {})
+        if str(speaker) in names:
+            names.setdefault(str(into), names[str(speaker)])
+            del names[str(speaker)]
+        names = {
+            str(renumbered[int(k)]): v for k, v in names.items() if int(k) in renumbered
+        }
+        named = bool(names) or bool(job.get("speaker_names"))
+        job["speaker_names"] = names
     audit(
         "job.speakers_merged",
         request,
@@ -3267,7 +3307,66 @@ def merge_speakers(
         into=into,
         speakers=len(renumbered),
     )
+    if named:
+        store_speaker_names(job_id, filename, names)
     return {"renumbered": {str(old): new for old, new in renumbered.items()}}
+
+
+# A name, not a paragraph; and nothing that would break an export -- `<` and `>`
+# would end WebVTT's <v Name> voice span, control characters a line.
+SPEAKER_NAME_LIMIT = 60
+SPEAKER_NAME_BAD = re.compile(r"[<>\x00-\x1f\x7f]")
+
+
+@app.post("/api/jobs/{job_id}/speakers/name")
+def name_speaker(
+    job_id: str, request: Request, speaker: int = Form(...), name: str = Form("")
+) -> dict[str, Any]:
+    """Give a speaker a name, or take it away with an empty one.
+
+    A list of names is a list of who was in the room -- the category of data
+    prompts and hotwords are. The app sees it (whoever named the speaker reads
+    the transcript anyway), but the main audit log records only its length and
+    hash; the text is kept in the job's sidecar, readable with the audit token.
+    """
+    value = " ".join((name or "").split())
+    if len(value) > SPEAKER_NAME_LIMIT or SPEAKER_NAME_BAD.search(name or ""):
+        raise HTTPException(
+            status_code=400,
+            detail=f"A name is up to {SPEAKER_NAME_LIMIT} characters, "
+            "without < > or line breaks",
+        )
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="No such job")
+        if job["state"] != "done":
+            raise HTTPException(
+                status_code=409, detail="Only a finished job's speakers can be named"
+            )
+        present = {segment_speaker(x) for x in job["segments"]} - {None}
+        if speaker not in present:
+            raise HTTPException(status_code=400, detail="No such speaker on this job")
+        names = dict(job.get("speaker_names") or {})
+        if value:
+            names[str(speaker)] = value
+        else:
+            names.pop(str(speaker), None)
+        job["speaker_names"] = names
+        job["labels_rev"] = job.get("labels_rev", 0) + 1
+        filename = job["filename"]
+    audit(
+        "job.speaker_named",
+        request,
+        job=job_id,
+        file=filename,
+        speaker=speaker,
+        cleared=not value,
+        name_len=len(value),
+        name_sha256=digest(value),
+    )
+    store_speaker_names(job_id, filename, names)
+    return {"speaker_names": names}
 
 
 @app.get("/api/jobs")
@@ -3309,7 +3408,7 @@ def job_detail(job_id: str, since: int = 0) -> dict[str, Any]:
     out["speaker_labels"] = any(s.get("speaker") is not None for s in segments)
     # Per-speaker totals for the card's speaker chips. Computed from the same
     # snapshot as the tail, and only read when the list says something changed.
-    out["speakers"] = speaker_summary(segments)
+    out["speakers"] = speaker_summary(segments, job.get("speaker_names"))
     return out
 
 

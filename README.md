@@ -238,7 +238,7 @@ audit-2026-09-18.jsonl      # the events
 prompts/<job_id>.json       # full prompt/hotword text, 0600, separate
 ```
 
-Events cover uploads, retries, speaker relabels, deletions, transcript exports, worker
+Events cover uploads, retries, speaker relabels, merges and renames, deletions, transcript exports, worker
 start/finish/error, VRAM evictions, model loads, the starter config being
 created, every refused request (`421` host, `403` cross-site, `401` auth) and a
 `server.started` snapshot of how the process was configured. Tokens never
@@ -421,10 +421,17 @@ hour-long recording.
   merge people or split one person in two. `Speaker 2` appearing for a single
   line is usually the diarizer being unsure, not a new person.
 
-  **Merge speakers on the card.** A finished, labelled card shows a chip per
-  speaker with their talk time. Click one to say who it really is — "Speaker 3
-  is really Speaker 1" — and every line moves over, the speakers are
-  renumbered, and the exports follow. Nothing is re-run; it takes a second.
+  **Merge and name speakers on the card.** A finished, labelled card shows a
+  chip per speaker with their talk time. Click one to give it a name — the
+  transcript and every export then say `Alice:` instead of `Speaker 1:` — or to
+  say who it really is: "Speaker 3 is really Speaker 1" moves every line over,
+  renumbers the speakers, and carries any names across. Nothing is re-run.
+
+  Names are treated like prompt text in the audit trail: the main log records
+  only a length and a hash, the names themselves go to the job's sidecar in
+  `prompts/`, readable with the audit token, and `--no-audit-prompts` keeps
+  them out of it too. A relabel starts a new job without the old job's names,
+  since its speakers are drawn afresh.
 
   **Got the count wrong?** Set Speakers to the right number and press
   **Relabel speakers** on the finished card. It runs only the speaker pass

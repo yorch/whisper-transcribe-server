@@ -118,6 +118,8 @@ INDEX_SELECTORS_ADDED = {
     ".people .chip.s1",
     ".people .chip.s2",
     ".speaker-edit",
+    ".speaker-edit input[type=text]",
+    ".speaker-edit input[type=text]:focus-visible",
 }
 
 

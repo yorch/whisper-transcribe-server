@@ -131,7 +131,13 @@ def preview_probe(body: str) -> dict:
         PREVIEW_HARNESS
         + "\n".join(
             function_source(name)
-            for name in ("fmtStamp", "stick", "setPaused", "appendSegments")
+            for name in (
+                "fmtStamp",
+                "stick",
+                "setPaused",
+                "speakerName",
+                "appendSegments",
+            )
         )
         + "\nprocess.stdout.write(JSON.stringify((() => {"
         + body
@@ -214,6 +220,7 @@ def card_probe(body: str) -> dict:
                 "followOn",
                 "stick",
                 "setPaused",
+                "speakerName",
                 "appendSegments",
                 "actions",
                 "speakerChips",
@@ -275,6 +282,7 @@ def poll_probe(body: str) -> dict:
                 "followOn",
                 "stick",
                 "setPaused",
+                "speakerName",
                 "appendSegments",
                 "actions",
                 "speakerChips",
@@ -607,6 +615,20 @@ def test_a_merge_redraws_rows_that_are_already_on_screen():
     assert probe["before"] == ["Speaker 1", "Speaker 2"]
     assert probe["after"] == ["Speaker 1", "Speaker 1"], probe
     assert probe["refetched"] == 2, "once at first sight, once for the merge"
+
+
+@needs_node
+def test_named_speakers_are_named_in_the_transcript():
+    probe = preview_probe(
+        """
+        const h = makeView();
+        h.view.names = {"2": "Bob"};
+        appendSegments(h.view, [Object.assign(seg(0, "hi"), {speaker: 1}),
+                                Object.assign(seg(3, "yo"), {speaker: 2})], false, 2, true);
+        return speakers(h.rows);
+        """
+    )
+    assert probe == ["Speaker 1", "Bob"]
 
 
 @needs_node
