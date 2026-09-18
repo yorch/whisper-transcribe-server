@@ -799,8 +799,9 @@ Segmentation `pyannote-3.0`, best threshold per embedding model:
   fold shares scored identically here; 3 % stays.
 - **No model is a clear win.** eres2net-en ties titanet-small on Auto and is a
   little better pinned; it is also smaller (26 vs 40 MB) and Apache-2.0. It is
-  offered as `diarization_embedding = "eres2net-en"`, with its own calibrated
-  threshold (0.9) applied when none is set. titanet-large is bigger, slower and
+  offered as `diarization_embedding = "eres2net-en"` server-wide and as the
+  page's **Voice model** per job (relabel a card with the other model to
+  compare), with its own calibrated threshold (0.9) applied when none is set. titanet-large is bigger, slower and
   no better.
 - **Both CAM++ exports fail in this pipeline** — ~57 % DER even with the count
   pinned, i.e. the embeddings do not separate voices at all here. That reads as

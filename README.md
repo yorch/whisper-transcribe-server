@@ -132,7 +132,8 @@ Useful flags:
 | `--pin-model`                 | force every job to `--model`, disable the UI selector                                                                       |
 | `--allow-precision-choice`    | expose the precision selector (hidden by default)                                                                           |
 | `--no-diarize`                | remove the speaker-identification control, so the diarization models are never fetched or loaded                             |
-| `--diarization-embedding eres2net-en` | the model that tells voices apart: `titanet-small` (default) or `eres2net-en` (smaller, Apache-2.0)               |
+| `--diarization-embedding eres2net-en` | the default model that tells voices apart: `titanet-small` or `eres2net-en` (smaller, Apache-2.0)                 |
+| `--pin-diarization-embedding` | every job uses `--diarization-embedding`; hides the page's Voice model selector                                            |
 | `--diarization-threshold 0.8` | how alike two voices must be to merge, on Auto; unset follows the model (0.8 titanet-small, 0.9 eres2net-en)               |
 | `--diarization-fold-share 0.03` | on Auto, fold speakers under this share of the talk time into their neighbours; `0` turns it off                        |
 | `--no-auth`                   | serve without a token                                                                                                       |
@@ -212,6 +213,7 @@ preload = true
 # Anything settable by a flag lives in this file too.
 allow_diarize = true
 embedding = "titanet-small"
+embedding_choice = true
 fold_share = 0.03
 
 [limits]

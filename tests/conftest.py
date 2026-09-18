@@ -61,6 +61,7 @@ class Configured:
             overrides.get("speech_pad_ms", 400),
             overrides.get("diarize", "false"),
             overrides.get("speakers", 0),
+            overrides.get("speaker_model"),
         )
         return s.new_job(name, path, opts)
 
@@ -105,6 +106,7 @@ def configured(tmp_path, monkeypatch):
         allow_precision_choice=False,
         allow_diarize=True,
         diarization_embedding="titanet-small",
+        diarization_embedding_choice=True,
         diarization_threshold=s.DIARIZE_THRESHOLD,
         diarization_fold_share=s.DIARIZE_FOLD_SHARE,
         model_cache=1,

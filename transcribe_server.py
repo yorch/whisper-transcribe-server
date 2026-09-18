@@ -1474,6 +1474,32 @@ def as_float(value: Any, default: float) -> float:
         return default
 
 
+def pick_speaker_model(requested: str | None) -> str:
+    """The job's voice model: the client's pick, if the server lets it choose.
+
+    Pinned (embedding_choice = false) behaves like --pin-model: the request is
+    ignored rather than refused, since the client never sees the control.
+    """
+    if not ARGS.diarization_embedding_choice or not requested:
+        return ARGS.diarization_embedding
+    if requested not in DIARIZE_EMBEDDINGS:
+        raise HTTPException(status_code=400, detail="Unknown voice model")
+    return requested
+
+
+def threshold_for(speaker_model: str | None) -> float:
+    """The clustering threshold for a job's voice model.
+
+    Each model has its own distance scale. The server's diarization_threshold
+    was resolved for the server's default model -- set explicitly, or that
+    model's calibrated value -- so it applies to that model only; any other
+    model runs at its own calibrated threshold.
+    """
+    if not speaker_model or speaker_model == ARGS.diarization_embedding:
+        return ARGS.diarization_threshold
+    return float(DIARIZE_EMBEDDINGS[speaker_model]["threshold"])
+
+
 def build_opts(
     model: str | None,
     compute_type: str | None,
@@ -1489,6 +1515,7 @@ def build_opts(
     speech_pad_ms: int,
     diarize: str = "false",
     speakers: int = 0,
+    speaker_model: str | None = None,
 ) -> dict[str, Any]:
     """Validate everything a client can influence. Pinned knobs ignore the client."""
     truthy = lambda v: str(v).lower() in ("1", "true", "yes", "on")  # noqa: E731
@@ -1546,6 +1573,8 @@ def build_opts(
         "diarize": diarize_on,
         # 0 means "work it out from the audio".
         "speakers": wanted,
+        # Which voice model tells the speakers apart; None when not labelling.
+        "speaker_model": pick_speaker_model(speaker_model) if diarize_on else None,
         "min_silence_ms": clamp(as_int(min_silence_ms, 2000), 100, 10000),
         "speech_pad_ms": clamp(as_int(speech_pad_ms, 400), 0, 2000),
     }
@@ -1768,7 +1797,7 @@ def _download(url: str, dest: Path) -> None:
             shutil.copyfileobj(response, fh)
 
 
-def ensure_diarize_models() -> dict[str, Path]:
+def ensure_diarize_models(embedding: str | None = None) -> dict[str, Path]:
     """Fetch the diarization weights once, into the work dir.
 
     They do not come from Hugging Face, so they do not belong in its cache, and
@@ -1781,7 +1810,12 @@ def ensure_diarize_models() -> dict[str, Path]:
         os.chmod(directory, 0o700)
 
     resolved: dict[str, Path] = {}
-    for key, spec in DIARIZE_MODELS.items():
+    specs = dict(DIARIZE_MODELS)
+    if embedding:
+        # A job's own voice model; each has its own file, so switching does not
+        # evict the other.
+        specs["embedding"] = DIARIZE_EMBEDDINGS[embedding]
+    for key, spec in specs.items():
         dest = directory / str(spec["file"])
         if dest.is_file() and _sha256_file(dest) == spec["sha256"]:
             resolved[key] = dest
@@ -2027,7 +2061,7 @@ def align_speakers(
     return out
 
 
-def fetch_diarize_models_or_explain() -> dict[str, Path]:
+def fetch_diarize_models_or_explain(embedding: str | None = None) -> dict[str, Path]:
     """Everything that has to be true before a child can run, or a clear reason."""
     # Say this in the parent's words rather than letting the child die with a
     # ModuleNotFoundError several frames deep: the fix is a different command,
@@ -2041,7 +2075,7 @@ def fetch_diarize_models_or_explain() -> dict[str, Path]:
             "(uv run transcribe_server.py); otherwise pip install sherpa-onnx"
         )
     try:
-        return ensure_diarize_models()
+        return ensure_diarize_models(embedding)
     except Exception as exc:  # noqa: BLE001
         raise RuntimeError(
             f"could not fetch the diarization models ({redact(str(exc), 200)}). "
@@ -2191,7 +2225,7 @@ def diarize_job(
 ) -> list[dict[str, Any]] | None:
     """The job-aware wrapper: fetch, report progress, honour Cancel."""
     patch_job(job_id, message="Fetching diarization models", phase="diarizing")
-    models = fetch_diarize_models_or_explain()
+    models = fetch_diarize_models_or_explain(opts.get("speaker_model"))
     if job_cancelled(job_id):
         return None
 
@@ -2210,7 +2244,7 @@ def diarize_job(
         models,
         on_progress=note,
         cancelled=lambda: job_cancelled(job_id),
-        threshold=ARGS.diarization_threshold,
+        threshold=threshold_for(opts.get("speaker_model")),
     )
 
 
@@ -2348,9 +2382,9 @@ def label_and_finish(
                     file=job["filename"],
                     backend="sherpa-onnx",
                     segmentation=DIARIZE_MODELS["segmentation"]["file"],
-                    embedding=DIARIZE_MODELS["embedding"]["file"],
+                    embedding=opts.get("speaker_model") or ARGS.diarization_embedding,
                     requested=opts["speakers"],
-                    threshold=ARGS.diarization_threshold,
+                    threshold=threshold_for(opts.get("speaker_model")),
                     fold_share=ARGS.diarization_fold_share,
                     folded=folded,
                     speakers=len(
@@ -3024,6 +3058,9 @@ def status() -> dict[str, Any]:
         "retry_available": ARGS.source_retention != "run",
         "allow_diarize": ARGS.allow_diarize,
         "diarize_max_speakers": DIARIZE_MAX_SPEAKERS,
+        "speaker_models": list(DIARIZE_EMBEDDINGS),
+        "default_speaker_model": ARGS.diarization_embedding,
+        "allow_speaker_model_choice": ARGS.diarization_embedding_choice,
         "prompt_limit": PROMPT_LIMIT,
         "hotwords_limit": HOTWORDS_LIMIT,
     }
@@ -3082,6 +3119,7 @@ async def create_job(
     speech_pad_ms: int = Form(400),
     diarize: str = Form("false"),
     speakers: int = Form(0),
+    speaker_model: str = Form(""),
 ) -> dict[str, Any]:
     opts = build_opts(
         model,
@@ -3098,6 +3136,7 @@ async def create_job(
         speech_pad_ms,
         diarize,
         speakers,
+        speaker_model,
     )
 
     with JOBS_LOCK:
@@ -3169,6 +3208,7 @@ def retry_job(
     speech_pad_ms: int = Form(400),
     diarize: str = Form("false"),
     speakers: int = Form(0),
+    speaker_model: str = Form(""),
 ) -> dict[str, Any]:
     """Re-run the same source audio with different settings, no re-upload."""
     old = get_job(job_id)
@@ -3197,6 +3237,7 @@ def retry_job(
         speech_pad_ms,
         diarize,
         speakers,
+        speaker_model,
     )
 
     with JOBS_LOCK:
@@ -3227,7 +3268,10 @@ def retry_job(
 
 @app.post("/api/jobs/{job_id}/speakers")
 def relabel_speakers_endpoint(
-    job_id: str, request: Request, speakers: int = Form(0)
+    job_id: str,
+    request: Request,
+    speakers: int = Form(0),
+    speaker_model: str = Form(""),
 ) -> dict[str, Any]:
     """Identify the speakers again with another count, without transcribing.
 
@@ -3260,6 +3304,8 @@ def relabel_speakers_endpoint(
     opts = dict(old["opts"])
     opts["diarize"] = True
     opts["speakers"] = clamp(as_int(speakers, 0), 0, DIARIZE_MAX_SPEAKERS)
+    # Relabelling with the other model is the cheapest way to compare them.
+    opts["speaker_model"] = pick_speaker_model(speaker_model)
     new_id = new_job(filename=old["filename"], path=Path(old["path"]), opts=opts)
     # Whisper's lines, not the last pass's split of them: a new count has to be
     # free to draw the speaker changes somewhere else.
@@ -3278,6 +3324,7 @@ def relabel_speakers_endpoint(
         from_job=job_id,
         file=old["filename"],
         speakers=opts["speakers"],
+        speaker_model=opts["speaker_model"],
     )
     store_prompt_sidecar(
         new_id, old["filename"], opts, source="relabel", from_job=job_id
@@ -3656,6 +3703,7 @@ DEFAULTS: dict[str, Any] = {
     "allow_precision_choice": False,
     "allow_diarize": True,
     "diarization_embedding": "titanet-small",
+    "diarization_embedding_choice": True,
     # None: the embedding model's own calibrated threshold.
     "diarization_threshold": None,
     "diarization_fold_share": DIARIZE_FOLD_SHARE,
@@ -3700,6 +3748,7 @@ ENV_OPTIONS: dict[str, tuple[str, str]] = {
     "TRANSCRIBE_MODEL_CACHE": ("model_cache", "int"),
     "TRANSCRIBE_ALLOW_DIARIZE": ("allow_diarize", "bool"),
     "TRANSCRIBE_DIARIZATION_EMBEDDING": ("diarization_embedding", "str"),
+    "TRANSCRIBE_DIARIZATION_EMBEDDING_CHOICE": ("diarization_embedding_choice", "bool"),
     "TRANSCRIBE_DIARIZATION_THRESHOLD": ("diarization_threshold", "float"),
     "TRANSCRIBE_DIARIZATION_FOLD_SHARE": ("diarization_fold_share", "float"),
     "TRANSCRIBE_PRELOAD": ("preload", "bool"),
@@ -3863,6 +3912,9 @@ CONFIG_TEMPLATE = """\
 # "eres2net-en", smaller, Apache-2.0, and a little better when you pin the
 # speaker count. Measured against each other in docs/speaker-diarization.md.
 # embedding = "titanet-small"
+# Let each job pick the voice model from the page ("Voice model"). Off pins
+# every job to the model above, as pin_model does for Whisper.
+# embedding_choice = true
 # How alike two stretches of voice must be to count as one speaker, when the
 # count is left on Auto. Higher merges more, lower splits more; a pinned count
 # ignores it. Unset, it follows the model: 0.8 for titanet-small, 0.9 for
@@ -4101,6 +4153,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="the speaker-embedding model (default titanet-small)",
     )
     gpu.add_argument(
+        "--pin-diarization-embedding",
+        dest="diarization_embedding_choice",
+        action="store_false",
+        default=argparse.SUPPRESS,
+        help="use --diarization-embedding for every job; hide the page's "
+        "Voice model selector",
+    )
+    gpu.add_argument(
         "--diarization-threshold",
         type=float,
         default=argparse.SUPPRESS,
@@ -4335,6 +4395,7 @@ def startup_snapshot(args: argparse.Namespace, cfg: Path | None) -> dict[str, An
         "allow_precision_choice": args.allow_precision_choice,
         "allow_diarize": args.allow_diarize,
         "diarization_embedding": args.diarization_embedding,
+        "diarization_embedding_choice": args.diarization_embedding_choice,
         "diarization_threshold": args.diarization_threshold,
         "diarization_fold_share": args.diarization_fold_share,
         "auth": bool(args.token),
