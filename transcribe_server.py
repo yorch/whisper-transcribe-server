@@ -1619,15 +1619,42 @@ DIARIZE_MODELS: dict[str, dict[str, Any]] = {
         "bytes": 1_540_506,
         "sha256": "d582f4b4c6b48205de7e0643c57df0df5615a3c176189be3fc461e9d18827b5d",
     },
-    "embedding": {
+    # Set from DIARIZE_EMBEDDINGS by main(), per diarization_embedding.
+    "embedding": {},
+}
+
+# The speaker-embedding models an operator can choose between -- the two that
+# earned a place in scripts/diarize_eval.py (docs/speaker-diarization.md,
+# section 10). Each carries the clustering threshold it was calibrated at,
+# because the distance scale differs by model: titanet-small is best at 0.8,
+# eres2net-en at 0.9, and a threshold left unset follows the model.
+# titanet-small keeps its original file name so an existing install is not
+# made to download it again.
+DIARIZE_EMBEDDINGS: dict[str, dict[str, Any]] = {
+    "titanet-small": {
         "url": "https://github.com/k2-fsa/sherpa-onnx/releases/download/"
         "speaker-recongition-models/nemo_en_titanet_small.onnx",
         "member": None,
         "file": "embedding.onnx",
         "bytes": 40_257_283,
         "sha256": "ad4a1802485d8b34c722d2a9d04249662f2ece5d28a7a039063ca22f515a789e",
+        "threshold": 0.8,
+    },
+    # 3D-Speaker ERes2Net trained on VoxCeleb (English). Ties titanet-small on
+    # Auto, is somewhat better with the count pinned, is smaller, and is
+    # Apache-2.0 where NeMo's weights need a licence check to redistribute.
+    "eres2net-en": {
+        "url": "https://github.com/k2-fsa/sherpa-onnx/releases/download/"
+        "speaker-recongition-models/"
+        "3dspeaker_speech_eres2net_sv_en_voxceleb_16k.onnx",
+        "member": None,
+        "file": "embedding-eres2net-en.onnx",
+        "bytes": 26_485_263,
+        "sha256": "c59158379255ad66e161679cca6af8d52d51e389e3224ab7d7a7baae295c2db5",
+        "threshold": 0.9,
     },
 }
+DIARIZE_MODELS["embedding"] = DIARIZE_EMBEDDINGS["titanet-small"]
 
 # The child. Kept as a string so transcribe_server.py stays one file: this runs
 # as `sys.executable -c`, and under `uv run` that interpreter already has the
@@ -2029,6 +2056,7 @@ def run_diarizer(
     models: dict[str, Path],
     on_progress: Callable[[int], None] | None = None,
     cancelled: Callable[[], bool] | None = None,
+    threshold: float = DIARIZE_THRESHOLD,
 ) -> list[dict[str, Any]] | None:
     """Diarize one file in a child process and return its turns.
 
@@ -2054,7 +2082,7 @@ def run_diarizer(
         str(models["segmentation"]),
         str(models["embedding"]),
         str(speakers),
-        f"{DIARIZE_THRESHOLD:g}",
+        f"{threshold:g}",
         f"{DIARIZE_MIN_DURATION_ON:g}",
         f"{DIARIZE_MIN_DURATION_OFF:g}",
         str(diarize_threads()),
@@ -2182,6 +2210,7 @@ def diarize_job(
         models,
         on_progress=note,
         cancelled=lambda: job_cancelled(job_id),
+        threshold=ARGS.diarization_threshold,
     )
 
 
@@ -2297,7 +2326,9 @@ def label_and_finish(
                 diarize_note = "the diarizer found no speech"
             else:
                 if not opts["speakers"]:
-                    turns, folded = fold_minor_speakers(turns, DIARIZE_FOLD_SHARE)
+                    turns, folded = fold_minor_speakers(
+                        turns, ARGS.diarization_fold_share
+                    )
                 before = len(collected)
                 # Kept as Whisper produced it, before alignment split lines at
                 # speaker changes: relabelling with another count starts from
@@ -2319,7 +2350,8 @@ def label_and_finish(
                     segmentation=DIARIZE_MODELS["segmentation"]["file"],
                     embedding=DIARIZE_MODELS["embedding"]["file"],
                     requested=opts["speakers"],
-                    threshold=DIARIZE_THRESHOLD,
+                    threshold=ARGS.diarization_threshold,
+                    fold_share=ARGS.diarization_fold_share,
                     folded=folded,
                     speakers=len(
                         {
@@ -3623,6 +3655,10 @@ DEFAULTS: dict[str, Any] = {
     "allow_model_choice": True,
     "allow_precision_choice": False,
     "allow_diarize": True,
+    "diarization_embedding": "titanet-small",
+    # None: the embedding model's own calibrated threshold.
+    "diarization_threshold": None,
+    "diarization_fold_share": DIARIZE_FOLD_SHARE,
     "preload": False,
     "max_upload_mb": 2048,
     "max_queue": 20,
@@ -3643,6 +3679,7 @@ CHOICES: dict[str, list[str]] = {
     "compute_type": COMPUTE_TYPES,
     "quality": list(QUALITIES),
     "source_retention": RETENTION,
+    "diarization_embedding": list(DIARIZE_EMBEDDINGS),
 }
 
 # Environment wins over both the config file and the flags, so a service
@@ -3662,6 +3699,9 @@ ENV_OPTIONS: dict[str, tuple[str, str]] = {
     "TRANSCRIBE_QUALITY": ("quality", "str"),
     "TRANSCRIBE_MODEL_CACHE": ("model_cache", "int"),
     "TRANSCRIBE_ALLOW_DIARIZE": ("allow_diarize", "bool"),
+    "TRANSCRIBE_DIARIZATION_EMBEDDING": ("diarization_embedding", "str"),
+    "TRANSCRIBE_DIARIZATION_THRESHOLD": ("diarization_threshold", "float"),
+    "TRANSCRIBE_DIARIZATION_FOLD_SHARE": ("diarization_fold_share", "float"),
     "TRANSCRIBE_PRELOAD": ("preload", "bool"),
     "TRANSCRIBE_MAX_UPLOAD_MB": ("max_upload_mb", "int"),
     "TRANSCRIBE_MAX_QUEUE": ("max_queue", "int"),
@@ -3689,7 +3729,7 @@ def as_list(value: Any) -> list[str]:
     return [part.strip() for part in str(value).split(",") if part.strip()]
 
 
-CONVERTERS = {"str": str, "int": int, "bool": as_bool, "list": as_list}
+CONVERTERS = {"str": str, "int": int, "float": float, "bool": as_bool, "list": as_list}
 
 
 def config_path(explicit: str | None, work_dir: str | None = None) -> tuple[Path, bool]:
@@ -3819,6 +3859,19 @@ CONFIG_TEMPLATE = """\
 # fetched. A diarized job is slower and needs word-level timings, which the
 # server switches on for it.
 # allow_diarize = true
+# The model that tells voices apart: "titanet-small" (the default) or
+# "eres2net-en", smaller, Apache-2.0, and a little better when you pin the
+# speaker count. Measured against each other in docs/speaker-diarization.md.
+# embedding = "titanet-small"
+# How alike two stretches of voice must be to count as one speaker, when the
+# count is left on Auto. Higher merges more, lower splits more; a pinned count
+# ignores it. Unset, it follows the model: 0.8 for titanet-small, 0.9 for
+# eres2net-en.
+# threshold = 0.8
+# On Auto, a speaker holding less than this share of the talk time is folded
+# into the voice nearest it in time -- usually a laugh or a raised voice heard
+# as someone new. 0 turns folding off.
+# fold_share = 0.03
 
 [limits]
 # max_upload_mb = 2048
@@ -4042,6 +4095,26 @@ def build_parser() -> argparse.ArgumentParser:
         "diarization models are never fetched or loaded",
     )
     gpu.add_argument(
+        "--diarization-embedding",
+        default=argparse.SUPPRESS,
+        choices=list(DIARIZE_EMBEDDINGS),
+        help="the speaker-embedding model (default titanet-small)",
+    )
+    gpu.add_argument(
+        "--diarization-threshold",
+        type=float,
+        default=argparse.SUPPRESS,
+        help="clustering distance for Auto speaker counts: higher merges more "
+        "(default: the embedding model's own, 0.8 for titanet-small)",
+    )
+    gpu.add_argument(
+        "--diarization-fold-share",
+        type=float,
+        default=argparse.SUPPRESS,
+        help="on Auto, fold speakers under this share of the talk time into "
+        f"their neighbours; 0 turns it off (default {DIARIZE_FOLD_SHARE:g})",
+    )
+    gpu.add_argument(
         "--preload",
         action="store_true",
         default=argparse.SUPPRESS,
@@ -4175,6 +4248,11 @@ def resolve_args(
                 raise SystemExit(
                     f"!  {name} must be an integer, got {value!r}"
                 ) from None
+        elif isinstance(default, float):
+            try:
+                merged[name] = float(value)
+            except (TypeError, ValueError):
+                raise SystemExit(f"!  {name} must be a number, got {value!r}") from None
         elif isinstance(default, list):
             merged[name] = as_list(value)
 
@@ -4192,6 +4270,29 @@ def resolve_args(
     for name in ("model_cache", "max_jobs", "audit_retain_days"):
         if merged[name] < 0:
             raise SystemExit(f"!  {name} cannot be negative, got {merged[name]}")
+    # Unset follows the model: each embedding has its own distance scale.
+    if merged["diarization_threshold"] is None:
+        merged["diarization_threshold"] = DIARIZE_EMBEDDINGS[
+            merged["diarization_embedding"]
+        ]["threshold"]
+    try:
+        merged["diarization_threshold"] = float(merged["diarization_threshold"])
+    except (TypeError, ValueError):
+        raise SystemExit(
+            f"!  diarization_threshold must be a number, got "
+            f"{merged['diarization_threshold']!r}"
+        ) from None
+    # A cosine-style distance: past 2 nothing ever merges, at 0 nothing does.
+    if not 0 < merged["diarization_threshold"] <= 2:
+        raise SystemExit(
+            "!  diarization_threshold must be above 0 and at most 2, got "
+            f"{merged['diarization_threshold']}"
+        )
+    if not 0 <= merged["diarization_fold_share"] < 0.5:
+        raise SystemExit(
+            "!  diarization_fold_share must be from 0 (off) to below 0.5, got "
+            f"{merged['diarization_fold_share']}"
+        )
 
     # Only the default location is self-referential, and the comparison is on the
     # effective value: --work-dir and TRANSCRIBE_WORK_DIR already moved the config
@@ -4233,6 +4334,9 @@ def startup_snapshot(args: argparse.Namespace, cfg: Path | None) -> dict[str, An
         "allow_model_choice": args.allow_model_choice,
         "allow_precision_choice": args.allow_precision_choice,
         "allow_diarize": args.allow_diarize,
+        "diarization_embedding": args.diarization_embedding,
+        "diarization_threshold": args.diarization_threshold,
+        "diarization_fold_share": args.diarization_fold_share,
         "auth": bool(args.token),
         "audit": args.audit,
         "audit_reads": args.audit_reads,
@@ -4400,6 +4504,7 @@ def main() -> None:
         print()
 
     ARGS = args
+    DIARIZE_MODELS["embedding"] = DIARIZE_EMBEDDINGS[args.diarization_embedding]
     READY = True
     CUDA = cuda
     ALLOWED_HOSTS, ALLOWED_SUFFIXES = local_names(args.host, args.allow_host)
@@ -4474,7 +4579,16 @@ def main() -> None:
     if hardware:
         print(f"GPU        {hardware}")
     print(f"VRAM cache {args.model_cache} model(s)")
-    print(f"Speakers   {'available (identify)' if args.allow_diarize else 'disabled'}")
+    print(
+        "Speakers   "
+        + (
+            f"available ({args.diarization_embedding}, threshold "
+            f"{args.diarization_threshold:g}, fold "
+            f"{args.diarization_fold_share:g})"
+            if args.allow_diarize
+            else "disabled"
+        )
+    )
     print(
         f"Sources    retention={args.source_retention}"
         f"{'  retry enabled' if args.source_retention != 'run' else '  retry disabled'}"

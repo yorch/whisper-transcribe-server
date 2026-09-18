@@ -472,6 +472,81 @@ def test_config_precedence_defaults_file_flags_env(tmp_path, monkeypatch):
     assert args.port == 3333, "environment must win over flags"
 
 
+def test_diarization_tuning_layers_like_every_other_option(tmp_path, monkeypatch):
+    """[diarization] threshold / fold_share in the file, flags over it, and the
+    environment over both -- as floats, since both are fractions."""
+    cfg = tmp_path / "config.toml"
+    cfg.write_text("[diarization]\nthreshold = 0.9\nfold_share = 0\n")
+    for var in (
+        "TRANSCRIBE_DIARIZATION_THRESHOLD",
+        "TRANSCRIBE_DIARIZATION_FOLD_SHARE",
+    ):
+        monkeypatch.delenv(var, raising=False)
+
+    args, _, _ = s.resolve_args(["--config", str(cfg)])
+    assert (args.diarization_threshold, args.diarization_fold_share) == (0.9, 0.0)
+
+    args, _, _ = s.resolve_args(
+        ["--config", str(cfg), "--diarization-threshold", "0.7"]
+    )
+    assert args.diarization_threshold == 0.7
+
+    monkeypatch.setenv("TRANSCRIBE_DIARIZATION_FOLD_SHARE", "0.05")
+    args, _, _ = s.resolve_args(["--config", str(cfg)])
+    assert args.diarization_fold_share == 0.05
+
+
+def test_an_unset_threshold_follows_the_embedding_model(tmp_path, monkeypatch):
+    """Each model has its own distance scale: titanet-small is calibrated at 0.8,
+    eres2net-en at 0.9. Switching the model alone must not leave it at the
+    other one's value."""
+    cfg = tmp_path / "config.toml"
+    cfg.write_text("")
+    for var in ("TRANSCRIBE_DIARIZATION_THRESHOLD", "TRANSCRIBE_DIARIZATION_EMBEDDING"):
+        monkeypatch.delenv(var, raising=False)
+
+    args, _, _ = s.resolve_args(["--config", str(cfg)])
+    assert (args.diarization_embedding, args.diarization_threshold) == (
+        "titanet-small",
+        0.8,
+    )
+
+    args, _, _ = s.resolve_args(
+        ["--config", str(cfg), "--diarization-embedding", "eres2net-en"]
+    )
+    assert args.diarization_threshold == 0.9
+
+    args, _, _ = s.resolve_args(
+        ["--config", str(cfg), "--diarization-embedding", "eres2net-en",
+         "--diarization-threshold", "0.85"]
+    )  # fmt: skip
+    assert args.diarization_threshold == 0.85, "an explicit threshold still wins"
+
+
+@pytest.mark.parametrize(
+    "flag,value",
+    [
+        ("--diarization-threshold", "0"),
+        ("--diarization-threshold", "3"),
+        ("--diarization-fold-share", "-0.1"),
+        ("--diarization-fold-share", "0.5"),
+    ],
+)
+def test_diarization_tuning_out_of_range_is_refused(tmp_path, monkeypatch, flag, value):
+    cfg = tmp_path / "config.toml"
+    cfg.write_text("")
+    for var in (
+        "TRANSCRIBE_DIARIZATION_THRESHOLD",
+        "TRANSCRIBE_DIARIZATION_FOLD_SHARE",
+    ):
+        monkeypatch.delenv(var, raising=False)
+
+    with pytest.raises(SystemExit) as exc:
+        s.resolve_args(["--config", str(cfg), flag, value])
+
+    assert flag.lstrip("-").replace("-", "_") in str(exc.value)
+
+
 def test_allow_host_is_additive_across_layers(tmp_path, monkeypatch):
     """A flag used to silently replace the configured allow-list."""
     cfg = tmp_path / "config.toml"
@@ -728,9 +803,10 @@ KEY_LINE = re.compile(r"^#\s*([a-z_][a-z0-9_]*)\s*=")
 #                     check_default_state_dir
 NOT_IN_TEMPLATE = {"config", "starter_config", "work_dir"}
 
-# DEFAULTS stores None for "derive it from the work dir", so the template can
-# only show a plausible path. Checked for presence, not for the value.
-DERIVED_DEFAULTS = {"audit_dir"}
+# DEFAULTS stores None for "derive it from the work dir" (audit_dir) or "the
+# embedding model's own" (diarization_threshold), so the template can only show a
+# plausible value. Checked for presence, not for the value.
+DERIVED_DEFAULTS = {"audit_dir", "diarization_threshold"}
 
 
 def materialise(template: str) -> str:

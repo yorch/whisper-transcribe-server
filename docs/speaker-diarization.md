@@ -761,7 +761,75 @@ rather than the guarantee.
 Not built, and deliberately: server-side speaker names (§7.4), a GPU
 `onnxruntime` path (§4.3), and crossing-diarization identities.
 
-## 10. Sources
+## 10. Measured again: thresholds, models, and the fold
+
+The 0.8 in §5 was calibrated on four files. After a two-person Zoom call came
+back as five speakers, the question was re-asked with a harness,
+`scripts/diarize_eval.py`, over 16 recordings (26 minutes): sherpa's four public
+files (speaker count known) and twelve synthetic calls from
+`scripts/synth_calls.py`, whose speaker timelines are exact.
+
+The synthetic calls are macOS `say` voices, each on its own simulated line
+(band limits, room echo, a phone-like one), mixed with line hiss and passed
+through Opus at 20 kbps. Per utterance the speaking rate and gain vary, and
+an "unstable" speaker sometimes switches line profile mid-call — a headset
+dropping out, a codec adapting — which is the mechanism by which one person
+becomes several. They include two similar-voice pairs and short back-channels.
+**They are a weak proxy for real calls**: TTS voices are far more consistent
+than people. Nothing below is a claim about real-meeting accuracy.
+
+Metrics: *exact* is the share of files where Auto found the true count;
+*+fold* the same after `fold_minor_speakers` at 3 %; *DER* is missed speech +
+false alarm + speaker confusion over reference speech (10 ms frames, no collar,
+greedy speaker mapping), synthetic files only.
+
+Segmentation `pyannote-3.0`, best threshold per embedding model:
+
+| embedding | best thr | exact | +fold | DER | pinned: exact / DER |
+| --- | --- | --- | --- | --- | --- |
+| **`titanet-small`** (default) | 0.8 | 69 % | **94 %** | **18.8 %** | 81 % / 20.4 % |
+| **`eres2net-en`** (3D-Speaker, VoxCeleb) | 0.9 | 81 % | **94 %** | 19.4 % | **88 % / 19.6 %** |
+| `titanet-large` | 0.9 | 75 % | 81 % | 20.9 % | 81 % / 20.2 % |
+| `wespeaker resnet34-LM` | 0.4–0.5 | 25–50 % | 44–62 % | 22–24 % | 69 % / 31.1 % |
+| `3dspeaker CAM++`, `wespeaker CAM++-LM` | — | ≤ 56 % | ≤ 44 % | 54–60 % | ~57 % DER |
+
+- **The fold is the largest single gain**: titanet-small goes from 69 % to 94 %
+  exact at no DER cost. The files it fixed are the ones that look like the
+  Zoom report — one voice briefly heard as a third speaker. 2 %, 3 % and 5 %
+  fold shares scored identically here; 3 % stays.
+- **No model is a clear win.** eres2net-en ties titanet-small on Auto and is a
+  little better pinned; it is also smaller (26 vs 40 MB) and Apache-2.0. It is
+  offered as `diarization_embedding = "eres2net-en"`, with its own calibrated
+  threshold (0.9) applied when none is set. titanet-large is bigger, slower and
+  no better.
+- **Both CAM++ exports fail in this pipeline** — ~57 % DER even with the count
+  pinned, i.e. the embeddings do not separate voices at all here. That reads as
+  an input-feature mismatch, not a bad model; they are not offered.
+- **reverb-v1 segmentation is worse** than pyannote-3.0 (22–25 % DER with the two
+  finalists), so segmentation is unchanged.
+- **Each model has its own distance scale** (ResNet34's best is 0.4–0.5, below
+  where titanet's is), which is why the threshold follows the model unless set.
+
+Two findings matter more than the averages:
+
+1. **A speaker whose line changes character is mis-attributed, not
+   over-counted.** The "unstable" files score ~49 % DER on both good models —
+   *with the right count*, and *also when the count is pinned*. The switched
+   stretches go to the other real speaker, so nothing in the count gives it
+   away. The fold cannot fix it and neither can pinning; a merge on the card
+   can, and per-participant recording (one track per person) avoids it.
+2. **Pinning is not always better.** Pinned to 4, titanet-small left one cluster
+   empty on all three four-speaker files (3 found) and scored 29–37 % DER, worse
+   than Auto + fold's 12–15 % on two of them. eres2net-en held 4 on the clean
+   one. The advice stands — pin a count you know, especially for two or three
+   people — but "Auto + fold, then merge on the card" is a sound default for
+   larger calls.
+
+Defaults are therefore unchanged: titanet-small, 0.8, fold 3 %. The harness is
+the way to revisit that on real recordings: a manifest of `{"path",
+"speakers"}` (a count alone is enough; add `"turns"` for DER) is all it needs.
+
+## 11. Sources
 
 - sherpa-onnx diarization docs — <https://k2-fsa.github.io/sherpa/onnx/speaker-diarization/index.html>
 - Pre-trained models, published RTF figures, model sizes —

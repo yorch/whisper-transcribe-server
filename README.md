@@ -132,6 +132,9 @@ Useful flags:
 | `--pin-model`                 | force every job to `--model`, disable the UI selector                                                                       |
 | `--allow-precision-choice`    | expose the precision selector (hidden by default)                                                                           |
 | `--no-diarize`                | remove the speaker-identification control, so the diarization models are never fetched or loaded                             |
+| `--diarization-embedding eres2net-en` | the model that tells voices apart: `titanet-small` (default) or `eres2net-en` (smaller, Apache-2.0)               |
+| `--diarization-threshold 0.8` | how alike two voices must be to merge, on Auto; unset follows the model (0.8 titanet-small, 0.9 eres2net-en)               |
+| `--diarization-fold-share 0.03` | on Auto, fold speakers under this share of the talk time into their neighbours; `0` turns it off                        |
 | `--no-auth`                   | serve without a token                                                                                                       |
 | `--allow-host name`           | accept an extra `Host` header value (repeatable; prefix with `.` for a suffix match, e.g. `.trycloudflare.com`)             |
 | `--max-upload-mb 2048`        | per-file upload ceiling                                                                                                     |
@@ -208,6 +211,8 @@ preload = true
 [diarization]
 # Anything settable by a flag lives in this file too.
 allow_diarize = true
+embedding = "titanet-small"
+fold_share = 0.03
 
 [limits]
 max_upload_mb = 2048
@@ -419,7 +424,13 @@ hour-long recording.
   matter. On two similar voices, or on a video call
   where each remote participant arrives through a different codec, even that can
   merge people or split one person in two. `Speaker 2` appearing for a single
-  line is usually the diarizer being unsure, not a new person.
+  line is usually the diarizer being unsure, not a new person. The subtler
+  failure is the opposite one: when someone's audio changes character mid-call
+  (a headset dropping out, the codec adapting), their lines can be handed to
+  the *other* speaker with the count still right — skim the labels, and merge
+  or relabel on the card. `docs/speaker-diarization.md` section 10 has the
+  measurements behind the defaults, and `scripts/diarize_eval.py` reruns them
+  on your own recordings.
 
   **Merge and name speakers on the card.** A finished, labelled card shows a
   chip per speaker with their talk time. Click one to give it a name — the
