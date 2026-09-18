@@ -499,6 +499,19 @@ def test_work_dir_flag_moves_the_default_config_path(tmp_path, monkeypatch):
     assert args.work_dir == str(tmp_path / "state")
 
 
+def toml_str(value: object) -> str:
+    """A value as a valid TOML *basic* string.
+
+    Interpolating a path straight into double quotes breaks on Windows: the
+    basic string `"C:\\Users\\x"` reads `\\U` as a unicode escape and the file
+    is rejected as invalid TOML. Escaping the backslash (and any quote) is what
+    the format actually requires, and it is the difference between these tests
+    passing on the platform this project targets and not.
+    """
+    escaped = str(value).replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
 def default_config(tmp_path, monkeypatch, body: str) -> Path:
     """Write a config at the *default* location, <home>/.transcribe-server.
 
@@ -532,12 +545,41 @@ def test_work_dir_in_the_default_config_is_a_startup_error(tmp_path, monkeypatch
 def test_work_dir_equal_to_the_config_dir_is_allowed(tmp_path, monkeypatch):
     """A no-op is not a mistake: the file already sits where it says state goes."""
     home = tmp_path / ".transcribe-server"
-    default_config(tmp_path, monkeypatch, f'[server]\nwork_dir = "{home}"\n')
+    default_config(tmp_path, monkeypatch, f"[server]\nwork_dir = {toml_str(home)}\n")
 
     args, path, required = s.resolve_args([])
     assert required is False
     assert path == home / "config.toml"
     assert args.work_dir == str(home)
+
+
+def test_a_windows_path_in_a_config_round_trips(tmp_path, monkeypatch):
+    """A path with backslashes has to survive the config file.
+
+    Interpolated into a TOML basic string unescaped it does not: `\\U` reads as a
+    unicode escape and the file is rejected before the server starts. This is the
+    platform the project targets, so the capability is worth pinning rather than
+    leaving to whichever machine runs the suite.
+    """
+    monkeypatch.delenv("TRANSCRIBE_CONFIG", raising=False)
+    win = r"C:\Users\somebody\.transcribe-server"
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(f"[server]\nwork_dir = {toml_str(win)}\n", encoding="utf-8")
+
+    args, _, _ = s.resolve_args(["--config", str(cfg)])
+
+    assert args.work_dir == win
+
+
+def test_a_windows_path_in_a_literal_toml_string_also_works(tmp_path, monkeypatch):
+    """Single quotes are the friendlier form for a path; they must work too."""
+    monkeypatch.delenv("TRANSCRIBE_CONFIG", raising=False)
+    cfg = tmp_path / "config.toml"
+    cfg.write_text("[server]\nwork_dir = 'C:\\Users\\somebody\\state'\n", encoding="utf-8")
+
+    args, _, _ = s.resolve_args(["--config", str(cfg)])
+
+    assert args.work_dir == r"C:\Users\somebody\state"
 
 
 def test_work_dir_from_the_environment_settles_the_default_config(
@@ -560,7 +602,7 @@ def test_work_dir_in_an_explicit_config_is_allowed(tmp_path, monkeypatch):
     monkeypatch.delenv("TRANSCRIBE_WORK_DIR", raising=False)
     elsewhere = tmp_path / "elsewhere"
     cfg = tmp_path / "etc.toml"
-    cfg.write_text(f'[server]\nwork_dir = "{elsewhere}"\n')
+    cfg.write_text(f"[server]\nwork_dir = {toml_str(elsewhere)}\n")
 
     args, path, required = s.resolve_args(["--config", str(cfg)])
     assert (path, required) == (cfg, True)
