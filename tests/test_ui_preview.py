@@ -1221,6 +1221,24 @@ def test_labels_arriving_at_the_end_redraw_the_transcript_once():
 
 
 @needs_node
+def test_the_speaker_column_only_takes_room_once_there_are_labels():
+    """An unlabelled transcript drew an empty 9ch column between every timestamp
+    and its text. The transcript says whether it is labelled; CSS hides the
+    column when it is not."""
+    probe = preview_probe(
+        """
+        const h = makeView();
+        appendSegments(h.view, [seg(0, "one")], true, 1, false);
+        const before = [...h.marks];
+        appendSegments(h.view, [Object.assign(seg(0, "one"), {speaker: 1})], false, 1, true);
+        return {before, after: [...h.marks]};
+        """
+    )
+    assert "labeled" not in probe["before"]
+    assert "labeled" in probe["after"]
+
+
+@needs_node
 def test_the_speaker_gutter_does_not_disturb_unlabelled_rows():
     rows = preview_probe(
         """

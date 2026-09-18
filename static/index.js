@@ -567,6 +567,9 @@ function appendSegments(view, segments, live, total, labeled){
     view.labeled = labeled;
     rebuilt = true;
   }
+  /* The speaker column only takes room once there is something in it: a 9ch
+     gap between every timestamp and its text read as broken layout. */
+  view.transcript.classList.toggle("labeled", !!view.labeled);
   for(const seg of segments){
     const row = document.createElement("div");
     row.className = "seg";

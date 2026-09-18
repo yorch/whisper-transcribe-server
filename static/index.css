@@ -284,6 +284,8 @@
     overflow:hidden;text-overflow:ellipsis;white-space:nowrap;user-select:none;
   }
 
+  .transcript:not(.labeled) .seg .sp{display:none}
+
   .seg .sp.s0{color:var(--amber)}
 
   .seg .sp.s1{color:var(--red)}
