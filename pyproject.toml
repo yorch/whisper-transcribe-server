@@ -1,0 +1,81 @@
+# The development environment, not how the server is run.
+#
+# transcribe_server.py is still a PEP 723 script: its inline `# /// script`
+# block is what `uv run transcribe_server.py`, the tray launcher and the Windows
+# build resolve, and uv keeps using it with this file present (a script with
+# inline metadata ignores the enclosing project). This file exists so that
+# `uv sync` builds one locked environment for the tests, ruff and pyright.
+#
+# The runtime dependencies below are a copy of that inline block, and
+# tests/test_project_metadata.py fails if the two disagree. Change both.
+
+[project]
+name = "whisper-transcribe-server"
+version = "0.0.0"
+description = "Drag-and-drop Whisper transcription served over your LAN."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.27",
+    "python-multipart>=0.0.9",
+    "faster-whisper>=1.0.3",
+    "numpy>=1.24",
+    "sherpa-onnx>=1.13.8",
+    "tomli>=2; python_version < '3.11'",
+    "nvidia-cublas-cu12; sys_platform != 'darwin'",
+    "nvidia-cudnn-cu12>=9,<10; sys_platform != 'darwin'",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "httpx>=0.27",
+    "ruff>=0.6",
+    "pyright>=1.1.380",
+    # The tray launcher's own inline dependencies, so pyright can resolve its
+    # imports; launcher/transcribe_tray.py still declares them for itself.
+    "pystray>=0.19",
+    "pillow>=10",
+]
+
+[tool.uv]
+# A script and its tests, not an installable package: nothing to build.
+package = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "B", "UP", "S", "ASYNC"]
+# The two HTML pages are embedded template strings; their CSS/JS lines are long
+# by nature and wrapping them would only hurt readability.
+ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+# `assert` is how tests assert. S101 targets production code, where an assert
+# can be stripped by -O.
+"tests/*" = ["S101"]
+# Same reasoning for the diarization proof-of-concept scripts: assertions are the
+# right shape for a throwaway probe, and a /tmp default is the point of them —
+# nothing ships from this directory.
+"docs/poc/*" = ["S101", "S108"]
+
+[tool.ruff.lint.flake8-bugbear]
+# File(...) and Form(...) in argument defaults are the FastAPI dependency idiom.
+extend-immutable-calls = ["fastapi.File", "fastapi.Form"]
+
+[tool.pyright]
+# `uv sync` builds .venv here, so pyright resolves imports against the same
+# locked environment the tests run in.
+venvPath = "."
+venv = ".venv"
+pythonVersion = "3.12"
+include = ["transcribe_server.py", "tests", "launcher"]
+exclude = [".venv", "**/__pycache__"]
+reportMissingImports = "error"
+reportMissingTypeStubs = "none"

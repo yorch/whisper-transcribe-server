@@ -58,7 +58,7 @@ The standard recipe is `WhisperX` or `pyannote.audio`. Both are correct and both
 are the wrong shape for this project.
 
 Two constraints drive it. `transcribe_server.py` must stay a **PEP 723
-single-file script** with no `pyproject.toml` (AGENTS.md), and the documented
+single-file script** (AGENTS.md), and the documented
 setup path is "install uv, run it" with no virtualenv. The existing dependency
 set is deliberately PyTorch-free — the README calls this out: *"faster-whisper
 does **not** use PyTorch, so those two packages are the real GPU dependency."*

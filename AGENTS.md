@@ -29,16 +29,20 @@ push failure as a blocker.
 ## Tests
 
 ```bash
-.venv/bin/pytest -q                    # whole suite; no GPU or model needed
-uvx ruff check .                       # configured by ruff.toml
-uvx ruff format --check .              # the formatter that rewrites files post-commit
-uvx pyright --project pyrightconfig.json
+uv sync                                # the locked dev env in .venv (pyproject.toml + uv.lock)
+uv run pytest -q                       # whole suite; no GPU or model needed
+uv run ruff check .                    # configured in pyproject.toml
+uv run ruff format --check .           # the formatter that rewrites files post-commit
+uv run pyright                         # resolves imports against .venv
 ```
 
 The test count is deliberately not quoted: it went 170 → 212 in a single day of
-parallel sessions, and a stale number is worse than none. `uvx ruff format
+parallel sessions, and a stale number is worse than none. `uv run ruff format
 --check .` is the same formatter that rewrites files *after* a commit (see Git
 hygiene above); a clean `ruff check` does not imply a formatted file.
+
+On macOS `tests/test_cuda_bootstrap.py::test_preload_loads_by_absolute_path`
+fails: it asserts Linux `libcublas.so` loading. It is not a regression.
 
 `uv run tests/test_cuda_bootstrap.py` runs the same suite in a throwaway env
 with no `.venv` and no CUDA wheels; the two `tests/test_gpu.py` tests that need
@@ -58,13 +62,13 @@ whatever happens to be installed.
 against a stub DOM) and skips without it; a browser is still the only way to
 check how the preview looks and scrolls for real.
 
-`.venv` is created by hand (see the README's Tests section) and is gitignored.
+`.venv` is built by `uv sync` from the committed `uv.lock`, and is gitignored.
 Tests never start the worker thread, so they queue uploads without loading a
 model or touching a GPU.
 
 Note: pi-lens's own pyright runner does not use the project venv, so it reports
-`fastapi`/`uvicorn`/`pystray`/`PIL` as unresolved imports. `uvx pyright --project
-pyrightconfig.json` is the authoritative check.
+`fastapi`/`uvicorn`/`pystray`/`PIL` as unresolved imports. `uv run pyright` is
+the authoritative check.
 
 ## Packaging
 
@@ -84,11 +88,15 @@ launcher/transcribe_tray.py --self-test --with-server   # also probes a real ser
 
 ## Constraints
 
-- **`transcribe_server.py` stays a PEP 723 script.** Its dependencies live in
-  the inline `# /// script` block. Do **not** add a `pyproject.toml`: it would
-  change how `uv run transcribe_server.py` resolves dependencies and break the
-  documented zero-setup path. `ruff.toml` and `pyrightconfig.json` are fine
-  because they only configure tooling.
+- **`transcribe_server.py` stays a PEP 723 script.** Its inline `# /// script`
+  block is what `uv run transcribe_server.py`, the launcher and the Windows
+  build resolve. `pyproject.toml` is the *dev* environment only: uv ignores the
+  enclosing project for a script with inline metadata (verified on uv 0.12), so
+  the zero-setup path is unaffected. Its `[project] dependencies` are a copy of
+  the inline block; **change both**, then `uv lock`.
+  `tests/test_project_metadata.py` fails if they disagree. Do not turn the
+  project into a package or drop the inline block: the launcher and the
+  PyInstaller build ship the bare script.
 - **The pages live in `static/`**, not in the module. They were extracted from
   embedded string literals to remove ~1,100 lines from the Python file and, more
   importantly, to stop `esc()` — the only thing between a filename and stored
@@ -96,7 +104,8 @@ launcher/transcribe_tray.py --self-test --with-server   # also probes a real ser
   `static/` must sit next to `transcribe_server.py`; a missing directory is a 500
   that says so rather than a blank page. Anything that ships the script (the
   PyInstaller spec, the launcher) has to ship `static/` too.
-- Prefer stdlib. New runtime dependencies must go in the inline metadata.
+- Prefer stdlib. New runtime dependencies go in the inline metadata *and*
+  `pyproject.toml` (see above).
 
 ## Invariants worth not breaking
 

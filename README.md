@@ -664,15 +664,19 @@ allowlist, job state machine and the HTTP surface, including regressions for
 the two most serious bugs found in review (a self-deadlock on cancel, and
 prompt text leaking to an app-token holder).
 
-It needs the runtime dependencies plus `pytest` and `httpx`, which is what the
-`.venv` is for:
+`pyproject.toml` and the committed `uv.lock` describe the development
+environment: the runtime dependencies plus pytest, httpx, ruff and pyright.
+`uv sync` builds it in `.venv`:
 ```bash
-uv venv .venv --python 3.12
-uv pip install --python .venv/bin/python \
-  fastapi "uvicorn[standard]" python-multipart faster-whisper pytest httpx \
-  sherpa-onnx
-.venv/bin/pytest -q
+uv sync
+uv run pytest -q
 ```
+
+That file is for development only. Running the server still goes through the
+script's inline dependencies — uv ignores the surrounding project for a script
+that declares its own — so `uv run transcribe_server.py` is unchanged. The two
+dependency lists are kept identical, and `tests/test_project_metadata.py` fails
+if they drift: add or bump a dependency in both, then `uv lock`.
 
 `sherpa-onnx` is only needed for the opt-in test that loads a real diarization
 model; everything else in the suite stubs it. To run that one, point it at the
@@ -681,21 +685,23 @@ weights and a recording whose speaker count you know:
 ```bash
 TRANSCRIBE_DIARIZE_MODELS=~/.transcribe-server/diarize-models \
 TRANSCRIBE_DIARIZE_AUDIO=meeting.wav TRANSCRIBE_DIARIZE_SPEAKERS=3 \
-  .venv/bin/pytest -q tests/test_diarization.py -k real
+  uv run pytest -q tests/test_diarization.py -k real
 ```
 
-`ruff.toml` and `pyrightconfig.json` point the linters at that same venv:
+The linters are configured in `pyproject.toml` and run from the same
+environment:
 
 ```bash
-uvx ruff check .
-uvx pyright --project pyrightconfig.json
+uv run ruff check .
+uv run ruff format --check .
+uv run pyright
 ```
 
 Tests never start the worker thread, so they queue uploads without loading a
 model or touching a GPU.
 
 `tests/test_cuda_bootstrap.py` gives you a one-command check that needs neither
-that `.venv` nor faster-whisper: it declares its own dependencies inline
+`uv sync` nor faster-whisper: it declares its own dependencies inline
 (pytest, fastapi, httpx, numpy) and runs the whole suite, because the
 model-loading paths are monkeypatched and the CUDA probes stub the loader and
 the driver.
@@ -704,8 +710,8 @@ the driver.
 uv run tests/test_cuda_bootstrap.py
 ```
 
-The `.venv` above is still what `pyright` type-checks against, and it is the
-only environment that exercises a real model load.
+The synced `.venv` is what `pyright` type-checks against, and it is the only
+environment that exercises a real model load.
 
 The launcher has its own self-test, which needs no display and no tray backend:
 

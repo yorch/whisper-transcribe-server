@@ -251,9 +251,9 @@ def build_command(
 ) -> list[str]:
     """The uv invocation that runs the server.
 
-    --no-project keeps uv from adopting a pyproject.toml if one ever appears
-    next to the script; the script's own PEP 723 metadata is the dependency
-    source of truth.
+    --no-project keeps uv from adopting the repo's pyproject.toml, which
+    describes the dev environment; the script's own PEP 723 metadata is the
+    dependency source of truth.
     """
     target = script or server_script()
     return [

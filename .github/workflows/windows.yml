@@ -4,9 +4,9 @@ name: windows
 # available — so this is the only thing that actually verifies it. It also runs
 # the Python suite on Windows, which the author could not do either.
 #
-# Everything here is a plain `uv run`, so it needs no committed lockfile and no
-# pyproject.toml (which would break the documented `uv run transcribe_server.py`
-# path).
+# Everything here is a plain `uv run --no-project`, resolving the scripts'
+# inline dependencies the way users do. pyproject.toml and uv.lock describe the
+# local dev environment and are deliberately not used here.
 
 on:
   push:
@@ -76,9 +76,9 @@ jobs:
         run: uvx ruff check . --output-format github
 
       - name: Type-check
-        # pyrightconfig.json points at .venv, which does not exist here, so the
-        # import resolution it does locally is not reproduced in CI.
-        run: uvx pyright --project pyrightconfig.json
+        # [tool.pyright] in pyproject.toml points at .venv, which is not built
+        # here, so the import resolution it does locally is not reproduced.
+        run: uvx pyright
         continue-on-error: true
 
   build:
