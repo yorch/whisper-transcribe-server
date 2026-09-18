@@ -589,7 +589,14 @@ function render(job){
   meter(view.meter, job);
   view.status.className = job.state === "error" ? "status err" : "status";
   view.status.textContent = statusLine(job);
-  actions(view.actions, job);
+  /* Rebuilt only when the set of buttons changes. A running job renders every
+     poll, and a fresh Cancel under the pointer each time ate any click whose
+     press and release straddled a poll, and threw keyboard focus off it. */
+  const shape = job.state + ":" + !!(RETRY_OK && job.can_retry);
+  if(view.actionShape !== shape){
+    view.actionShape = shape;
+    actions(view.actions, job);
+  }
 
   appendSegments(view, job.segments || [],
                  ["queued","loading","running"].includes(job.state),
@@ -662,7 +669,26 @@ el("jobs").addEventListener("click", async (e) => {
 });
 
 /* ---------- poll ---------- */
-async function tick(){
+/* One poll at a time. tick() is called by the interval and again after every
+   upload, retry and delete, and a poll is several awaits long. Two in flight
+   both read a card's row count before either appended, so both asked for the
+   same tail: the second to land drew rows the first already had, or its shorter
+   total read as a transcript going backwards and wiped the card down to a
+   tail. A call that arrives mid-poll asks for one more pass and waits for it,
+   so "tick() after a DELETE" still means a list read after the DELETE. */
+let polling = null, pollAgain = false;
+
+function tick(){
+  if(polling){ pollAgain = true; return polling; }
+  polling = (async () => {
+    try{
+      do{ pollAgain = false; await poll(); }while(pollAgain);
+    }finally{ polling = null; }
+  })();
+  return polling;
+}
+
+async function poll(){
   if(!unlocked) return;
   try{
     const {jobs} = await (await api("/api/jobs")).json();
@@ -676,10 +702,16 @@ async function tick(){
       views.delete(viewKey(stale));
     }
 
-    for(const summary of jobs){
-      const sig = summary.state + ":" + summary.progress + ":" + summary.segment_count;
+    /* Oldest first, because a new card is prepended: the server lists newest
+       first, and walking that order stacked a reloaded page upside down while
+       a job added afterwards still went on top. */
+    for(const summary of [...jobs].reverse()){
+      /* Phase and message too: fetching the diarization models moves neither
+         the meter nor the segment count, and the card would go on promising an
+         ETA for the whole download. */
+      const sig = [summary.state, summary.phase, summary.message,
+                   summary.progress, summary.segment_count].join(":");
       if(known.get(summary.id) === sig) continue;
-      known.set(summary.id, sig);
 
       /* Ask for only what this card has not seen. A card that lost its rows
          (the job's segments went backwards) starts from zero again. */
@@ -696,14 +728,17 @@ async function tick(){
          a blip answered with an error body). Rendering the body as a job would
          key a card on undefined, which the sweep below — walking real ids —
          could then never remove: a phantom that survives until the page is
-         reloaded. Skip the tick; the next poll no longer lists the job anyway. */
+         reloaded. Skip it; `known` is only written after a render, so the next
+         poll asks again instead of taking this change as seen. */
       if(!detail.ok) continue;
       let full = await detail.json();
       if(!full || full.id !== summary.id) continue;
-      /* Labels arrive in one batch when diarization finishes, and the tail
-         cannot carry them: refetch the whole transcript once when the shape
-         changes, so rows drawn without labels are rebuilt with them. */
-      if(view && full.speaker_labels !== view.labeled && view.shown > 0){
+      /* Two things a tail cannot repair, both answered by one full refetch:
+         labels arriving in one batch when diarization finishes, which rows
+         already drawn do not have, and a transcript that shrank between the
+         list and this read, whose tail from `since` is empty. */
+      if(view && view.shown > 0 && (full.speaker_labels !== view.labeled
+                                    || full.segment_count < since)){
         view.transcript.textContent = "";
         view.shown = 0;
         const again = await api(url + "?since=0");
@@ -712,6 +747,7 @@ async function tick(){
         if(!full || full.id !== summary.id) continue;
       }
       render(full);
+      known.set(summary.id, sig);
     }
   }catch{ /* server blip or 401; next tick retries */ }
 }

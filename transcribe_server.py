@@ -2994,16 +2994,23 @@ def job_detail(job_id: str, since: int = 0) -> dict[str, Any]:
     detail endpoint for anything that is not the polling loop.
     """
     job = get_job(job_id)
+    # One read of the list, and the count, the tail and the label shape all come
+    # from it. The worker swaps in a longer list after every segment instead of
+    # growing this one, so a second read can see a different list -- and a
+    # count from one next to a tail from the other is what the page takes for a
+    # transcript that went backwards.
+    segments = job["segments"]
     out = job_public(job, include_segments=False)
-    total = len(job["segments"])
+    total = len(segments)
     start = clamp(as_int(since, 0), 0, total)
-    out["segments"] = job["segments"][start:]
+    out["segment_count"] = total
+    out["segments"] = segments[start:]
     out["segment_start"] = start
     # Speaker labels land in one batch when the diarization pass finishes, so a
     # tail carrying no new segments would never reveal them. Reporting the shape
     # lets the client notice and refetch, which is the only way it can rebuild
     # rows that were already drawn without labels.
-    out["speaker_labels"] = any(s.get("speaker") is not None for s in job["segments"])
+    out["speaker_labels"] = any(s.get("speaker") is not None for s in segments)
     return out
 
 

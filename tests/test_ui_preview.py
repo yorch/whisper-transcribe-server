@@ -231,17 +231,25 @@ def card_probe(body: str) -> dict:
 POLL_SERVER = """
 const known = new Map();
 let unlocked = true;
+let polling = null, pollAgain = false;
 let polls = [];
 const server = {listed: true, segments: [], state: "running", progress: 0,
-                labeled: false};
+                labeled: false, phase: null, message: ""};
+const seg = (start, text) => ({start, text});
+const cellOf = (row, cls) => (row.children.find(
+  (kid) => kid.className.split(" ").includes(cls)) || {}).textContent || "";
+const texts = (rows) => rows.map(r => cellOf(r, "tx"));
+const speakers = (rows) => rows.map(r => cellOf(r, "sp"));
 async function api(path){
   polls.push(path);
   if(path === "/api/jobs")
     return {ok: true, status: 200, json: async () => ({jobs: server.listed ? [{id: "abc", state: server.state,
-      progress: server.progress, segment_count: server.segments.length}] : []})};
+      progress: server.progress, phase: server.phase, message: server.message,
+      segment_count: server.segments.length}] : []})};
   const since = Number(/since=(\\d+)/.exec(path)[1]);
   return {ok: true, status: 200, json: async () => ({id: "abc", filename: "a.wav", state: server.state,
-    progress: server.progress, opts: {model: "small"}, elapsed: 4, duration: 20,
+    progress: server.progress, phase: server.phase, message: server.message,
+    opts: {model: "small"}, elapsed: 4, duration: 20,
     language: "en", segment_start: since, segment_count: server.segments.length,
     speaker_labels: server.labeled, segments: server.segments.slice(since)})};
 }
@@ -270,6 +278,7 @@ def poll_probe(body: str) -> dict:
                 "createCard",
                 "render",
                 "tick",
+                "poll",
             )
         )
         + "\n(async () => { process.stdout.write(JSON.stringify(await (async () => {"
@@ -393,6 +402,184 @@ def test_several_jobs_at_once_each_keep_one_card():
         "a finished job's transcript must not be rebuilt"
     )
     assert probe["wasQueued"] == [], "a queued job has nothing to show yet"
+
+
+@needs_node
+def test_overlapping_polls_neither_repeat_nor_lose_rows():
+    """tick() runs off the interval and again after every upload, retry and
+    delete, and one poll is several awaits long. Two in flight at once both read
+    the card's row count before either appended, so both asked for the same
+    tail: the second to land drew rows the first already had, or its shorter
+    total looked like a transcript going backwards and wiped the card down to a
+    tail. Either way the operator watched lines repeat or vanish mid-job."""
+    probe = poll_probe(
+        """
+        const first = api;
+        server.segments.push(seg(0, "one"));
+        server.progress = 0.1;
+        await tick();
+        // The first poll's detail read is slow; everything after it is not.
+        let release, held = 0;
+        const gate = new Promise((r) => { release = r; });
+        api = async (path) => {
+          const r = await first(path);
+          const body = await r.json();          // what the server said, then
+          if(path.includes("since=") && held++ === 0) await gate;
+          return {ok: r.ok, status: 200, json: async () => body};
+        };
+        server.segments.push(seg(3, "two"), seg(6, "three"));
+        server.progress = 0.3;
+        const slow = tick();
+        await new Promise((r) => setTimeout(r, 0));
+        // An upload finishes and polls while the interval's poll is waiting.
+        server.segments.push(seg(9, "four"));
+        server.progress = 0.4;
+        const quick = tick();
+        await new Promise((r) => setTimeout(r, 0));
+        release();
+        await Promise.all([slow, quick]);
+        const settled = texts(views.get(viewKey("abc")).transcript.children);
+        server.segments.push(seg(12, "five"));
+        server.progress = 0.5;
+        await tick();
+        return {settled, after: texts(views.get(viewKey("abc")).transcript.children)};
+        """
+    )
+    assert probe["settled"] == ["one", "two", "three", "four"], probe["settled"]
+    assert probe["after"] == ["one", "two", "three", "four", "five"], probe["after"]
+
+
+@needs_node
+def test_a_failed_read_of_the_last_change_is_retried_not_forgotten():
+    """The poll remembered a job's signature before its detail read had
+    succeeded. A finished job's signature never changes again, so one failed
+    read of the final state left the card saying "running" — Cancel button and
+    all — until the page was reloaded."""
+    probe = poll_probe(
+        """
+        const first = api;
+        server.segments.push(seg(0, "one"));
+        server.progress = 0.5;
+        await tick();
+        server.state = "done";
+        server.progress = 1;
+        api = async (path) => path.includes("since=")
+          ? {ok: false, status: 502, json: async () => ({detail: "bad gateway"})}
+          : first(path);
+        await tick();
+        api = first;
+        await tick();
+        const view = views.get(viewKey("abc"));
+        return {status: view.status.textContent,
+                buttons: view.actions.children.map(b => b.textContent)};
+        """
+    )
+    assert probe["status"].startswith("Finished"), probe["status"]
+    assert "Save .txt" in probe["buttons"], probe["buttons"]
+
+
+@needs_node
+def test_a_failed_label_refetch_does_not_leave_an_empty_transcript():
+    """The label refetch clears the rows before it asks for them again. If that
+    request failed, the tick moved on with the signature already recorded, and
+    a finished job was left with a blank transcript for good."""
+    probe = poll_probe(
+        """
+        const first = api;
+        server.segments.push(seg(0, "one"), seg(3, "two"));
+        server.progress = 0.9;
+        await tick();
+        server.segments = [Object.assign(seg(0, "one"), {speaker: 1}),
+                           Object.assign(seg(3, "two"), {speaker: 2})];
+        server.labeled = true;
+        server.state = "done";
+        server.progress = 1;
+        api = async (path) => path.includes("since=0")
+          ? {ok: false, status: 502, json: async () => ({})}
+          : first(path);
+        await tick();
+        api = first;
+        await tick();
+        const rows = views.get(viewKey("abc")).transcript.children;
+        return {texts: texts(rows), speakers: speakers(rows)};
+        """
+    )
+    assert probe["texts"] == ["one", "two"], probe
+    assert probe["speakers"] == ["Speaker 1", "Speaker 2"], probe
+
+
+@needs_node
+def test_a_phase_change_without_progress_still_reaches_the_status_line():
+    """Fetching the diarization models moves the job into its second pass
+    without moving the meter, and the poll only re-read a job whose state,
+    progress or segment count changed. The card kept promising "about 0s left"
+    for the whole 42 MB download instead of saying what it was doing."""
+    probe = poll_probe(
+        """
+        server.segments.push(seg(0, "one"));
+        server.progress = 0.9;
+        await tick();
+        const before = views.get(viewKey("abc")).status.textContent;
+        server.phase = "diarizing";
+        server.message = "Fetching diarization models";
+        await tick();
+        return {before, after: views.get(viewKey("abc")).status.textContent};
+        """
+    )
+    assert probe["before"].startswith("90%"), probe
+    assert probe["after"] == "Fetching diarization models", probe
+
+
+@needs_node
+def test_cards_are_newest_first_on_load_and_after_a_new_upload():
+    """The server lists newest first and each new card is prepended, so walking
+    the list in order stacked a reloaded page oldest-first — while a job added
+    afterwards still went on top. Same jobs, two different orders."""
+    probe = poll_probe(
+        """
+        const listed = ["mid", "old"];          // newest first, as the server sends
+        api = async (path) => {
+          if(path === "/api/jobs")
+            return {ok: true, json: async () => ({jobs: listed.map(id => (
+              {id, state: "done", progress: 1, segment_count: 0}))})};
+          const id = /\\/api\\/jobs\\/([^?]+)/.exec(path)[1];
+          return {ok: true, json: async () => ({id, filename: id + ".wav", state: "done",
+            progress: 1, opts: {model: "m"}, segment_count: 0, segments: [],
+            speaker_labels: false, elapsed: 1, duration: 1, language: "en"})};
+        };
+        await tick();
+        const loaded = jobsBox.children.map(n => n.id);
+        listed.unshift("new");
+        await tick();
+        return {loaded, added: jobsBox.children.map(n => n.id)};
+        """
+    )
+    assert probe["loaded"] == ["job-mid", "job-old"], probe
+    assert probe["added"] == ["job-new", "job-mid", "job-old"], probe
+
+
+@needs_node
+def test_a_running_job_keeps_its_cancel_button_between_polls():
+    """The action buttons were rebuilt on every render, which for a running job
+    is every poll. A click whose press and release straddled a poll landed on
+    two different buttons and did nothing, and keyboard focus on Cancel was
+    thrown away every 1.2 seconds."""
+    probe = card_probe(
+        """
+        const job = (progress) => ({id: "r", filename: "x", state: "running",
+          progress, opts: {model: "m"}, segments: [], segment_count: 0});
+        render(job(0.2));
+        const view = views.get(viewKey("r"));
+        const first = view.actions.children[0];
+        render(job(0.3));
+        const same = view.actions.children[0] === first;
+        render(Object.assign(job(1), {state: "done", elapsed: 3, duration: 3,
+                                      language: "en"}));
+        return {same, done: view.actions.children.map(b => b.textContent)};
+        """
+    )
+    assert probe["same"], "a progress step must not rebuild the Cancel button"
+    assert probe["done"][0] == "Copy text", "a state change must still rebuild them"
 
 
 # --------------------------------------------------------------------------- #
@@ -1499,11 +1686,11 @@ def test_the_poll_asks_for_a_tail_and_the_renderer_passes_the_total():
 def test_the_poll_refetches_from_zero_when_labels_land():
     """A tail cannot rebuild rows drawn without speakers, so the shape change
     has to trigger one full refetch."""
-    tick = function_source("tick")
-    assert "full.speaker_labels !== view.labeled" in tick, (
-        "tick() must notice the label shape changing"
+    poll = function_source("poll")
+    assert "full.speaker_labels !== view.labeled" in poll, (
+        "poll() must notice the label shape changing"
     )
-    assert '"?since=0"' in tick, "and refetch the whole transcript once"
+    assert '"?since=0"' in poll, "and refetch the whole transcript once"
 
 
 def test_the_server_reports_the_label_shape(configured, client):
@@ -1526,10 +1713,33 @@ def test_the_server_reports_the_label_shape(configured, client):
     assert body["segments"] == [], "the tail is empty; the flag is the only signal"
 
 
+def test_a_detail_read_is_one_snapshot_even_while_the_worker_appends(
+    configured, client, monkeypatch
+):
+    """The worker replaces job["segments"] with a longer list after every
+    segment, without waiting for readers. The detail endpoint took the count in
+    job_public() and the tail from a second read, so a segment landing in
+    between answered "3 segments" alongside a tail that ran to 4. The page reads
+    a count below what it holds as a transcript that went backwards, and wiped
+    the card down to its tail."""
+    job_id = _three_segment_job(configured)
+    real = s.job_public
+
+    def worker_appends_meanwhile(job, include_segments=True):
+        out = real(job, include_segments)
+        job["segments"] = [*job["segments"], {"start": 3.0, "end": 4.0, "text": "4th"}]
+        return out
+
+    monkeypatch.setattr(s, "job_public", worker_appends_meanwhile)
+    body = client.get(f"/api/jobs/{job_id}?since=1").json()
+
+    assert body["segment_count"] == body["segment_start"] + len(body["segments"]), body
+
+
 def test_the_page_never_refetches_the_whole_transcript_on_a_tick():
     """Guards against the regression this change exists to fix."""
-    tick = function_source("tick")
-    assert "?since=" in tick, "tick() must be incremental"
+    poll = function_source("poll")
+    assert "?since=" in poll, "poll() must be incremental"
     assert (
-        re.search(r'api\("/api/jobs/" \+ encodeURIComponent\([^)]*\)\)', tick) is None
-    ), "tick() must not fetch the full detail endpoint any more"
+        re.search(r'api\("/api/jobs/" \+ encodeURIComponent\([^)]*\)\)', poll) is None
+    ), "poll() must not fetch the full detail endpoint any more"
