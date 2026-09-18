@@ -1557,6 +1557,14 @@ diarize_threads = lambda: clamp(os.cpu_count() or 1, 1, 4)  # noqa: E731
 # -- 4/4 at 0.8 and 0.9, and 3/4 at 1.0, which merges the four-speaker file
 # down to three. 0.8 is the safe end of the plateau that is right on all four.
 DIARIZE_THRESHOLD = 0.8
+
+# On Auto, a speaker holding less than this share of the talk time is folded
+# into the voice nearest it in time. Call audio is where Auto over-counts: a
+# two-person Zoom call came back as five speakers, the extra three a laugh, a
+# cough and a raised voice holding seconds each. A pinned count is never
+# folded -- the operator said how many there were. The price is a real person
+# who says one line in a long meeting; pinning the count is the way out.
+DIARIZE_FOLD_SHARE = 0.03
 DIARIZE_MIN_DURATION_ON = 0.3
 DIARIZE_MIN_DURATION_OFF = 0.5
 
@@ -1787,6 +1795,42 @@ def relabel_speakers(turns: list[dict[str, Any]]) -> list[dict[str, Any]]:
             }
         )
     return out
+
+
+def fold_minor_speakers(
+    turns: list[dict[str, Any]], min_share: float
+) -> tuple[list[dict[str, Any]], int]:
+    """Fold speakers under `min_share` of the talk time into their neighbours.
+
+    Each turn of a minor speaker goes to the kept speaker whose turn is nearest
+    it in time, and the result is renumbered by first appearance. Returns the
+    turns and how many speakers were folded. The loudest speaker is always
+    kept, so the transcript never ends up with nobody in it.
+    """
+    talk: dict[int, float] = {}
+    for t in turns:
+        speaker = int(t["speaker"])
+        talk[speaker] = talk.get(speaker, 0.0) + max(0.0, t["end"] - t["start"])
+    total = sum(talk.values())
+    if min_share <= 0 or len(talk) < 2 or total <= 0:
+        return relabel_speakers(turns), 0
+    minor = {sp for sp, seconds in talk.items() if seconds / total < min_share}
+    minor.discard(max(talk, key=lambda sp: talk[sp]))
+    if not minor:
+        return relabel_speakers(turns), 0
+
+    kept = [t for t in turns if int(t["speaker"]) not in minor]
+
+    def gap(a: dict[str, Any], b: dict[str, Any]) -> float:
+        return max(0.0, b["start"] - a["end"], a["start"] - b["end"])
+
+    out = []
+    for t in turns:
+        if int(t["speaker"]) in minor:
+            nearest = min(kept, key=lambda k: (gap(t, k), k["start"]))
+            t = {**t, "speaker": nearest["speaker"]}
+        out.append(t)
+    return relabel_speakers(out), len(minor)
 
 
 def speaker_label(speaker: int) -> str:
@@ -2188,6 +2232,7 @@ def label_and_finish(
     # job still finishes, unlabelled, and says why. Losing an hour of
     # transcription because a 42 MB download failed would be absurd.
     diarize_note: str | None = None
+    folded = 0
     if opts["diarize"] and collected:
         diarize_started = time.time()
         try:
@@ -2208,6 +2253,8 @@ def label_and_finish(
             if not turns:
                 diarize_note = "the diarizer found no speech"
             else:
+                if not opts["speakers"]:
+                    turns, folded = fold_minor_speakers(turns, DIARIZE_FOLD_SHARE)
                 before = len(collected)
                 # Kept as Whisper produced it, before alignment split lines at
                 # speaker changes: relabelling with another count starts from
@@ -2230,6 +2277,7 @@ def label_and_finish(
                     embedding=DIARIZE_MODELS["embedding"]["file"],
                     requested=opts["speakers"],
                     threshold=DIARIZE_THRESHOLD,
+                    folded=folded,
                     speakers=len(
                         {
                             speaker
@@ -2243,6 +2291,8 @@ def label_and_finish(
                 )
 
     message = f"{len(collected)} segments"
+    if folded:
+        message += f" \u00b7 {folded} minor voice{'s' if folded > 1 else ''} folded"
     if diarize_note:
         message += f" \u00b7 no speaker labels ({diarize_note})"
 

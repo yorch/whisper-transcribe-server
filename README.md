@@ -412,7 +412,11 @@ hour-long recording.
   threshold tuned on a handful of recordings: call audio in particular (Zoom,
   Teams) tends to make one voice sound like several, and a two-person call can
   come back as five speakers. Pinned to the real number it is much more
-  reliable. On two similar voices, or on a video call
+  reliable. On Auto, a "speaker" holding under 3% of the talk time is folded
+  into the voice nearest it in time — usually a laugh or a raised voice heard
+  as someone new — and the job says how many were folded. That can also fold a
+  real person who says one line in a long meeting; pin the count if they
+  matter. On two similar voices, or on a video call
   where each remote participant arrives through a different codec, even that can
   merge people or split one person in two. `Speaker 2` appearing for a single
   line is usually the diarizer being unsure, not a new person.

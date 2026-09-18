@@ -59,6 +59,8 @@ class Configured:
             overrides.get("word_timestamps", "false"),
             overrides.get("min_silence_ms", 2000),
             overrides.get("speech_pad_ms", 400),
+            overrides.get("diarize", "false"),
+            overrides.get("speakers", 0),
         )
         return s.new_job(name, path, opts)
 
