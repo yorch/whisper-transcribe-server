@@ -55,7 +55,7 @@ import uuid
 from collections import OrderedDict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any
 from urllib.parse import quote
 
 import uvicorn
@@ -63,13 +63,13 @@ import uvicorn
 try:  # tomllib is 3.11+; the inline dependency covers older interpreters
     import tomllib
 
-    def load_toml(text: str) -> Dict[str, Any]:
+    def load_toml(text: str) -> dict[str, Any]:
         return tomllib.loads(text)
 
 except ModuleNotFoundError:  # pragma: no cover - 3.10 only
     import tomli
 
-    def load_toml(text: str) -> Dict[str, Any]:
+    def load_toml(text: str) -> dict[str, Any]:
         return tomli.loads(text)
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
@@ -96,9 +96,9 @@ UPLOAD_DIR = WORK_DIR / "uploads"
 
 # Set in main(). Requests are refused until then, so importing this module and
 # serving `app` directly from an ASGI server fails closed rather than open.
-ARGS: Optional[argparse.Namespace] = None
-ALLOWED_HOSTS: Set[str] = set()
-ALLOWED_SUFFIXES: Set[str] = set()  # entries like ".trycloudflare.com"
+ARGS: argparse.Namespace | None = None
+ALLOWED_HOSTS: set[str] = set()
+ALLOWED_SUFFIXES: set[str] = set()  # entries like ".trycloudflare.com"
 
 SAFE_JOB_ID = re.compile(r"[A-Za-z0-9_-]{1,64}")
 
@@ -106,13 +106,13 @@ SAFE_JOB_ID = re.compile(r"[A-Za-z0-9_-]{1,64}")
 # Job store
 # --------------------------------------------------------------------------- #
 
-JOBS: Dict[str, Dict[str, Any]] = {}
+JOBS: dict[str, dict[str, Any]] = {}
 JOBS_LOCK = threading.Lock()
-JOB_QUEUE: "queue.Queue[str]" = queue.Queue()
+JOB_QUEUE: queue.Queue[str] = queue.Queue()
 
 # LRU, capped by --model-cache. Uncapped, a client walking the model and
 # precision dropdowns would pin every combination in VRAM at once.
-_MODEL_CACHE: "OrderedDict[tuple, Any]" = OrderedDict()
+_MODEL_CACHE: OrderedDict[tuple, Any] = OrderedDict()
 _MODEL_LOCK = threading.Lock()
 
 
@@ -130,7 +130,7 @@ def redact(text: str, limit: int = 300) -> str:
 # --------------------------------------------------------------------------- #
 
 
-def digest(value: str) -> Optional[str]:
+def digest(value: str) -> str | None:
     """Hash for correlating repeated prompts without storing them in the main log."""
     if not value:
         return None
@@ -162,8 +162,8 @@ class AuditLog:
         self.retain_days = max(0, retain_days)
         self.store_prompts = prompts
         self._lock = threading.Lock()
-        self._fh: Optional[Any] = None
-        self._day: Optional[str] = None
+        self._fh: Any | None = None
+        self._day: str | None = None
         self._warned = False
 
     # -- writing ---------------------------------------------------------- #
@@ -187,7 +187,7 @@ class AuditLog:
     def emit(self, event: str, **fields: Any) -> None:
         if not self.enabled:
             return
-        record: Dict[str, Any] = {
+        record: dict[str, Any] = {
             "ts": datetime.now(timezone.utc)
             .isoformat(timespec="milliseconds")
             .replace("+00:00", "Z"),
@@ -206,7 +206,7 @@ class AuditLog:
         except Exception as exc:  # noqa: BLE001
             self._warn_once("write", exc)
 
-    def write_prompt(self, job_id: str, payload: Dict[str, Any]) -> None:
+    def write_prompt(self, job_id: str, payload: dict[str, Any]) -> None:
         if not (self.enabled and self.store_prompts):
             return
         if not SAFE_JOB_ID.fullmatch(job_id):
@@ -224,7 +224,7 @@ class AuditLog:
         except Exception as exc:  # noqa: BLE001
             self._warn_once("sidecar write", exc)
 
-    def read_prompt(self, job_id: str) -> Optional[Dict[str, Any]]:
+    def read_prompt(self, job_id: str) -> dict[str, Any] | None:
         if not SAFE_JOB_ID.fullmatch(job_id):
             return None
         try:
@@ -236,7 +236,7 @@ class AuditLog:
 
     # -- reading ---------------------------------------------------------- #
 
-    def dates(self) -> List[str]:
+    def dates(self) -> list[str]:
         try:
             return sorted(
                 (p.stem[len("audit-") :] for p in self.dir.glob("audit-*.jsonl")),
@@ -250,9 +250,9 @@ class AuditLog:
         day: str,
         limit: int = 200,
         offset: int = 0,
-        job: Optional[str] = None,
-        needle: Optional[str] = None,
-    ) -> Tuple[List[str], int]:
+        job: str | None = None,
+        needle: str | None = None,
+    ) -> tuple[list[str], int]:
         """Return (raw lines newest-first, total matching) for one day."""
         try:
             fh = (self.dir / f"audit-{day}.jsonl").open(
@@ -260,7 +260,7 @@ class AuditLog:
             )
         except OSError:
             return [], 0
-        lines: List[str] = []
+        lines: list[str] = []
         low = needle.lower() if needle else None
         with fh:
             for raw in fh:
@@ -282,14 +282,14 @@ class AuditLog:
 
     # -- retention -------------------------------------------------------- #
 
-    def prune(self) -> List[str]:
+    def prune(self) -> list[str]:
         """Delete day files and sidecars past retain_days. 0 keeps everything."""
         if self.retain_days <= 0:
             return []
         cutoff = (
             datetime.now(timezone.utc) - timedelta(days=self.retain_days)
         ).strftime("%Y-%m-%d")
-        removed: List[str] = []
+        removed: list[str] = []
         for path in self.dir.glob("audit-*.jsonl"):
             if path.stem[len("audit-") :] < cutoff:
                 removed.append(self._unlink(path))
@@ -305,7 +305,7 @@ class AuditLog:
         return [name for name in removed if name]
 
     @staticmethod
-    def _unlink(path: Path) -> Optional[str]:
+    def _unlink(path: Path) -> str | None:
         try:
             path.unlink()
             return path.name
@@ -313,10 +313,10 @@ class AuditLog:
             return None
 
 
-AUDIT: Optional[AuditLog] = None
+AUDIT: AuditLog | None = None
 
 
-def request_fields(request: Request) -> Dict[str, Any]:
+def request_fields(request: Request) -> dict[str, Any]:
     """Who and from where, without treating proxy headers as fact.
 
     Behind a tunnel the TCP peer is always localhost, so the address the proxy
@@ -337,7 +337,7 @@ def request_fields(request: Request) -> Dict[str, Any]:
     }
 
 
-def audit(event: str, request: Optional[Request] = None, **fields: Any) -> None:
+def audit(event: str, request: Request | None = None, **fields: Any) -> None:
     """Record one event. Never raises, never blocks a response."""
     if AUDIT is None:
         return
@@ -350,7 +350,7 @@ def audit(event: str, request: Optional[Request] = None, **fields: Any) -> None:
     AUDIT.emit(event, **fields)
 
 
-def audit_opts(opts: Dict[str, Any]) -> Dict[str, Any]:
+def audit_opts(opts: dict[str, Any]) -> dict[str, Any]:
     """Job options for the main log: knobs verbatim, prompt text only hashed."""
     out = {k: v for k, v in opts.items() if k not in ("prompt", "hotwords")}
     out["prompt_len"] = len(opts["prompt"])
@@ -363,9 +363,9 @@ def audit_opts(opts: Dict[str, Any]) -> Dict[str, Any]:
 def store_prompt_sidecar(
     job_id: str,
     filename: str,
-    opts: Dict[str, Any],
+    opts: dict[str, Any],
     source: str,
-    from_job: Optional[str] = None,
+    from_job: str | None = None,
 ) -> None:
     if AUDIT is None or not (opts["prompt"] or opts["hotwords"]):
         return
@@ -385,7 +385,7 @@ def store_prompt_sidecar(
     )
 
 
-def new_job(filename: str, path: Path, opts: Dict[str, Any]) -> str:
+def new_job(filename: str, path: Path, opts: dict[str, Any]) -> str:
     job_id = uuid.uuid4().hex[:12]
     with JOBS_LOCK:
         JOBS[job_id] = {
@@ -414,7 +414,7 @@ def patch_job(job_id: str, **fields) -> None:
             job.update(fields)
 
 
-def get_job(job_id: str) -> Dict[str, Any]:
+def get_job(job_id: str) -> dict[str, Any]:
     with JOBS_LOCK:
         job = JOBS.get(job_id)
         if job is None:
@@ -428,7 +428,7 @@ def source_shared(path: str, exclude_id: str) -> bool:
         return any(j["path"] == path and j["id"] != exclude_id for j in JOBS.values())
 
 
-def drop_source(job: Dict[str, Any]) -> None:
+def drop_source(job: dict[str, Any]) -> None:
     if ARGS and ARGS.source_retention == "forever":
         return
     if source_shared(job["path"], job["id"]):
@@ -442,7 +442,7 @@ def drop_source(job: Dict[str, Any]) -> None:
 def prune_jobs() -> None:
     """Keep memory bounded: evict the oldest finished jobs past the cap."""
     cap = ARGS.max_jobs if ARGS else 60
-    evicted: List[Dict[str, Any]] = []
+    evicted: list[dict[str, Any]] = []
     with JOBS_LOCK:
         if len(JOBS) <= cap:
             return
@@ -466,7 +466,7 @@ def prune_jobs() -> None:
         )
 
 
-def job_public(job: Dict[str, Any], include_segments: bool = True) -> Dict[str, Any]:
+def job_public(job: dict[str, Any], include_segments: bool = True) -> dict[str, Any]:
     out = {k: v for k, v in job.items() if k not in ("path", "segments")}
     now = time.time()
     started = job.get("started")
@@ -491,8 +491,8 @@ def clamp(value: int, low: int, high: int) -> int:
 
 
 def build_opts(
-    model: Optional[str],
-    compute_type: Optional[str],
+    model: str | None,
+    compute_type: str | None,
     language: str,
     vad: str,
     quality: str,
@@ -503,7 +503,7 @@ def build_opts(
     word_timestamps: str,
     min_silence_ms: int,
     speech_pad_ms: int,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Validate everything a client can influence. Pinned knobs ignore the client."""
     truthy = lambda v: str(v).lower() in ("1", "true", "yes", "on")  # noqa: E731
 
@@ -581,8 +581,8 @@ def load_model(name: str, device: str, compute_type: str):
         return model
 
 
-def transcribe_kwargs(opts: Dict[str, Any]) -> Dict[str, Any]:
-    kwargs: Dict[str, Any] = {
+def transcribe_kwargs(opts: dict[str, Any]) -> dict[str, Any]:
+    kwargs: dict[str, Any] = {
         "beam_size": opts["beam_size"],
         "language": opts["language"] or None,
         "task": "translate" if opts["translate"] else "transcribe",
@@ -649,9 +649,9 @@ def run_job(job_id: str) -> None:
             duration=round(duration, 2),
         )
 
-        collected: List[Dict[str, Any]] = []
+        collected: list[dict[str, Any]] = []
         for seg in segments:
-            entry: Dict[str, Any] = {
+            entry: dict[str, Any] = {
                 "start": round(seg.start, 2),
                 "end": round(seg.end, 2),
                 "text": seg.text.strip(),
@@ -756,7 +756,7 @@ def _stamp(seconds: float, comma: bool = False) -> str:
     return f"{h:02d}:{m:02d}:{s:02d}{sep}{ms:03d}"
 
 
-def render(job: Dict[str, Any], fmt: str) -> tuple[str, str]:
+def render(job: dict[str, Any], fmt: str) -> tuple[str, str]:
     """Return (body, mime) for the requested format."""
     segs = job["segments"]
 
@@ -829,7 +829,7 @@ def normalize_host(raw: str) -> str:
     return host.rstrip(".").strip()
 
 
-def host_allowed(header: Optional[str]) -> bool:
+def host_allowed(header: str | None) -> bool:
     """Reject DNS-rebinding: only hostnames we expect may address this server."""
     if not header:
         return False
@@ -945,7 +945,7 @@ def audit_ui() -> str:
 
 
 @app.get("/api/status")
-def status() -> Dict[str, Any]:
+def status() -> dict[str, Any]:
     gpu = None
     try:
         import ctranslate2
@@ -1008,7 +1008,7 @@ async def create_job(
     word_timestamps: str = Form("false"),
     min_silence_ms: int = Form(2000),
     speech_pad_ms: int = Form(400),
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     opts = build_opts(
         model,
         compute_type,
@@ -1093,7 +1093,7 @@ async def retry_job(
     word_timestamps: str = Form("false"),
     min_silence_ms: int = Form(2000),
     speech_pad_ms: int = Form(400),
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Re-run the same source audio with different settings, no re-upload."""
     old = get_job(job_id)
     source = Path(old["path"])
@@ -1146,19 +1146,19 @@ async def retry_job(
 
 
 @app.get("/api/jobs")
-def list_jobs() -> Dict[str, Any]:
+def list_jobs() -> dict[str, Any]:
     with JOBS_LOCK:
         jobs = sorted(JOBS.values(), key=lambda j: j["created"], reverse=True)
         return {"jobs": [job_public(j, include_segments=False) for j in jobs]}
 
 
 @app.get("/api/jobs/{job_id}")
-def job_detail(job_id: str) -> Dict[str, Any]:
+def job_detail(job_id: str) -> dict[str, Any]:
     return job_public(get_job(job_id))
 
 
 @app.delete("/api/jobs/{job_id}")
-def delete_job(job_id: str, request: Request) -> Dict[str, Any]:
+def delete_job(job_id: str, request: Request) -> dict[str, Any]:
     job = get_job(job_id)
     if job["state"] in ("queued", "loading", "running"):
         patch_job(job_id, state="cancelled", message="Cancelled")
@@ -1224,7 +1224,7 @@ def audit_query(
     job: str = "",
     q: str = "",
     include_prompts: int = 0,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     if AUDIT is None:
         raise HTTPException(status_code=503, detail="Audit trail unavailable")
 
@@ -1244,7 +1244,7 @@ def audit_query(
     needle = q.strip() or None
     raw, total = AUDIT.read(day, limit=limit, offset=offset, job=job or None, needle=needle)
 
-    events: List[Dict[str, Any]] = []
+    events: list[dict[str, Any]] = []
     for line in raw:
         try:
             events.append(json.loads(line))
@@ -1281,7 +1281,7 @@ def audit_query(
 
 
 @app.get("/api/audit/prompts/{job_id}")
-def audit_prompt(job_id: str, request: Request) -> Dict[str, Any]:
+def audit_prompt(job_id: str, request: Request) -> dict[str, Any]:
     if AUDIT is None:
         raise HTTPException(status_code=503, detail="Audit trail unavailable")
     side = AUDIT.read_prompt(job_id)
@@ -2330,7 +2330,7 @@ el("auto").addEventListener("change", schedule);
 # --------------------------------------------------------------------------- #
 
 
-def local_names(bind_host: str, extra: List[str]) -> tuple[Set[str], Set[str]]:
+def local_names(bind_host: str, extra: list[str]) -> tuple[set[str], set[str]]:
     """Hostnames this server will answer to. Anything else is a rebinding attempt.
 
     Returns (exact_names, suffixes). A --allow-host entry starting with
@@ -2338,7 +2338,7 @@ def local_names(bind_host: str, extra: List[str]) -> tuple[Set[str], Set[str]]:
     covers the random hostnames `cloudflared tunnel --url` hands out.
     """
     names = {"localhost", "127.0.0.1", "::1", "0.0.0.0"}
-    suffixes: Set[str] = set()
+    suffixes: set[str] = set()
     try:
         hostname = socket.gethostname()
         names.add(hostname.lower())
@@ -2372,7 +2372,7 @@ def local_names(bind_host: str, extra: List[str]) -> tuple[Set[str], Set[str]]:
 # Every option the server understands. Config file keys, flag names and env
 # vars all resolve into this shape; anything not listed here is rejected rather
 # than silently ignored.
-DEFAULTS: Dict[str, Any] = {
+DEFAULTS: dict[str, Any] = {
     "config": None,
     "work_dir": None,
     "host": "0.0.0.0",
@@ -2400,7 +2400,7 @@ DEFAULTS: Dict[str, Any] = {
     "audit_token": "",
 }
 
-CHOICES: Dict[str, List[str]] = {
+CHOICES: dict[str, list[str]] = {
     "model": MODELS,
     "device": ["cuda", "cpu", "auto"],
     "compute_type": COMPUTE_TYPES,
@@ -2410,7 +2410,7 @@ CHOICES: Dict[str, List[str]] = {
 
 # Environment wins over both the config file and the flags, so a service
 # wrapper can override whatever is on disk without rewriting it.
-ENV_OPTIONS: Dict[str, Tuple[str, str]] = {
+ENV_OPTIONS: dict[str, tuple[str, str]] = {
     "TRANSCRIBE_CONFIG": ("config", "str"),
     "TRANSCRIBE_WORK_DIR": ("work_dir", "str"),
     "TRANSCRIBE_HOST": ("host", "str"),
@@ -2443,7 +2443,7 @@ def as_bool(value: Any) -> bool:
     return str(value).strip().lower() in ("1", "true", "yes", "on")
 
 
-def as_list(value: Any) -> List[str]:
+def as_list(value: Any) -> list[str]:
     if isinstance(value, (list, tuple)):
         return [str(v) for v in value]
     return [part.strip() for part in str(value).split(",") if part.strip()]
@@ -2452,7 +2452,7 @@ def as_list(value: Any) -> List[str]:
 CONVERTERS = {"str": str, "int": int, "bool": as_bool, "list": as_list}
 
 
-def config_path(explicit: Optional[str]) -> Tuple[Path, bool]:
+def config_path(explicit: str | None) -> tuple[Path, bool]:
     """Return (path, required). Only an explicit path must exist."""
     if explicit:
         return Path(explicit).expanduser(), True
@@ -2466,7 +2466,7 @@ def config_path(explicit: Optional[str]) -> Tuple[Path, bool]:
 
 # Natural spellings for options whose flat name carries its section, so
 # [audit] reads = true means audit_reads. The bare name still works too.
-CONFIG_ALIASES: Dict[str, str] = {
+CONFIG_ALIASES: dict[str, str] = {
     "audit.enabled": "audit",
     "audit.reads": "audit_reads",
     "audit.dir": "audit_dir",
@@ -2476,7 +2476,7 @@ CONFIG_ALIASES: Dict[str, str] = {
 }
 
 
-def load_config_file(path: Path, required: bool) -> Dict[str, Any]:
+def load_config_file(path: Path, required: bool) -> dict[str, Any]:
     """Flatten [section] tables into one dict of option names."""
     try:
         text = path.read_text(encoding="utf-8")
@@ -2492,7 +2492,7 @@ def load_config_file(path: Path, required: bool) -> Dict[str, Any]:
     except Exception as exc:  # noqa: BLE001 - tomllib raises several types
         raise SystemExit(f"!  {path} is not valid TOML: {exc}") from exc
 
-    flat: Dict[str, Any] = {}
+    flat: dict[str, Any] = {}
     for section, values in raw.items():
         if not isinstance(values, dict):
             raise SystemExit(f"!  {path}: [{section}] must be a table of options")
@@ -2693,12 +2693,12 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
-def resolve_args(argv: Optional[List[str]] = None) -> Tuple[argparse.Namespace, Path, bool]:
+def resolve_args(argv: list[str] | None = None) -> tuple[argparse.Namespace, Path, bool]:
     """Layer defaults, config file, flags and environment, in that order."""
     cli = vars(build_parser().parse_args(argv))
 
     path, required = config_path(cli.get("config"))
-    merged: Dict[str, Any] = dict(DEFAULTS)
+    merged: dict[str, Any] = dict(DEFAULTS)
     merged.update(load_config_file(path, required))
     merged.update(cli)
 
@@ -2751,7 +2751,7 @@ def resolve_args(argv: Optional[List[str]] = None) -> Tuple[argparse.Namespace, 
     return argparse.Namespace(**merged), path, required
 
 
-def startup_snapshot(args: argparse.Namespace, cfg: Optional[Path]) -> Dict[str, Any]:
+def startup_snapshot(args: argparse.Namespace, cfg: Path | None) -> dict[str, Any]:
     """How the server was running, for later forensics. Tokens never appear."""
     return {
         "config": redact(str(cfg), 500) if cfg else None,
