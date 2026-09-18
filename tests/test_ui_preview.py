@@ -215,14 +215,18 @@ def test_a_followed_preview_appends_rows_with_timestamps_and_sticks_to_the_botto
 
 
 @needs_node
-def test_appending_the_same_segments_again_adds_nothing():
-    """A poll that returns no new text must not duplicate the preview."""
+def test_an_empty_tail_adds_nothing():
+    """A poll with no new text sends an empty list, and must add no rows.
+
+    This used to be guaranteed by re-sending the whole transcript and letting
+    appendSegments de-duplicate it. The guarantee now lives in the request
+    (?since=<shown>), so the renderer only has to append what it is handed.
+    """
     probe = preview_probe(
         """
         const h = makeView();
-        const two = [seg(3, "first"), seg(72, "second")];
-        appendSegments(h.view, two, true);
-        appendSegments(h.view, two, true);
+        appendSegments(h.view, [seg(3, "first"), seg(72, "second")], true, 2);
+        appendSegments(h.view, [], true, 2);
         return {rows: h.rows.length, shown: h.view.shown};
         """
     )
@@ -231,11 +235,12 @@ def test_appending_the_same_segments_again_adds_nothing():
 
 @needs_node
 def test_a_preview_that_lost_segments_starts_over_instead_of_leaving_stale_rows():
+    """A tail plus a smaller server total means those rows no longer exist."""
     probe = preview_probe(
         """
         const h = makeView();
-        appendSegments(h.view, [seg(3, "first"), seg(72, "second")], true);
-        appendSegments(h.view, [seg(9, "replacement")], false);
+        appendSegments(h.view, [seg(3, "first"), seg(72, "second")], true, 2);
+        appendSegments(h.view, [seg(9, "replacement")], false, 1);
         return {rows: h.rows.length, times: times(h.rows)};
         """
     )
@@ -336,3 +341,101 @@ def test_the_api_gives_the_preview_what_it_renders(configured, client):
 
     assert [seg["start"] for seg in body["segments"]] == [0.0, 1.5]
     assert [seg["text"] for seg in body["segments"]] == ["first", "second"]
+
+
+# --------------------------------------------------------------------------- #
+# The poll fetches only the tail, not the whole transcript every tick
+# --------------------------------------------------------------------------- #
+
+
+def _three_segment_job(configured) -> str:
+    job_id = configured.make_job()
+    s.patch_job(
+        job_id,
+        state="running",
+        language="en",
+        duration=3.0,
+        segments=[
+            {"start": 0.0, "end": 1.0, "text": "first"},
+            {"start": 1.0, "end": 2.0, "text": "second"},
+            {"start": 2.0, "end": 3.0, "text": "third"},
+        ],
+    )
+    return job_id
+
+
+def test_since_returns_only_the_segments_the_client_lacks(configured, client):
+    """The whole point: a poll must not re-ship the transcript it already has."""
+    job_id = _three_segment_job(configured)
+
+    body = client.get(f"/api/jobs/{job_id}?since=2").json()
+
+    assert [seg["text"] for seg in body["segments"]] == ["third"]
+    assert body["segment_start"] == 2
+    assert body["segment_count"] == 3, "the client needs the total to spot a reset"
+
+
+def test_since_zero_still_returns_everything(configured, client):
+    """Not every caller polls; the endpoint stays usable as a plain detail read."""
+    job_id = _three_segment_job(configured)
+
+    body = client.get(f"/api/jobs/{job_id}?since=0").json()
+
+    assert [seg["text"] for seg in body["segments"]] == ["first", "second", "third"]
+    assert body["segment_start"] == 0
+
+
+def test_a_caught_up_client_gets_an_empty_tail(configured, client):
+    job_id = _three_segment_job(configured)
+
+    body = client.get(f"/api/jobs/{job_id}?since=3").json()
+
+    assert body["segments"] == []
+    assert body["segment_count"] == 3
+
+
+@pytest.mark.parametrize("since", ["99", "-5"])
+def test_an_out_of_range_since_is_clamped_not_fatal(configured, client, since):
+    """A stale value must not 500, or duplicate the transcript."""
+    job_id = _three_segment_job(configured)
+
+    response = client.get(f"/api/jobs/{job_id}?since={since}")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["segment_count"] == 3
+    assert len(body["segments"]) <= 3
+    assert body["segment_start"] <= 3
+
+
+def test_a_non_numeric_since_is_rejected_by_the_typed_param(configured, client):
+    """`since` is a declared int, so FastAPI rejects junk before the handler.
+
+    That is the same contract the other typed query params have (see
+    audit_query's `limit`), and the only writer of this value is the page's own
+    segment counter, so there is nothing to be lenient for.
+    """
+    job_id = _three_segment_job(configured)
+
+    assert client.get(f"/api/jobs/{job_id}?since=abc").status_code == 422
+
+
+def test_the_poll_asks_for_a_tail_and_the_renderer_passes_the_total():
+    """Both halves have to hold, or the wire saving is silently lost."""
+    script = page_script()
+    assert '"?since=" + since' in script, "the poll must ask for a tail"
+    assert "summary.segment_count < view.shown" in script, (
+        "a card must notice when the job's segments went backwards"
+    )
+    assert "job.segment_count)" in function_source("render"), (
+        "render() must hand appendSegments the server's total"
+    )
+
+
+def test_the_page_never_refetches_the_whole_transcript_on_a_tick():
+    """Guards against the regression this change exists to fix."""
+    tick = function_source("tick")
+    assert "?since=" in tick, "tick() must be incremental"
+    assert re.search(r'api\("/api/jobs/" \+ encodeURIComponent\([^)]*\)\)', tick) is None, (
+        "tick() must not fetch the full detail endpoint any more"
+    )

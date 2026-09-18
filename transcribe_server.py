@@ -1975,8 +1975,24 @@ def list_jobs() -> dict[str, Any]:
 
 
 @app.get("/api/jobs/{job_id}")
-def job_detail(job_id: str) -> dict[str, Any]:
-    return job_public(get_job(job_id))
+def job_detail(job_id: str, since: int = 0) -> dict[str, Any]:
+    """One job, optionally only the segments after `since`.
+
+    The page polls this while a job runs. Re-sending the whole transcript on
+    every tick is quadratic in the length of the recording — an hour-long
+    meeting is hundreds of ticks over a transcript that keeps growing — so the
+    client says how many segments it already has and gets only the tail.
+
+    `since=0` (the default) still returns everything, so this stays a plain
+    detail endpoint for anything that is not the polling loop.
+    """
+    job = get_job(job_id)
+    out = job_public(job, include_segments=False)
+    total = len(job["segments"])
+    start = clamp(as_int(since, 0), 0, total)
+    out["segments"] = job["segments"][start:]
+    out["segment_start"] = start
+    return out
 
 
 @app.delete("/api/jobs/{job_id}")
@@ -2763,14 +2779,18 @@ function createCard(job){
 /* Append only what is new. The server grows job["segments"] and never rewrites
    one, so counting is enough. textContent rather than innerHTML: transcript
    text needs no escaping and cannot become markup. */
-function appendSegments(view, segments, live){
+function appendSegments(view, segments, live, total){
   view.live = live;
-  if(segments.length < view.shown){
+  /* `segments` is the tail the server has not sent yet, so there is nothing to
+     de-duplicate: a poll with no new text sends an empty list. `total` is the
+     server's own count, which is the only way to notice that a job's segment
+     list went backwards (a restart, or a re-queued job) and the preview has to
+     be rebuilt rather than appended to. */
+  if(total !== undefined && total < view.shown + segments.length){
     view.transcript.textContent = "";
     view.shown = 0;
   }
-  for(let i = view.shown; i < segments.length; i++){
-    const seg = segments[i];
+  for(const seg of segments){
     const row = document.createElement("div");
     row.className = "seg";
     const ts = document.createElement("span");
@@ -2782,7 +2802,7 @@ function appendSegments(view, segments, live){
     row.append(ts, tx);
     view.transcript.append(row);
   }
-  view.shown = segments.length;
+  view.shown += segments.length;
   /* Only chase a job that is still producing text: a finished transcript should
      open at its first line, not at its last. */
   if(live) stick(view);
@@ -2820,7 +2840,8 @@ function render(job){
   view.node.querySelector(".actions").innerHTML = actionsHtml(job);
 
   appendSegments(view, job.segments || [],
-                 ["queued","loading","running"].includes(job.state));
+                 ["queued","loading","running"].includes(job.state),
+                 job.segment_count);
 }
 
 /* Downloads go through fetch so the token stays in a header, never a URL. */
@@ -2907,7 +2928,18 @@ async function tick(){
       const sig = summary.state + ":" + summary.progress + ":" + summary.segment_count;
       if(known.get(summary.id) === sig) continue;
       known.set(summary.id, sig);
-      const full = await (await api("/api/jobs/" + encodeURIComponent(summary.id))).json();
+
+      /* Ask for only what this card has not seen. A card that lost its rows
+         (the job's segments went backwards) starts from zero again. */
+      const view = views.get("job-" + summary.id);
+      let since = view ? view.shown : 0;
+      if(view && summary.segment_count < view.shown){
+        view.transcript.textContent = "";
+        view.shown = 0;
+        since = 0;
+      }
+      const full = await (await api("/api/jobs/" + encodeURIComponent(summary.id)
+                                    + "?since=" + since)).json();
       render(full);
     }
   }catch(e){ /* server blip or 401; next tick retries */ }
