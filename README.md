@@ -153,6 +153,14 @@ startup error instead of becoming a server quietly running on defaults, and
 (a read-only or container home) the server says so and carries on with
 defaults.
 
+`work_dir` is the one key that cannot live in the default config file. That
+file is found *in* the state dir, so it cannot move the state dir without
+leaving itself behind — the state would move, the file would stay, and a config
+written next to the new state would be ignored with nothing on screen to say
+so. Setting it there is a startup error. Use `--work-dir` or
+`TRANSCRIBE_WORK_DIR`, which move both, or an explicit `--config` pointing at a
+file that lives elsewhere, where the key is honest and still works.
+
 Anything settable by a flag can also live in a TOML file, which is what you
 want on a machine you don't want to re-type a long command line for:
 

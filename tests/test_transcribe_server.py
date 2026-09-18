@@ -499,6 +499,74 @@ def test_work_dir_flag_moves_the_default_config_path(tmp_path, monkeypatch):
     assert args.work_dir == str(tmp_path / "state")
 
 
+def default_config(tmp_path, monkeypatch, body: str) -> Path:
+    """Write a config at the *default* location, <home>/.transcribe-server.
+
+    HOME is redirected instead of passing --work-dir, because a flag wins over
+    the file and would hide the case under test (the file being the only thing
+    that sets work_dir).
+    """
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    monkeypatch.delenv("TRANSCRIBE_CONFIG", raising=False)
+    monkeypatch.delenv("TRANSCRIBE_WORK_DIR", raising=False)
+    cfg = tmp_path / ".transcribe-server" / "config.toml"
+    cfg.parent.mkdir(parents=True, exist_ok=True)
+    cfg.write_text(body, encoding="utf-8")
+    return cfg
+
+
+def test_work_dir_in_the_default_config_is_a_startup_error(tmp_path, monkeypatch):
+    """The file cannot move the state dir it was found in; see the function."""
+    cfg = default_config(
+        tmp_path, monkeypatch, '[server]\nwork_dir = "/mnt/big/state"\n'
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        s.resolve_args([])
+
+    message = str(exc.value)
+    assert str(cfg) in message, "the error has to name the file to fix"
+    assert "--work-dir" in message, "and say what to do instead"
+
+
+def test_work_dir_equal_to_the_config_dir_is_allowed(tmp_path, monkeypatch):
+    """A no-op is not a mistake: the file already sits where it says state goes."""
+    home = tmp_path / ".transcribe-server"
+    default_config(tmp_path, monkeypatch, f'[server]\nwork_dir = "{home}"\n')
+
+    args, path, required = s.resolve_args([])
+    assert required is False
+    assert path == home / "config.toml"
+    assert args.work_dir == str(home)
+
+
+def test_work_dir_from_the_environment_settles_the_default_config(
+    tmp_path, monkeypatch
+):
+    """The check is on the effective value: env wins, so a stale key is harmless."""
+    monkeypatch.delenv("TRANSCRIBE_CONFIG", raising=False)
+    state = tmp_path / "state"
+    state.mkdir()
+    (state / "config.toml").write_text('[server]\nwork_dir = "/mnt/big/state"\n')
+    monkeypatch.setenv("TRANSCRIBE_WORK_DIR", str(state))
+
+    args, path, _ = s.resolve_args([])
+    assert path == state / "config.toml"
+    assert args.work_dir == str(state)
+
+
+def test_work_dir_in_an_explicit_config_is_allowed(tmp_path, monkeypatch):
+    """An explicit --config does not live in the state dir, so the key is honest."""
+    monkeypatch.delenv("TRANSCRIBE_WORK_DIR", raising=False)
+    elsewhere = tmp_path / "elsewhere"
+    cfg = tmp_path / "etc.toml"
+    cfg.write_text(f'[server]\nwork_dir = "{elsewhere}"\n')
+
+    args, path, required = s.resolve_args(["--config", str(cfg)])
+    assert (path, required) == (cfg, True)
+    assert args.work_dir == str(elsewhere)
+
+
 @pytest.mark.parametrize(
     "body,needle",
     [
@@ -563,9 +631,16 @@ def test_audit_section_aliases(tmp_path, monkeypatch):
 
 KEY_LINE = re.compile(r"^#\s*([a-z_][a-z0-9_]*)\s*=")
 
+# Options the template must not carry as a `key = value` line:
+#   config         -- it is this file
+#   starter_config -- only matters before the file exists
+#   work_dir       -- self-referential here, and a startup error; see
+#                     check_default_state_dir
+NOT_IN_TEMPLATE = {"config", "starter_config", "work_dir"}
+
 # DEFAULTS stores None for "derive it from the work dir", so the template can
-# only show a plausible path for these two. They are checked for presence.
-DERIVED_DEFAULTS = {"work_dir", "audit_dir"}
+# only show a plausible path. Checked for presence, not for the value.
+DERIVED_DEFAULTS = {"audit_dir"}
 
 
 def materialise(template: str) -> str:
@@ -595,9 +670,9 @@ def test_starter_config_documents_every_option_at_its_default(tmp_path):
     cfg.write_text(materialise(s.CONFIG_TEMPLATE), encoding="utf-8")
     flat = s.load_config_file(cfg, required=False)
 
-    # `config` is this file, and `starter_config` only matters before it
-    # exists, so neither can be set from inside it.
-    assert set(flat) == set(s.DEFAULTS) - {"config", "starter_config"}
+    # `config` is this file, `starter_config` only matters before it exists, and
+    # `work_dir` is rejected at this location, so none of them can be set here.
+    assert set(flat) == set(s.DEFAULTS) - NOT_IN_TEMPLATE
     for name, value in flat.items():
         if name in DERIVED_DEFAULTS:
             continue
