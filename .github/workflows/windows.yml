@@ -95,8 +95,19 @@ jobs:
 
       - name: Self-test the bundle, including a real server
         # Proves the launcher can start the server through uv and poll it, which
-        # is the part a unit test cannot reach.
-        run: '& "dist\TranscriptionServer\Transcription Server.exe" --self-test --with-server'
+        # is the part a unit test cannot reach. The bundle is a windowed exe, so
+        # its console output is not reliably captured: read the report it writes
+        # instead of trusting an exit code.
+        run: |
+          & "dist\TranscriptionServer\Transcription Server.exe" --self-test --with-server
+          $code = $LASTEXITCODE
+          $report = Join-Path $env:LOCALAPPDATA "TranscriptionServer\self-test.log"
+          if (Test-Path $report) {
+            Get-Content $report
+          } else {
+            throw "the self-test wrote no report; the check cannot be trusted"
+          }
+          if ($code -ne 0) { throw "bundled launcher self-test failed" }
         timeout-minutes: 15
 
       - name: Report what was produced

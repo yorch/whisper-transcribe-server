@@ -27,7 +27,13 @@ Compression=lzma2/max
 SolidCompression=yes
 WizardStyle=modern
 ; The firewall rule needs elevation; the app itself runs unelevated.
+; The firewall rule needs elevation, so the default is a machine-wide install.
+; Overrides are allowed so someone who does not want that rule can install
+; per-user instead and add the rule themselves — which also keeps the "start
+; when I sign in" shortcut in their own profile rather than the elevating
+; account's. See packaging/README.md.
 PrivilegesRequired=admin
+PrivilegesRequiredOverridesAllowed=dialog
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 UninstallDisplayIcon={app}\{#AppExe}
@@ -61,7 +67,7 @@ Filename: "netsh"; Parameters: "advfirewall firewall add rule name=""{#AppName}"
 Filename: "{app}\{#AppExe}"; Description: "Start {#AppName} now"; Flags: nowait postinstall skipifsilent
 
 [UninstallRun]
-Filename: "netsh"; Parameters: "advfirewall firewall delete rule name=""{#AppName}"""; Flags: runhidden
+Filename: "netsh"; Parameters: "advfirewall firewall delete rule name=""{#AppName}"""; Flags: runhidden; RunOnceId: "RemoveFirewallRule"
 
 [UninstallDelete]
 ; The launcher's own state (token, log) and the server's work dir are left

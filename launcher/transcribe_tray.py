@@ -542,15 +542,25 @@ def self_test(with_server: bool = False) -> int:
     With --with-server this also starts a real server, waits for readiness the
     same way the tray does, and stops it — the only way to prove the readiness
     probe matches what the server actually serves.
+
+    The report is written to a file as well as stdout. The bundle is a windowed
+    executable, so when it is launched from a console its output is not
+    reliably captured — an exit code alone would say "passed" without showing
+    which checks ran.
     """
     failures: list[str] = []
+    lines: list[str] = []
+
+    def emit(text: str) -> None:
+        print(text)
+        lines.append(text)
 
     def check(name: str, ok: bool, detail: str = "") -> None:
-        print(f"  {'PASS' if ok else 'FAIL'}  {name}{'  ' + detail if detail else ''}")
+        emit(f"  {'PASS' if ok else 'FAIL'}  {name}{'  ' + detail if detail else ''}")
         if not ok:
             failures.append(name)
 
-    print("launcher self-test")
+    emit("launcher self-test")
     check("resource_dir exists", resource_dir().is_dir(), str(resource_dir()))
     check("server script found", server_script().is_file(), str(server_script()))
 
@@ -584,9 +594,17 @@ def self_test(with_server: bool = False) -> int:
     if with_server:
         check("readiness probe against a real server", end_to_end_probe())
 
-    print(
+    emit(
         f"\n{'all checks passed' if not failures else 'FAILURES: ' + ', '.join(failures)}"
     )
+
+    # Durable evidence, not just an exit code: CI reads this back, and "Show
+    # log" in the tray can point at it when something looks wrong.
+    report = launcher_dir() / "self-test.log"
+    with contextlib.suppress(OSError):
+        report.parent.mkdir(parents=True, exist_ok=True)
+        report.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
     return 1 if failures else 0
 
 
