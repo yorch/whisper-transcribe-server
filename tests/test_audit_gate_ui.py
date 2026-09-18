@@ -45,9 +45,11 @@ const MODE = "__MODE__";
 def page_script() -> str:
     """The audit page's JS: the shared helpers plus its own script."""
     static = s.STATIC_DIR
-    return (static / "common.js").read_text(encoding="utf-8") + "\n" + (
-        static / "audit.js"
-    ).read_text(encoding="utf-8")
+    return (
+        (static / "common.js").read_text(encoding="utf-8")
+        + "\n"
+        + (static / "audit.js").read_text(encoding="utf-8")
+    )
 
 
 def node_argv(*args: str) -> list[str]:
@@ -131,4 +133,6 @@ def test_boot_probes_even_with_no_stored_token():
     assert "if(!TOKENS.get()) return;" not in script, (
         "boot() returning early leaves /audit unusable under --audit-open"
     )
-    assert 'const headers = TOKENS.get() ? {"x-audit-token":TOKENS.get()} : {};' in script
+    assert (
+        'const headers = TOKENS.get() ? {"x-audit-token":TOKENS.get()} : {};' in script
+    )

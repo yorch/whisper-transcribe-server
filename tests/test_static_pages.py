@@ -210,8 +210,16 @@ AUDIT_SELECTORS_BEFORE = {
 
 @pytest.mark.parametrize(
     "name",
-    ["index.html", "audit.html", "app.css", "index.css", "audit.css",
-     "common.js", "index.js", "audit.js"],
+    [
+        "index.html",
+        "audit.html",
+        "app.css",
+        "index.css",
+        "audit.css",
+        "common.js",
+        "index.js",
+        "audit.js",
+    ],
 )
 def test_every_asset_is_present(name):
     assert (STATIC / name).is_file(), f"static/{name} is missing"
@@ -219,7 +227,7 @@ def test_every_asset_is_present(name):
 
 @pytest.mark.parametrize(
     "path,needle",
-    [("/", "id=\"intake\""), ("/audit", "Audit trail")],
+    [("/", 'id="intake"'), ("/audit", "Audit trail")],
 )
 def test_the_pages_are_served(client, path, needle):
     response = client.get(path)
@@ -347,7 +355,8 @@ def test_the_pages_load_the_shared_helpers_first(page):
 def test_esc_is_defined_only_in_common_js():
     """It is the only thing between a filename and stored XSS; one copy only."""
     definers = [
-        name for name in ("common.js", "index.js", "audit.js")
+        name
+        for name in ("common.js", "index.js", "audit.js")
         if re.search(r"const esc\s*=", asset(name))
     ]
     assert definers == ["common.js"], f"esc is defined in {definers}"
