@@ -50,3 +50,18 @@ def test_pyproject_dependencies_match_the_inline_block():
 def test_pyproject_python_floor_matches_the_inline_block():
     inline = inline_metadata(ROOT / "transcribe_server.py")
     assert project()["requires-python"] == inline["requires-python"]
+
+
+def test_the_lock_pairs_sherpa_onnx_with_its_native_core():
+    """sherpa-onnx's libraries live in sherpa-onnx-core, which uv's universal
+    lock drops from sherpa-onnx's dependencies; pyproject names it explicitly.
+    A bump of one without the other would lock a core built for a different
+    release, so the two locked versions must match."""
+    lock = tomllib.loads((ROOT / "uv.lock").read_text(encoding="utf-8"))
+    versions = {
+        pkg["name"]: pkg["version"]
+        for pkg in lock["package"]
+        if pkg["name"] in ("sherpa-onnx", "sherpa-onnx-core")
+    }
+    assert set(versions) == {"sherpa-onnx", "sherpa-onnx-core"}, versions
+    assert versions["sherpa-onnx"] == versions["sherpa-onnx-core"], versions

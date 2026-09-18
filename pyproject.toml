@@ -37,6 +37,13 @@ dev = [
     # imports; launcher/transcribe_tray.py still declares them for itself.
     "pystray>=0.19",
     "pillow>=10",
+    # sherpa-onnx's native libraries (libonnxruntime among them) ship in
+    # sherpa-onnx-core. Every per-platform resolve pulls it in, but uv's
+    # universal lock records sherpa-onnx with no dependencies, so `uv sync`
+    # left `import sherpa_onnx` failing on a missing libonnxruntime. Named
+    # here to put it in the lock; keep the version equal to sherpa-onnx's --
+    # tests/test_project_metadata.py checks the lock for exactly that.
+    "sherpa-onnx-core==1.13.8",
 ]
 
 [tool.uv]
