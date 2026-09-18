@@ -29,6 +29,7 @@ import contextlib
 import importlib
 import os
 import secrets
+import shutil
 import socket
 import subprocess
 import sys
@@ -43,6 +44,7 @@ APP_NAME = "Transcription Server"
 UV_RELEASES = "https://github.com/astral-sh/uv/releases/latest/download"
 UV_ASSET = "uv-x86_64-pc-windows-msvc.zip"
 DEFAULT_PORT = 8765
+
 
 # Where the launcher keeps its own state (token, logs, downloaded uv). Separate
 # from the server's work dir, which the server owns.
@@ -110,9 +112,7 @@ def find_uv() -> Path | None:
         if candidate.is_file():
             return candidate
 
-    from shutil import which
-
-    found = which("uv")
+    found = shutil.which("uv")
     return Path(found) if found else None
 
 
@@ -251,8 +251,7 @@ class ServerProcess:
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
         self._log = self.log_path.open("a", encoding="utf-8", errors="replace")
         self._log.write(
-            f"\n=== {time.strftime('%Y-%m-%d %H:%M:%S')} "
-            f"{' '.join(self.command)} ===\n"
+            f"\n=== {time.strftime('%Y-%m-%d %H:%M:%S')} {' '.join(self.command)} ===\n"
         )
         self._log.flush()
         self.proc = subprocess.Popen(  # noqa: S603
@@ -326,9 +325,16 @@ def copy_to_clipboard(text: str) -> bool:
     """Windows clipboard via the shell; no extra dependency."""
     if sys.platform != "win32":
         return False
+    # Resolve the full path rather than invoking a bare "clip": a partial path
+    # is resolved against PATH and the cwd, so it can be hijacked.
+    clip = shutil.which("clip")
+    if clip is None:
+        return False
     try:
         subprocess.run(  # noqa: S603
-            ["clip"], input=text.encode("utf-16le"), check=True,  # noqa: S607
+            [clip],
+            input=text.encode("utf-16le"),
+            check=True,
             creationflags=creation_flags(),
         )
         return True
@@ -615,7 +621,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=f"{APP_NAME} launcher")
     parser.add_argument("--port", type=int, default=None, help="preferred port")
     parser.add_argument("--no-tray", action="store_true", help="supervise headless")
-    parser.add_argument("--no-browser", action="store_true", help="do not open a browser")
+    parser.add_argument(
+        "--no-browser", action="store_true", help="do not open a browser"
+    )
     parser.add_argument("--self-test", action="store_true", help="check launcher logic")
     parser.add_argument(
         "--with-server",

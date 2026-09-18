@@ -4,6 +4,24 @@ Drag-and-drop Whisper transcription served over your LAN.
 
 ## Setup on the Windows machine
 
+Two ways in: run it from source (below), or install the tray app. The tray app
+is a launcher that manages the process, token and port for you, and bundles
+ffmpeg — see [packaging/README.md](packaging/README.md).
+
+```powershell
+# from source, zero install
+winget install astral-sh.uv
+uv run transcribe_server.py --preload
+
+# or build the tray app (add -Installer for a setup .exe)
+pwsh -File packaging\build-windows.ps1 -Installer
+```
+
+Either way the same `transcribe_server.py` does the work; the launcher just
+supervises it. Everything below applies to both.
+
+### Running from source
+
 Dependencies are declared inline in the script (PEP 723), so there's no
 requirements file, no venv to create, and nothing to install by hand.
 
@@ -40,7 +58,8 @@ Optionally, installing PyTorch gives the status strip a proper GPU name
 uv run --with torch transcribe_server.py
 ```
 
-ffmpeg is required for decoding anything that isn't plain WAV:
+ffmpeg is required for decoding anything that isn't plain WAV (the tray app
+bundles it):
 
 ```powershell
 winget install Gyan.FFmpeg
@@ -515,6 +534,9 @@ What it still doesn't do, by design:
   still occupies the threadpool for its duration.
 - **Verified on CPU and on a single RTX 3060** (`base`, fp16, ~10x realtime).
   `large-v3`, multi-GPU and Windows are untested by the author.
+- **The Windows tray app has never been built on Windows** — the launcher's
+  logic is tested, its build scripts are not. See
+  [packaging/README.md](packaging/README.md#known-gaps).
 
 ## Tests
 
@@ -525,7 +547,6 @@ app-token holder).
 
 It needs the runtime dependencies plus `pytest` and `httpx`, which is what the
 `.venv` is for:
-
 ```bash
 uv venv .venv --python 3.12
 uv pip install --python .venv/bin/python \
@@ -555,3 +576,10 @@ uv run tests/test_cuda_bootstrap.py
 
 The `.venv` above is still what `pyright` type-checks against, and it is the
 only environment that exercises a real model load.
+
+The launcher has its own self-test, which needs no display and no tray backend:
+
+```bash
+launcher/transcribe_tray.py --self-test                # logic only, fast
+launcher/transcribe_tray.py --self-test --with-server   # also probes a real server
+```
