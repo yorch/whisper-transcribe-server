@@ -615,18 +615,28 @@ def run_headless(supervisor: Supervisor) -> int:
 Check = Literal["skip", "pass", "fail"]
 
 
-def report_check(name: str, ok: bool, detail: str = "", skip: str = "") -> Check:
+def report_check(
+    name: str, ok: bool, detail: str = "", skip: str = "", sink: list[str] | None = None
+) -> Check:
     """Print one self-test line, and say which kind it was.
 
     A skipped check is neither a pass nor a failure: PASS would claim evidence
     the platform cannot provide, and FAIL would report a problem that is not
     there. Saying so is the only honest option, and the summary counts them.
+
+    `sink` collects the same line for the report file. The bundle is a windowed
+    executable, so its stdout is not reliably captured when it is launched from
+    a console — an exit code would say "passed" without showing which checks
+    ran.
     """
     if skip:
-        print(f"  SKIP  {name}  {skip}")
-        return "skip"
-    print(f"  {'PASS' if ok else 'FAIL'}  {name}{'  ' + detail if detail else ''}")
-    return "pass" if ok else "fail"
+        line = f"  SKIP  {name}  {skip}"
+    else:
+        line = f"  {'PASS' if ok else 'FAIL'}  {name}{'  ' + detail if detail else ''}"
+    print(line)
+    if sink is not None:
+        sink.append(line)
+    return "skip" if skip else ("pass" if ok else "fail")
 
 
 def self_test(with_server: bool = False) -> int:
@@ -635,18 +645,23 @@ def self_test(with_server: bool = False) -> int:
     With --with-server this also starts a real server, waits for readiness the
     same way the tray does, and stops it — the only way to prove the readiness
     probe and the audit credential match what the server actually serves.
+
+    The report is written to a file as well as stdout, so a windowed bundle
+    launched from a console still leaves evidence of which checks ran.
     """
     failures: list[str] = []
     skipped: list[str] = []
+    lines: list[str] = []
 
     def check(name: str, ok: bool, detail: str = "", skip: str = "") -> None:
-        outcome = report_check(name, ok, detail, skip)
+        outcome = report_check(name, ok, detail, skip, sink=lines)
         if outcome == "skip":
             skipped.append(name)
         elif outcome == "fail":
             failures.append(name)
 
     print("launcher self-test")
+    lines.append("launcher self-test")
     check("resource_dir exists", resource_dir().is_dir(), str(resource_dir()))
     check("server script found", server_script().is_file(), str(server_script()))
 
@@ -711,6 +726,21 @@ def self_test(with_server: bool = False) -> int:
     if skipped:
         summary += f" ({len(skipped)} skipped: {', '.join(skipped)})"
     print(f"\n{summary}")
+    lines.append(f"\n{summary}")
+
+    # Durable evidence, not just an exit code: CI reads this back, and "Show
+    # log" in the tray can point at it when something looks wrong. Written on
+    # every path, including failing ones, so it describes this run rather than
+    # an earlier one.
+    report = launcher_dir() / "self-test.log"
+    with contextlib.suppress(OSError):
+        report.parent.mkdir(parents=True, exist_ok=True)
+        report.write_text(
+            f"{time.strftime('%Y-%m-%d %H:%M:%S')}  with_server={with_server}\n"
+            + "\n".join(lines)
+            + "\n",
+            encoding="utf-8",
+        )
     return 1 if failures else 0
 
 
