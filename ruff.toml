@@ -18,6 +18,9 @@ ignore = ["E501"]
 # `assert` is how tests assert. S101 targets production code, where an assert
 # can be stripped by -O.
 "tests/*" = ["S101"]
+# Same reasoning for the diarization proof-of-concept scripts: assertions are the
+# right shape for a throwaway probe, and nothing ships from this directory.
+"docs/poc/*" = ["S101"]
 
 [lint.flake8-bugbear]
 # File(...) and Form(...) in argument defaults are the FastAPI dependency idiom.
