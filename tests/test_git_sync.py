@@ -45,11 +45,7 @@ def clean_env(**overrides: str) -> dict[str, str]:
     Global and system config are bypassed, and anything gh-related is dropped so
     a developer's session cannot decide what these tests assert.
     """
-    env = {
-        k: v
-        for k, v in os.environ.items()
-        if not k.startswith(("GH_", "GITHUB_"))
-    }
+    env = {k: v for k, v in os.environ.items() if not k.startswith(("GH_", "GITHUB_"))}
     env.update(
         {
             "GIT_CONFIG_GLOBAL": os.devnull,
@@ -74,7 +70,9 @@ class Guard:
         self.work = tmp_path / "work"
         self.remote = tmp_path / "remote.git"
         self.remote.mkdir()
-        run([git_bin(), "init", "-q", "--bare", str(self.remote)], tmp_path, clean_env())
+        run(
+            [git_bin(), "init", "-q", "--bare", str(self.remote)], tmp_path, clean_env()
+        )
         run([git_bin(), "init", "-q", str(self.work)], tmp_path, clean_env())
         git(self.work, "config", "user.email", "guard@example.com")
         git(self.work, "config", "user.name", "Guard")
@@ -117,7 +115,9 @@ class Guard:
             env or clean_env(),
         )
 
-    def bin_without_gh(self, tmp_path: Path, gh_output: str | None = None, gh_exit: int = 1) -> str:
+    def bin_without_gh(
+        self, tmp_path: Path, gh_output: str | None = None, gh_exit: int = 1
+    ) -> str:
         """A PATH holding only what the script needs, optionally with a fake gh.
 
         The stub prints `gh_output` on stdout and exits `gh_exit`: a failed gh
@@ -127,7 +127,9 @@ class Guard:
         bindir = tmp_path / "bin"
         bindir.mkdir(exist_ok=True)
         for name in ("git", "sed", "cut", "dirname", "which", "bash", "sh"):
-            found = shutil.which(name) or (f"/bin/{name}" if Path(f"/bin/{name}").exists() else None)
+            found = shutil.which(name) or (
+                f"/bin/{name}" if Path(f"/bin/{name}").exists() else None
+            )
             if found:
                 link = bindir / name
                 if not link.exists():
@@ -135,7 +137,8 @@ class Guard:
         if gh_output is not None:
             stub = bindir / "gh"
             stub.write_text(
-                f"#!/bin/sh\nprintf '%s\\n' '{gh_output}'\nexit {gh_exit}\n", encoding="utf-8"
+                f"#!/bin/sh\nprintf '%s\\n' '{gh_output}'\nexit {gh_exit}\n",
+                encoding="utf-8",
             )
             stub.chmod(0o755)
         return str(bindir)
@@ -186,15 +189,21 @@ def test_a_commit_that_was_never_pushed_exits_two_with_real_shas(guard: Guard):
 # --------------------------------------------------------------------------- #
 
 
-def test_a_branch_the_remote_has_never_seen_is_not_reported_as_unreachable(guard: Guard):
+def test_a_branch_the_remote_has_never_seen_is_not_reported_as_unreachable(
+    guard: Guard,
+):
     result = guard.guard()
 
-    assert result.returncode == 2, "a branch that is absent is not pushed, not unreachable"
+    assert result.returncode == 2, (
+        "a branch that is absent is not pushed, not unreachable"
+    )
     assert "is not on the remote yet" in result.stdout
     assert "Could not reach the remote" not in result.stdout
 
 
-def test_commit_mode_pushes_a_branch_the_remote_has_never_seen(guard: Guard, tmp_path: Path):
+def test_commit_mode_pushes_a_branch_the_remote_has_never_seen(
+    guard: Guard, tmp_path: Path
+):
     """The regression that mattered: `-c` used to exit 3 without pushing."""
     (guard.work / "file.txt").write_text("two\n", encoding="utf-8")
     env = clean_env(PATH=guard.bin_without_gh(tmp_path))
@@ -206,12 +215,16 @@ def test_commit_mode_pushes_a_branch_the_remote_has_never_seen(guard: Guard, tmp
     assert guard.remote_refs().get(f"refs/heads/{guard.branch}") == guard.head()
 
 
-def test_commit_mode_also_pushes_when_the_branch_is_only_behind(guard: Guard, tmp_path: Path):
+def test_commit_mode_also_pushes_when_the_branch_is_only_behind(
+    guard: Guard, tmp_path: Path
+):
     guard.push()
     (guard.work / "file.txt").write_text("two\n", encoding="utf-8")
     git(guard.work, "commit", "-qam", "second")
 
-    result = guard.guard("-c", "second", env=clean_env(PATH=guard.bin_without_gh(tmp_path)))
+    result = guard.guard(
+        "-c", "second", env=clean_env(PATH=guard.bin_without_gh(tmp_path))
+    )
 
     assert result.returncode == 0, result.stdout + result.stderr
     assert guard.remote_refs().get(f"refs/heads/{guard.branch}") == guard.head()
@@ -259,10 +272,14 @@ def test_a_gh_error_body_is_never_mistaken_for_a_sha(guard: Guard, tmp_path: Pat
     assert "Could not reach the remote" in result.stdout
 
 
-def test_a_gh_sha_is_trusted_when_git_cannot_reach_the_remote(guard: Guard, tmp_path: Path):
+def test_a_gh_sha_is_trusted_when_git_cannot_reach_the_remote(
+    guard: Guard, tmp_path: Path
+):
     """The fallback that exists on purpose: broken ssh, working gh."""
     guard.make_unreachable()
-    env = clean_env(PATH=guard.bin_without_gh(tmp_path, gh_output=guard.head(), gh_exit=0))
+    env = clean_env(
+        PATH=guard.bin_without_gh(tmp_path, gh_output=guard.head(), gh_exit=0)
+    )
 
     result = guard.guard(env=env)
 
