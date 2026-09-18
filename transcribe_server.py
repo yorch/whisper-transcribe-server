@@ -74,6 +74,7 @@ UPLOAD_DIR = WORK_DIR / "uploads"
 # serving `app` directly from an ASGI server fails closed rather than open.
 ARGS: Optional[argparse.Namespace] = None
 ALLOWED_HOSTS: Set[str] = set()
+ALLOWED_SUFFIXES: Set[str] = set()  # entries like ".trycloudflare.com"
 
 # --------------------------------------------------------------------------- #
 # Job store
@@ -475,14 +476,31 @@ def content_disposition(stem: str, ext: str) -> str:
 app = FastAPI(title="Transcription server", docs_url=None, redoc_url=None)
 
 
+def normalize_host(raw: str) -> str:
+    """Normalize a Host header value or --allow-host entry to a bare hostname."""
+    host = raw.strip().lower()
+    # Tolerate pasting a full URL: https://example.com:443/path -> example.com
+    if "://" in host:
+        host = host.split("://", 1)[1]
+    host = host.split("/", 1)[0].strip()
+    if host.startswith("[") and "]" in host:
+        # [::1] or [::1]:8765
+        host = host[1 : host.index("]")]
+    elif host.count(":") == 1:
+        host = host.rsplit(":", 1)[0]
+    return host.rstrip(".").strip()
+
+
 def host_allowed(header: Optional[str]) -> bool:
     """Reject DNS-rebinding: only hostnames we expect may address this server."""
     if not header:
         return False
-    host = header.rsplit(":", 1)[0] if header.count(":") == 1 else header
-    if host.startswith("[") and "]" in host:
-        host = host[1 : host.index("]")]
-    return host.lower() in ALLOWED_HOSTS
+    host = normalize_host(header)
+    if not host:
+        return False
+    if host in ALLOWED_HOSTS:
+        return True
+    return any(host == s.lstrip(".") or host.endswith(s) for s in ALLOWED_SUFFIXES)
 
 
 @app.middleware("http")
@@ -490,8 +508,17 @@ async def guard(request: Request, call_next):
     if ARGS is None:
         return JSONResponse({"detail": "Server not configured"}, status_code=503)
 
-    if not host_allowed(request.headers.get("host")):
-        return JSONResponse({"detail": "Unrecognised Host header"}, status_code=421)
+    raw_host = request.headers.get("host")
+    if not host_allowed(raw_host):
+        seen = (raw_host or "").strip()[:100]
+        print(f"!  Rejected Host header {seen!r} (add it with --allow-host)")
+        return JSONResponse(
+            {
+                "detail": f"Unrecognised Host header {seen!r}. "
+                "Restart the server with --allow-host for this name."
+            },
+            status_code=421,
+        )
 
     path = request.url.path
     if path.startswith("/api/"):
@@ -1428,9 +1455,15 @@ setInterval(refreshStatus, 5000);
 # --------------------------------------------------------------------------- #
 
 
-def local_names(bind_host: str, extra: List[str]) -> Set[str]:
-    """Hostnames this server will answer to. Anything else is a rebinding attempt."""
+def local_names(bind_host: str, extra: List[str]) -> tuple[Set[str], Set[str]]:
+    """Hostnames this server will answer to. Anything else is a rebinding attempt.
+
+    Returns (exact_names, suffixes). A --allow-host entry starting with
+    "*." or "." becomes a suffix match, so --allow-host .trycloudflare.com
+    covers the random hostnames `cloudflared tunnel --url` hands out.
+    """
     names = {"localhost", "127.0.0.1", "::1", "0.0.0.0"}
+    suffixes: Set[str] = set()
     try:
         hostname = socket.gethostname()
         names.add(hostname.lower())
@@ -1440,12 +1473,25 @@ def local_names(bind_host: str, extra: List[str]) -> Set[str]:
         pass
     if bind_host not in ("0.0.0.0", "::"):
         names.add(bind_host.lower())
-    names.update(h.strip().lower() for h in extra if h.strip())
-    return names
+    for entry in extra:
+        e = entry.strip().lower()
+        if not e:
+            continue
+        if e.startswith("*."):
+            e = e[1:]  # "*.example.com" -> ".example.com"
+        if e.startswith("."):
+            suffix = normalize_host(e)
+            if suffix:
+                suffixes.add("." + suffix.lstrip("."))
+        else:
+            norm = normalize_host(e)
+            if norm:
+                names.add(norm)
+    return names, suffixes
 
 
 def main() -> None:
-    global ARGS, ALLOWED_HOSTS
+    global ARGS, ALLOWED_HOSTS, ALLOWED_SUFFIXES
     p = argparse.ArgumentParser(description="LAN transcription server (faster-whisper)")
 
     net = p.add_argument_group("network and access")
@@ -1468,7 +1514,9 @@ def main() -> None:
         "--allow-host",
         action="append",
         default=[],
-        help="extra Host header value to accept; repeatable",
+        help="extra Host header value to accept; repeatable. "
+        'Prefix with "." for a suffix match, e.g. --allow-host '
+        ".trycloudflare.com for Cloudflare tunnels.",
     )
 
     gpu = p.add_argument_group("model and hardware")
@@ -1557,7 +1605,7 @@ def main() -> None:
             args.token = secrets.token_urlsafe(24)
 
     ARGS = args
-    ALLOWED_HOSTS = local_names(args.host, args.allow_host)
+    ALLOWED_HOSTS, ALLOWED_SUFFIXES = local_names(args.host, args.allow_host)
 
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -1599,7 +1647,7 @@ def main() -> None:
         f"Sources    retention={args.source_retention}"
         f"{'  retry enabled' if args.source_retention != 'run' else '  retry disabled'}"
     )
-    print(f"\nAccepting Host: {', '.join(sorted(ALLOWED_HOSTS))}")
+    print(f"\nAccepting Host: {', '.join(sorted(ALLOWED_HOSTS | ALLOWED_SUFFIXES))}")
     print("(add more with --allow-host)\n")
 
     uvicorn.run(app, host=args.host, port=args.port, log_level="warning")

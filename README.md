@@ -80,7 +80,7 @@ Useful flags:
 | `--pin-model`                 | force every job to `--model`, disable the UI selector                                                                       |
 | `--allow-precision-choice`    | expose the precision selector (hidden by default)                                                                           |
 | `--no-auth`                   | serve without a token                                                                                                       |
-| `--allow-host name`           | accept an extra `Host` header value (repeatable)                                                                            |
+| `--allow-host name`           | accept an extra `Host` header value (repeatable; prefix with `.` for a suffix match, e.g. `.trycloudflare.com`)              |
 | `--max-upload-mb 2048`        | per-file upload ceiling                                                                                                     |
 | `--max-queue 20`              | max jobs pending before uploads are refused                                                                                 |
 | `--max-jobs 60`               | finished job records retained before eviction                                                                               |
@@ -110,6 +110,32 @@ New-NetFirewallRule -DisplayName "Transcription server" -Direction Inbound `
 ```
 
 Keep it on the `Private` profile so it isn't exposed on untrusted networks.
+
+## Exposing it via Cloudflare Tunnel
+
+The server allowlists the `Host` header, so a tunnel domain is rejected with
+`421 Unrecognised Host header` unless you allow it. The 421 response and the
+server console both name the rejected host.
+
+```powershell
+# terminal 1: start a tunnel to the server
+cloudflared tunnel --url http://localhost:8765
+# note the URL it prints, e.g. https://abc-123.trycloudflare.com
+
+# terminal 2: allow that exact hostname
+uv run transcribe_server.py --preload --allow-host abc-123.trycloudflare.com
+```
+
+The quick-tunnel hostname changes on every restart. To accept any of them:
+
+```powershell
+uv run transcribe_server.py --preload --allow-host .trycloudflare.com
+```
+
+For a stable name, use a named tunnel or custom domain and allow that host
+instead. The token is still required — open
+`https://<your-tunnel-host>/?token=<token>`. As a bonus, Cloudflare provides
+the TLS this server lacks on the LAN.
 
 ## Using it
 
