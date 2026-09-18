@@ -1,0 +1,120 @@
+name: windows
+
+# The Windows build has never been run locally — no Windows machine was
+# available — so this is the only thing that actually verifies it. It also runs
+# the Python suite on Windows, which the author could not do either.
+#
+# Everything here is a plain `uv run`, so it needs no committed lockfile and no
+# pyproject.toml (which would break the documented `uv run transcribe_server.py`
+# path).
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "**.py"
+      - "static/**"
+      - "packaging/**"
+      - "launcher/**"
+      - ".github/workflows/windows.yml"
+  pull_request:
+    paths:
+      - "**.py"
+      - "static/**"
+      - "packaging/**"
+      - "launcher/**"
+      - ".github/workflows/windows.yml"
+  workflow_dispatch:
+
+# A newer push makes an in-flight build irrelevant.
+concurrency:
+  group: windows-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # One place to bump; both jobs must agree or the venv and the bundle drift.
+  PYTHON: "3.12"
+  # Everything transcribe_server.py declares inline, plus the launcher's extras
+  # and the test-only packages.
+  DEPS: >-
+    --with pytest --with httpx --with fastapi --with "uvicorn[standard]"
+    --with python-multipart --with faster-whisper --with tomli
+    --with pystray --with pillow
+
+jobs:
+  test:
+    name: tests on Windows
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Python ${{ env.PYTHON }}
+        run: uv python install ${{ env.PYTHON }}
+
+      - name: Run the suite
+        # The UI tests shell out to node, which the runner already has; they
+        # skip themselves if it is missing rather than failing.
+        run: uv run --no-project --python ${{ env.PYTHON }} ${{ env.DEPS }} pytest tests/ -q
+
+      - name: Lint
+        run: uvx ruff check . --output-format github
+
+      - name: Type-check
+        # pyrightconfig.json points at .venv, which does not exist here, so the
+        # import resolution it does locally is not reproduced in CI.
+        run: uvx pyright --project pyrightconfig.json
+        continue-on-error: true
+
+  build:
+    name: build the launcher
+    runs-on: windows-latest
+    timeout-minutes: 45
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Python ${{ env.PYTHON }}
+        run: uv python install ${{ env.PYTHON }}
+
+      - name: Install Inno Setup
+        run: choco install innosetup --no-progress -y
+
+      - name: Build (and build the installer)
+        # Vendors uv.exe + ffmpeg, runs PyInstaller, runs the launcher's
+        # self-test against the bundle, checks static/ shipped, then ISCC.
+        run: pwsh -File packaging/build-windows.ps1 -Installer -Python ${{ env.PYTHON }}
+
+      - name: Self-test the bundle, including a real server
+        # Proves the launcher can start the server through uv and poll it, which
+        # is the part a unit test cannot reach.
+        run: '& "dist\TranscriptionServer\Transcription Server.exe" --self-test --with-server'
+        timeout-minutes: 15
+
+      - name: Report what was produced
+        run: |
+          Get-ChildItem dist\TranscriptionServer | Select-Object Name, Length
+          if (Test-Path packaging\output) {
+            Get-ChildItem packaging\output | Select-Object Name, Length
+          }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: TranscriptionServer-windows
+          path: dist/TranscriptionServer/
+          retention-days: 14
+
+      - uses: actions/upload-artifact@v4
+        if: hashFiles('packaging/output/*.exe') != ''
+        with:
+          name: TranscriptionServer-installer
+          path: packaging/output/*.exe
+          retention-days: 14
