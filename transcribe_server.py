@@ -1372,8 +1372,38 @@ def public_opts(opts: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+def relabel_refusal(job: dict[str, Any]) -> str | None:
+    """Why this job's speakers cannot be labelled again, or None if they can.
+
+    One function for both the endpoint's refusal and the page's can_relabel,
+    so the button is never offered for a request the server would turn down.
+    """
+    if not ARGS.allow_diarize:
+        return "Speaker identification is turned off on this server"
+    if job["state"] != "done":
+        return "Only a finished job can have its speakers identified again"
+    # Labels are split at word boundaries; a transcript without word timings
+    # could only hand each line to its dominant speaker. Retry can ask for them.
+    if not job["opts"].get("word_timestamps") or not any(
+        seg.get("words") for seg in job.get("transcribed") or job["segments"]
+    ):
+        return (
+            "This transcript has no word timings, which speaker labels need; "
+            "use Retry with Identify speakers ticked"
+        )
+    if not Path(job["path"]).exists():
+        return "The source audio is no longer on disk; re-upload it"
+    return None
+
+
 def job_public(job: dict[str, Any], include_segments: bool = True) -> dict[str, Any]:
-    out = {k: v for k, v in job.items() if k not in ("path", "segments", "opts")}
+    # "transcribed" is a second copy of the transcript, kept for relabelling;
+    # the list is polled every 1.2 s and must not carry it.
+    out = {
+        k: v
+        for k, v in job.items()
+        if k not in ("path", "segments", "opts", "transcribed")
+    }
     out["opts"] = public_opts(job["opts"])
     now = time.time()
     started = job.get("started")
@@ -1383,6 +1413,7 @@ def job_public(job: dict[str, Any], include_segments: bool = True) -> dict[str, 
     out["can_retry"] = (
         job["state"] in ("done", "error", "cancelled") and Path(job["path"]).exists()
     )
+    out["can_relabel"] = relabel_refusal(job) is None
     if include_segments:
         out["segments"] = job["segments"]
     return out
@@ -2139,8 +2170,168 @@ def transcribe_kwargs(opts: dict[str, Any]) -> dict[str, Any]:
     return kwargs
 
 
+def label_and_finish(
+    job_id: str,
+    job: dict[str, Any],
+    opts: dict[str, Any],
+    collected: list[dict[str, Any]],
+    language: str | None,
+    duration: float,
+) -> None:
+    """The speaker pass, if asked for, then the job marked done.
+
+    Shared by a fresh transcription and a relabel, which differ only in where
+    `collected` came from. Returns quietly when the job was cancelled.
+    """
+    # Speaker labels are a second pass over the audio, and they are worth
+    # less than the transcript itself: if anything goes wrong in here the
+    # job still finishes, unlabelled, and says why. Losing an hour of
+    # transcription because a 42 MB download failed would be absurd.
+    diarize_note: str | None = None
+    if opts["diarize"] and collected:
+        diarize_started = time.time()
+        try:
+            turns = diarize_job(job_id, job["path"], opts)
+        except Exception as exc:  # noqa: BLE001
+            traceback.print_exc()
+            diarize_note = friendly_error(exc)
+            audit(
+                "job.diarize_failed",
+                job=job_id,
+                file=job["filename"],
+                reason=type(exc).__name__,
+                message=redact(str(exc)),
+            )
+        else:
+            if turns is None:
+                return  # cancelled while the child was running
+            if not turns:
+                diarize_note = "the diarizer found no speech"
+            else:
+                before = len(collected)
+                # Kept as Whisper produced it, before alignment split lines at
+                # speaker changes: relabelling with another count starts from
+                # this, not from boundaries the last guess drew.
+                transcribed = list(collected)
+                collected = align_speakers(collected, turns)
+                # patch_job is what refuses a cancelled job, not us:
+                # overwriting one with a finished result is the exact bug
+                # that return value exists to prevent.
+                if not patch_job(
+                    job_id, segments=list(collected), transcribed=transcribed
+                ):
+                    return
+                audit(
+                    "job.diarized",
+                    job=job_id,
+                    file=job["filename"],
+                    backend="sherpa-onnx",
+                    segmentation=DIARIZE_MODELS["segmentation"]["file"],
+                    embedding=DIARIZE_MODELS["embedding"]["file"],
+                    requested=opts["speakers"],
+                    threshold=DIARIZE_THRESHOLD,
+                    speakers=len(
+                        {
+                            speaker
+                            for speaker in map(segment_speaker, collected)
+                            if speaker is not None
+                        }
+                    ),
+                    segments_before=before,
+                    segments_after=len(collected),
+                    elapsed=round(time.time() - diarize_started, 1),
+                )
+
+    message = f"{len(collected)} segments"
+    if diarize_note:
+        message += f" \u00b7 no speaker labels ({diarize_note})"
+
+    if not patch_job(
+        job_id,
+        state="done",
+        progress=1.0,
+        finished=time.time(),
+        message=message,
+    ):
+        return  # cancelled while finishing; don't claim success
+    audit(
+        "job.done",
+        job=job_id,
+        file=job["filename"],
+        model=opts["model"],
+        compute_type=opts["compute_type"],
+        language=language,
+        duration=round(duration, 2),
+        segments=len(collected),
+        elapsed=round(time.time() - (job.get("started") or time.time()), 1),
+    )
+
+
+def relabel_job(job_id: str, job: dict[str, Any]) -> None:
+    """Only the speaker pass, over a transcript the job was created with.
+
+    No model is loaded and nothing is transcribed: the text is shown at once,
+    and the labels land when the pass finishes, exactly as they do at the end of
+    a full job. Everything after that -- alignment, the failure note, done --
+    is label_and_finish, the same code a fresh transcription runs.
+    """
+    opts = job["opts"]
+    collected = [dict(seg) for seg in job["transcribed"]]
+    # patch_job refuses to move a cancelled job, and a relabel cancelled while
+    # it was queued must stay that way.
+    if not patch_job(
+        job_id,
+        state="running",
+        phase="diarizing",
+        started=time.time(),
+        progress=0.9,
+        segments=list(collected),
+        message="Identifying speakers",
+    ):
+        return
+    audit(
+        "job.started",
+        job=job_id,
+        file=job["filename"],
+        relabel_of=job["relabel_of"],
+        speakers=opts["speakers"],
+    )
+    try:
+        label_and_finish(
+            job_id,
+            job,
+            opts,
+            collected,
+            job.get("language"),
+            float(job.get("duration") or 0.0),
+        )
+    except Exception as exc:  # noqa: BLE001
+        traceback.print_exc()
+        if patch_job(
+            job_id,
+            state="error",
+            finished=time.time(),
+            message=f"{type(exc).__name__}: {friendly_error(exc)}",
+        ):
+            audit(
+                "job.error",
+                job=job_id,
+                file=job["filename"],
+                stage="relabel",
+                reason=type(exc).__name__,
+                message=redact(str(exc)),
+            )
+    finally:
+        if ARGS.source_retention == "run":
+            drop_source(job)
+        prune_jobs()
+
+
 def run_job(job_id: str) -> None:
     job = get_job(job_id)
+    if job.get("relabel_of"):
+        relabel_job(job_id, job)
+        return
     opts = job["opts"]
     patch_job(job_id, state="loading", started=time.time(), message="Loading model")
 
@@ -2236,81 +2427,13 @@ def run_job(job_id: str) -> None:
                 # and threading.Lock is not reentrant.
                 return
 
-        # Speaker labels are a second pass over the audio, and they are worth
-        # less than the transcript itself: if anything goes wrong in here the
-        # job still finishes, unlabelled, and says why. Losing an hour of
-        # transcription because a 42 MB download failed would be absurd.
-        diarize_note: str | None = None
-        if opts["diarize"] and collected:
-            diarize_started = time.time()
-            try:
-                turns = diarize_job(job_id, job["path"], opts)
-            except Exception as exc:  # noqa: BLE001
-                traceback.print_exc()
-                diarize_note = friendly_error(exc)
-                audit(
-                    "job.diarize_failed",
-                    job=job_id,
-                    file=job["filename"],
-                    reason=type(exc).__name__,
-                    message=redact(str(exc)),
-                )
-            else:
-                if turns is None:
-                    return  # cancelled while the child was running
-                if not turns:
-                    diarize_note = "the diarizer found no speech"
-                else:
-                    before = len(collected)
-                    collected = align_speakers(collected, turns)
-                    # patch_job is what refuses a cancelled job, not us:
-                    # overwriting one with a finished result is the exact bug
-                    # that return value exists to prevent.
-                    if not patch_job(job_id, segments=list(collected)):
-                        return
-                    audit(
-                        "job.diarized",
-                        job=job_id,
-                        file=job["filename"],
-                        backend="sherpa-onnx",
-                        segmentation=DIARIZE_MODELS["segmentation"]["file"],
-                        embedding=DIARIZE_MODELS["embedding"]["file"],
-                        requested=opts["speakers"],
-                        threshold=DIARIZE_THRESHOLD,
-                        speakers=len(
-                            {
-                                speaker
-                                for speaker in map(segment_speaker, collected)
-                                if speaker is not None
-                            }
-                        ),
-                        segments_before=before,
-                        segments_after=len(collected),
-                        elapsed=round(time.time() - diarize_started, 1),
-                    )
-
-        message = f"{len(collected)} segments"
-        if diarize_note:
-            message += f" \u00b7 no speaker labels ({diarize_note})"
-
-        if not patch_job(
+        label_and_finish(
             job_id,
-            state="done",
-            progress=1.0,
-            finished=time.time(),
-            message=message,
-        ):
-            return  # cancelled while finishing; don't claim success
-        audit(
-            "job.done",
-            job=job_id,
-            file=job["filename"],
-            model=opts["model"],
-            compute_type=opts["compute_type"],
-            language=getattr(info, "language", None),
-            duration=round(duration, 2),
-            segments=len(collected),
-            elapsed=round(time.time() - (job.get("started") or time.time()), 1),
+            job,
+            opts,
+            collected,
+            getattr(info, "language", None),
+            duration,
         )
     except Exception as exc:  # noqa: BLE001
         traceback.print_exc()
@@ -2971,6 +3094,66 @@ def retry_job(
         opts=audit_opts(opts),
     )
     store_prompt_sidecar(new_id, old["filename"], opts, source="retry", from_job=job_id)
+    return {"id": new_id}
+
+
+@app.post("/api/jobs/{job_id}/speakers")
+def relabel_speakers_endpoint(
+    job_id: str, request: Request, speakers: int = Form(0)
+) -> dict[str, Any]:
+    """Identify the speakers again with another count, without transcribing.
+
+    Auto speaker counting is the unreliable part of diarization -- call audio
+    can turn two people into five -- and Retry fixes a wrong count only by
+    transcribing the whole file again. This queues a new job over the same
+    audio and the transcript the old one already has, so the fix costs the
+    speaker pass alone. The old job is left as it was, as Retry leaves it.
+    """
+    old = get_job(job_id)
+    refusal = relabel_refusal(old)
+    if refusal is not None:
+        audit_rejection(
+            "job.relabel_rejected", request, job=job_id, reason=refusal, status=409
+        )
+        raise HTTPException(status_code=409, detail=refusal)
+
+    with JOBS_LOCK:
+        pending = sum(
+            1 for j in JOBS.values() if j["state"] in ("queued", "loading", "running")
+        )
+    if pending >= ARGS.max_queue:
+        audit_rejection(
+            "job.relabel_rejected", request, job=job_id, reason="queue-full", status=429
+        )
+        raise HTTPException(
+            status_code=429, detail=f"Queue is full ({ARGS.max_queue} jobs)"
+        )
+
+    opts = dict(old["opts"])
+    opts["diarize"] = True
+    opts["speakers"] = clamp(as_int(speakers, 0), 0, DIARIZE_MAX_SPEAKERS)
+    new_id = new_job(filename=old["filename"], path=Path(old["path"]), opts=opts)
+    # Whisper's lines, not the last pass's split of them: a new count has to be
+    # free to draw the speaker changes somewhere else.
+    patch_job(
+        new_id,
+        relabel_of=job_id,
+        transcribed=[dict(seg) for seg in old.get("transcribed") or old["segments"]],
+        language=old.get("language"),
+        duration=old.get("duration"),
+    )
+    JOB_QUEUE.put(new_id)
+    audit(
+        "job.relabelled",
+        request,
+        job=new_id,
+        from_job=job_id,
+        file=old["filename"],
+        speakers=opts["speakers"],
+    )
+    store_prompt_sidecar(
+        new_id, old["filename"], opts, source="relabel", from_job=job_id
+    )
     return {"id": new_id}
 
 

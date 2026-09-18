@@ -238,7 +238,7 @@ audit-2026-09-18.jsonl      # the events
 prompts/<job_id>.json       # full prompt/hotword text, 0600, separate
 ```
 
-Events cover uploads, retries, deletions, transcript exports, worker
+Events cover uploads, retries, speaker relabels, deletions, transcript exports, worker
 start/finish/error, VRAM evictions, model loads, the starter config being
 created, every refused request (`421` host, `403` cross-site, `401` auth) and a
 `server.started` snapshot of how the process was configured. Tokens never

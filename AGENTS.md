@@ -127,6 +127,14 @@ launcher/transcribe_tray.py --self-test --with-server   # also probes a real ser
   "a job will genuinely run", and a job does run — it just has no labels. Exit 1
   here would contradict the invariant above, and under a service wrapper it buys
   a restart loop instead of a diagnosis.
+- **Relabelling is a new job, never an edit of a finished one.**
+  `POST /api/jobs/{id}/speakers` queues a job with `relabel_of` and a copy of
+  the transcript as Whisper produced it (`transcribed`); the worker runs only
+  `label_and_finish` over it, the same tail a full transcription runs. That
+  keeps "done never leaves done" and "cancelled never leaves cancelled" true
+  without a new state. `transcribed` is a second copy of the transcript:
+  `job_public` must keep excluding it, or every 1.2 s poll carries it.
+  `relabel_refusal` is the single rule behind both the 409 and `can_relabel`.
 - **Alignment splits on speaker change, so `word_timestamps` is not optional.**
   Asking for diarization forces it on. Without word timings a whole segment can
   only go to its dominant speaker, which is the version of the feature that is
