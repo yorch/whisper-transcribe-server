@@ -403,9 +403,11 @@ drop applies to that job.
   you (see below).
 - **Identify speakers** — labels the voices in the recording `Speaker 1`,
   `Speaker 2` and so on, and splits a sentence at the point the speaker changes.
-  Off by default because it is a second pass over the audio: expect roughly
-  2 minutes per hour of recording, on the CPU, after the transcript is finished.
-  The first job that uses it downloads ~42 MB of models from GitHub.
+  **Ticked by default on this page**, so a file you drop comes back labelled;
+  untick it for a plain transcript. The API defaults it off, so a script has to
+  ask. It is a second pass over the audio: expect roughly 2 minutes per hour of
+  recording, on the CPU, after the transcript has finished. The first job that
+  uses it downloads ~42 MB of models from GitHub.
 
   The labels are **anonymous and per-recording**. `Speaker 1` in today's standup
   is not the same person as `Speaker 1` in tomorrow's, and nothing here

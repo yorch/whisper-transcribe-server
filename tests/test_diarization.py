@@ -23,6 +23,7 @@ import importlib.util
 import io
 import json
 import os
+import re
 import tarfile
 import threading
 import time
@@ -347,6 +348,27 @@ def test_alignment_survives_turns_arriving_out_of_order():
     assert [entry["speaker"] for entry in out] == [4, 9]
 
 
+def test_word_timings_jumping_backwards_do_not_mis_tag():
+    """The cursor in align_speakers only moves forward, so a backwards jump left
+    it stranded past the turn the word belonged to.
+
+    Word timings are monotonic in practice -- measured over a real transcript:
+    108 words, zero inversions -- so this is not reachable from faster-whisper
+    output today. It matters anyway because it mis-tagged *silently*, and
+    because a word landing in an earlier turn is the one case the nearest-turn
+    fallback cannot rescue: two turns back, the "nearest" side is the wrong one.
+    """
+    turns = [turn(0.0, 1.0, 10), turn(2.0, 3.0, 20), turn(4.0, 5.0, 30)]
+    segments = [
+        segment(0, 6, "a b", words=words((4.5, 4.6, " a"), (0.5, 0.6, " b"))),
+    ]
+
+    out = s.align_speakers(segments, turns)
+
+    # 'a' is inside the third turn, 'b' jumped back into the first.
+    assert [entry["speaker"] for entry in out] == [30, 10]
+
+
 def test_relabelling_is_stable_and_one_based():
     turns = [turn(10.0, 12.0, 55), turn(0.0, 2.0, 8), turn(20.0, 22.0, 55)]
 
@@ -421,6 +443,23 @@ def test_the_speaker_count_is_clamped(configured):
     low = job_opts(diarize="true", speakers=-5)
     assert high["speakers"] == s.DIARIZE_MAX_SPEAKERS
     assert low["speakers"] == 0
+
+
+def test_the_web_app_asks_for_speaker_labels_by_default(configured):
+    """Dropping a file on the page should come back labelled.
+
+    The two halves are deliberately different: the served page ships the box
+    ticked, because the person using it wants labels, while the API keeps
+    defaulting to off so a script has to say what it wants.
+
+    Read from static/ rather than a module constant: the pages moved out of
+    transcribe_server.py, and this is the shape that survived.
+    """
+    page = (s.STATIC_DIR / "index.html").read_text(encoding="utf-8")
+    assert re.search(r'id="diarize"\s+checked', page), (
+        "the Identify speakers box is no longer ticked by default"
+    )
+    assert job_opts()["diarize"] is False, "the API default should stay opt-in"
 
 
 def test_no_diarize_pins_the_feature_off(configured, monkeypatch):

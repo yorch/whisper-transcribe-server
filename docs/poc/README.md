@@ -31,7 +31,8 @@ uv run --python 3.12 --with sherpa-onnx --with numpy python calibrate.py
   wakes; if the worst gap equals the length of the pass, the GIL was held.
 - `calibrate.py` — sweeps the auto-detect threshold across the four files above
   and prints how many speakers each setting finds against the true count. This
-  is what moved the shipped default from 0.5 to 0.8.
+  is what moved the shipped default from 0.5 to 0.8, and it is the script behind
+  the table in section 5 of the design doc.
 - `e2e_check.py` — the real shipped path (child process, real weights,
   alignment, exports, the `--preload` probe) against `0-four-speakers-zh.wav`.
   Run it from the repo root with the worktree venv:
@@ -40,6 +41,17 @@ uv run --python 3.12 --with sherpa-onnx --with numpy python calibrate.py
   .venv/bin/python docs/poc/e2e_check.py .
   ```
 
+- `web_upload_check.py` — the whole application, not just the library: starts a
+  real server, checks the served page ticks *Identify speakers*, POSTs an upload
+  with the form body that page would send, and asserts the finished job has a
+  speaker on every segment and a `speakers` block in the JSON export. Needs
+  `httpx` and binds a port, so it stays out of the test suite.
+
+  ```bash
+  .venv/bin/python docs/poc/web_upload_check.py
+  ```
+
 Expected: `pipeline.py` identifies four speakers at RTF ≈ 0.04 on a multi-core
 desktop; `gil.py` prints `verdict: GIL HELD`; `calibrate.py` scores 4/4 at 0.8
-and 1/4 at 0.5; `e2e_check.py` ends with ALL END-TO-END CHECKS PASSED.
+and 1/4 at 0.5; `e2e_check.py` and `web_upload_check.py` both end with ALL
+CHECKS PASSED.

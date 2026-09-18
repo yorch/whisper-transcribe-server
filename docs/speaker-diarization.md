@@ -133,10 +133,32 @@ A C++/ONNX runtime inference framework. For diarization it composes three pieces
 that are each independently replaceable:
 
 ```
-pyannote segmentation-3.0 (ONNX)   →  "who is speaking" per 1.5s window, speaker-agnostic
+pyannote segmentation-3.0 (ONNX)   →  speech activity per frame, speaker-agnostic
 speaker embedding extractor (ONNX) →  a voiceprint per speech region
 fast clustering (built in)         →  collapse voiceprints into SPEAKER_00..N
 ```
+
+The middle line is the part that is easy to get wrong when reading about this:
+the segmentation model answers *"is someone talking, and how many overlapping
+voices"*, never *"who"*. Its speaker slots are **local to one window** and have
+no relationship to the slots in the next window — it has no memory and no
+identity. Identities come only from the third line, which is why the clustering
+threshold (or the speaker count you supply) is what decides how many people the
+transcript ends up with.
+
+Measured geometry, from the model's own metadata:
+
+| | value |
+| --- | --- |
+| window | `window_size=160000` samples = **10 s** |
+| hop | `window_shift_ratio=0.1` = **1 s** |
+| output frame | `receptive_field_shift=270` samples ≈ **17 ms** |
+| local speaker slots | `num_speakers=3` |
+| classes | `num_classes=7` = silence + 3 singles + 3 *pairs* |
+
+The 7 classes are the detail worth noticing: the model is trained on a
+**powerset**, so one frame can say "slots 1 and 3 are both active" instead of
+forcing an either/or. That is how simultaneous speech is represented at all.
 
 The Python surface is:
 
@@ -686,12 +708,55 @@ single calibrated constant with the measurement next to it.
   `--preload` probe, which reports diarization trouble without refusing to
   start; `job.diarized` / `job.diarize_failed` audit events.
 - `tests/test_diarization.py` — the GIL-isolation regression test, the child
-  protocol, an alignment case per failure mode, the export shapes, and an
-  opt-in test against the real model.
+  protocol, an alignment case per failure mode, the export shapes, a regression
+  for the non-monotonic-cursor mis-tag (§9.1), and an opt-in test against the
+  real model.
 - `tests/test_ui_preview.py` — the append-only preview now redraws when labels
   arrive, with the gutter present but empty beforehand so rows do not shift.
-- `docs/poc/` — the measurements, and `e2e_check.py` for the real path.
+- `docs/poc/` — the measurements, `e2e_check.py` for the real path, and
+  `web_upload_check.py` for the whole application: it starts a server, checks the
+  page ticks the box, uploads, and asserts the job comes back tagged.
 - `README.md`, `AGENTS.md` — the operator view and the three new invariants.
+
+Two things were settled after the first merge, both from re-reading the code
+rather than from a failing test:
+
+### 9.1 The alignment cursor assumed time only moves forward
+
+`speaker_for` walks `segments` and `turns` together with one cursor that never
+goers back. A word whose start is *earlier* than a previously seen one therefore
+left the cursor stranded past the turn it belonged to, and the word was silently
+attributed to a neighbour. Jumping back exactly one turn happened to survive,
+because the nearest-turn fallback computes a negative gap and picks the earlier
+side; two turns back it picks the wrong one.
+
+Measured exposure before fixing it: **108 real words from faster-whisper, zero
+inversions**, and the largest backwards gap between consecutive words was
+**0.00 s**. So it was unreachable — but it failed by mis-tagging rather than by
+raising, in the one function whose entire job is to get the tags right, so the
+fix is cheap: remember the previous word's start and reset the cursor when time
+goes backwards. The reset costs one scan of the turns and only fires on input
+that does not occur.
+
+### 9.2 The web page now asks for labels, the API still does not
+
+A dropped file should come back labelled, so the *Identify speakers* box ships
+ticked. The API keeps `diarize=false` as its default, so a script has to say
+what it wants. The consequence to be aware of is that word-level timings are
+force-enabled by that box (see §7.2), so a web upload is slower than it used to
+be: roughly +36% against `base`, +3.7% against `large-v3`.
+
+Ticking the box in the markup created one interaction worth recording, because
+it is the kind of thing a changed default hides: the script that couples the two
+boxes ran at page load, before `/api/status` had said whether the server offers
+diarization at all. On a `--no-diarize` server the control is hidden — so the
+page would have sat there with **word timings ticked and disabled for a feature
+that does not exist**, quietly changing what the export contains. The coupling
+now consults `DIARIZE_OK` and is applied only once status has answered.
+
+The tagging itself was never at risk from that: `build_opts` forces word timings
+server-side whenever diarization is on, so the client-side lock is an affordance
+rather than the guarantee.
 
 Not built, and deliberately: server-side speaker names (§7.4), a GPU
 `onnxruntime` path (§4.3), and crossing-diarization identities.

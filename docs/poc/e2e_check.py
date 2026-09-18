@@ -5,9 +5,9 @@ The test suite stubs the child on purpose, so it can run in a few seconds and
 without 42 MB of weights. This drives the actual shipped path instead, because
 stubs assert the protocol and not the answers:
 
-    ensure_diarize_models() -> run_diarizer()   (spawns DIARIZE_WORKER, real
-                                                 .onnx, decodes via PyAV)
-                            -> align_speakers() -> render()
+    fetch_diarize_models_or_explain() -> run_diarizer()  (spawns DIARIZE_WORKER,
+                                                 real .onnx, decodes via PyAV)
+                                      -> align_speakers() -> render()
 
 Run it against the segmentation model's sample recordings. Download them with
 the commands in this directory's README, then:
@@ -75,9 +75,13 @@ s.ARGS = type(
     },
 )()
 
-print("== ensure_diarize_models (verifies the pinned hashes) ==")
+print("== fetch_diarize_models_or_explain (the real entry point) ==")
 t0 = time.perf_counter()
-models = s.ensure_diarize_models()
+# Not ensure_diarize_models(): the preflight is where the sherpa-onnx check
+# lives, so calling it is what the server actually does, and skipping it is how
+# this script would otherwise reach run_diarizer with no sherpa-onnx installed
+# and get a child's ModuleNotFoundError instead of an explanation.
+models = s.fetch_diarize_models_or_explain()
 print(
     f"   resolved in {time.perf_counter() - t0:.2f}s: "
     f"{ {k: v.name for k, v in models.items()} }"
