@@ -221,7 +221,27 @@ def test_a_corrupt_download_is_rejected_and_leaves_nothing_behind(
     assert leftovers == [], f"a failed fetch left {leftovers} in the model dir"
 
 
+def sherpa_present(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pretend sherpa-onnx is importable.
+
+    The suite has to pass on an interpreter without it -- that is precisely what
+    `uv run tests/test_cuda_bootstrap.py` provides -- so any test that exercises
+    the code *past* the preflight has to say so, rather than depending on what
+    happens to be installed on the machine running it.
+    """
+    real = importlib.util.find_spec
+    monkeypatch.setattr(
+        s.importlib.util,
+        "find_spec",
+        lambda name, *a, **k: object()
+        if name == "sherpa_onnx"
+        else real(name, *a, **k),
+    )
+
+
 def test_a_failed_fetch_is_reported_with_the_way_out(configured, monkeypatch):
+    sherpa_present(monkeypatch)
+
     def boom(url: str, dest: Path) -> None:
         raise OSError("no route to host")
 
@@ -564,22 +584,41 @@ def test_preload_warns_but_still_starts_when_diarization_is_unavailable(
     assert "Speaker identification ready" not in out, "no false all-clear"
 
 
-def test_preload_reports_a_missing_sherpa_onnx_in_plain_words(
-    configured, monkeypatch
-):
-    """Not the child's ModuleNotFoundError several frames deep: the fix is a
-    different command, not a different file."""
-    real_find_spec = importlib.util.find_spec
+def sherpa_absent(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The other direction: an interpreter with no sherpa-onnx installed."""
+    real = importlib.util.find_spec
     monkeypatch.setattr(
         s.importlib.util,
         "find_spec",
-        lambda name, *a, **k: None
-        if name == "sherpa_onnx"
-        else real_find_spec(name, *a, **k),
+        lambda name, *a, **k: None if name == "sherpa_onnx" else real(name, *a, **k),
     )
 
+
+def test_a_missing_sherpa_onnx_is_reported_in_plain_words(
+    configured, monkeypatch
+):
+    """Not the child's ModuleNotFoundError several frames deep: the fix is a
+    different command, not a different file.
+
+    This lives in the preflight rather than in run_diarizer on purpose -- see
+    the comment there. The stub-worker tests in this file have to keep working
+    on an interpreter with no sherpa-onnx installed, which is exactly what the
+    clean-environment suite is.
+    """
+    sherpa_absent(monkeypatch)
+
     with pytest.raises(RuntimeError, match="uv run transcribe_server.py"):
-        s.run_diarizer("meeting.wav", 0, FAKE_MODELS)
+        s.fetch_diarize_models_or_explain()
+
+
+def test_run_diarizer_does_not_require_sherpa_onnx_itself(configured, monkeypatch):
+    """It spawns whatever worker it is given, so it stays testable anywhere."""
+    sherpa_absent(monkeypatch)
+    monkeypatch.setattr(
+        s, "DIARIZE_WORKER", worker('emit({"t": "turns", "turns": [[0, 1, 5]]})')
+    )
+
+    assert s.run_diarizer("meeting.wav", 0, FAKE_MODELS) == [turn(0.0, 1.0, 1)]
 
 
 def test_preload_still_fails_when_the_transcriber_cannot_encode(

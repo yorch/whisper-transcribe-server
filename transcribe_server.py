@@ -1649,7 +1649,18 @@ def align_speakers(
 
 
 def fetch_diarize_models_or_explain() -> dict[str, Path]:
-    """Fetch the weights, or raise something the operator can act on."""
+    """Everything that has to be true before a child can run, or a clear reason."""
+    # Say this in the parent's words rather than letting the child die with a
+    # ModuleNotFoundError several frames deep: the fix is a different command,
+    # not a different file. Deliberately here and not in run_diarizer, which
+    # stays a dumb "spawn this worker, parse its output" so it can be tested
+    # with a stub worker on an interpreter that has no sherpa-onnx at all.
+    if importlib.util.find_spec("sherpa_onnx") is None:
+        raise RuntimeError(
+            "sherpa-onnx is not installed for this interpreter. It is declared "
+            "in the script's inline dependencies, so run it through uv "
+            "(uv run transcribe_server.py); otherwise pip install sherpa-onnx"
+        )
     try:
         return ensure_diarize_models()
     except Exception as exc:  # noqa: BLE001
@@ -1681,16 +1692,6 @@ def run_diarizer(
 
     if stopped():
         return None
-
-    # Say this in the parent's words rather than letting the child die with a
-    # ModuleNotFoundError several frames deep: the fix is a different command,
-    # not a different file.
-    if importlib.util.find_spec("sherpa_onnx") is None:
-        raise RuntimeError(
-            "sherpa-onnx is not installed for this interpreter. It is declared "
-            "in the script's inline dependencies, so run it through uv "
-            "(uv run transcribe_server.py); otherwise pip install sherpa-onnx"
-        )
 
     command = [
         sys.executable,
