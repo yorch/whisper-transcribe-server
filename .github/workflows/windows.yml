@@ -99,13 +99,20 @@ jobs:
         # its console output is not reliably captured: read the report it writes
         # instead of trusting an exit code.
         run: |
+          $report = Join-Path $env:LOCALAPPDATA "TranscriptionServer\self-test.log"
+          # Delete it first. A stale report from an earlier run reads like a
+          # pass and hides the failure it was meant to explain.
+          Remove-Item $report -ErrorAction SilentlyContinue
+
           & "dist\TranscriptionServer\Transcription Server.exe" --self-test --with-server
           $code = $LASTEXITCODE
-          $report = Join-Path $env:LOCALAPPDATA "TranscriptionServer\self-test.log"
-          if (Test-Path $report) {
-            Get-Content $report
-          } else {
-            throw "the self-test wrote no report; the check cannot be trusted"
+
+          if (-not (Test-Path $report)) {
+            throw "the self-test wrote no report; the run cannot be trusted"
+          }
+          Get-Content $report
+          if (-not (Select-String -Path $report -Pattern "readiness probe" -Quiet)) {
+            throw "the report has no readiness probe; --with-server did not run"
           }
           if ($code -ne 0) { throw "bundled launcher self-test failed" }
         timeout-minutes: 15

@@ -592,18 +592,33 @@ def self_test(with_server: bool = False) -> int:
     check("icon renders", make_icon_image().size == (64, 64))
 
     if with_server:
-        check("readiness probe against a real server", end_to_end_probe())
+        # A crash here must be a recorded failure, not a lost traceback. The
+        # bundle is a windowed executable: an unhandled exception prints to a
+        # stdout nobody captures, the report never gets written, and the run
+        # fails with no explanation of why.
+        try:
+            probed = end_to_end_probe()
+        except Exception as exc:  # noqa: BLE001
+            emit(f"  probe raised: {type(exc).__name__}: {exc}")
+            probed = False
+        check("readiness probe against a real server", probed)
 
     emit(
         f"\n{'all checks passed' if not failures else 'FAILURES: ' + ', '.join(failures)}"
     )
 
     # Durable evidence, not just an exit code: CI reads this back, and "Show
-    # log" in the tray can point at it when something looks wrong.
+    # log" in the tray can point at it when something looks wrong. Written on
+    # every path, including the failing ones, so the report can be trusted to
+    # describe this run rather than an earlier one.
     report = launcher_dir() / "self-test.log"
     with contextlib.suppress(OSError):
         report.parent.mkdir(parents=True, exist_ok=True)
-        report.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        report.write_text(
+            f"{time.strftime('%Y-%m-%d %H:%M:%S')}  "
+            f"with_server={with_server}\n" + "\n".join(lines) + "\n",
+            encoding="utf-8",
+        )
 
     return 1 if failures else 0
 
@@ -633,7 +648,10 @@ def end_to_end_probe(timeout: float = 900.0) -> bool:
     command = build_command(uv, port, [], script)
     env = child_env(None)
     env["TRANSCRIBE_TOKEN"] = token
-    server = ServerProcess(command, env, launcher_dir() / "self-test.log")
+    # Deliberately not self-test.log: that is the report's file, and the
+    # server's banner would overwrite the very evidence this probe exists to
+    # produce.
+    server = ServerProcess(command, env, launcher_dir() / "self-test-server.log")
     server.start()
     try:
         return wait_for_ready(port, token, server, timeout)
