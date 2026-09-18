@@ -889,6 +889,7 @@ CONTROL_HARNESS = """
 const controls = {
   diarize: {checked: true},
   words: {checked: false, disabled: false, title: ""},
+  speakers: {disabled: false},
 };
 const el = (id) => controls[id];
 let DIARIZE_OK = false;
@@ -955,6 +956,40 @@ def test_asking_for_speakers_ticks_and_locks_word_timings():
     assert probe["words"] is True
     assert probe["disabled"] is True, "the operator should see why it is on"
     assert "speaker" in probe["title"]
+
+
+def test_the_speaker_count_sits_in_the_main_controls():
+    """It decides whether the labels are right, and Auto is often wrong on call
+    audio, so it cannot live behind Advanced where it went unnoticed."""
+    html = page_html()
+    controls = html[html.index('<div class="controls">') : html.index("<details")]
+    assert 'id="diarize"' in controls and 'id="speakers"' in controls
+    assert '<option value="0" selected>Auto</option>' in controls
+
+
+@needs_node
+def test_the_speaker_choices_are_auto_then_every_count_the_server_takes():
+    program = (
+        function_source("speakerChoices")
+        + "\nprocess.stdout.write(JSON.stringify([speakerChoices(4), speakerChoices(0),"
+        + " speakerChoices(undefined)]));"
+    )
+    four, none, missing = json.loads(run_node(program))
+    assert four == [["0", "Auto"], ["1", "1"], ["2", "2"], ["3", "3"], ["4", "4"]]
+    assert none == [["0", "Auto"]] and missing == [["0", "Auto"]]
+
+
+@needs_node
+def test_the_speaker_count_is_disabled_while_labels_are_off():
+    probe = control_probe(
+        """
+        DIARIZE_OK = true; controls.diarize.checked = false; syncDiarize();
+        const off = controls.speakers.disabled;
+        controls.diarize.checked = true; syncDiarize();
+        return {off, on: controls.speakers.disabled};
+        """
+    )
+    assert probe == {"off": True, "on": False}
 
 
 @needs_node

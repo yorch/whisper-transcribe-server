@@ -394,6 +394,34 @@ hour-long recording.
   `thorough` buys a little accuracy for noticeably more time.
 - **Skip silence** — VAD filtering. Speeds up meetings with long dead air and
   reduces hallucinated text during silence. Worth leaving on.
+- **Identify speakers** — labels the voices in the recording `Speaker 1`,
+  `Speaker 2` and so on, and splits a sentence at the point the speaker changes.
+  **Ticked by default on this page**, so a file you drop comes back labelled;
+  untick it for a plain transcript. The API defaults it off, so a script has to
+  ask. It is a second pass over the audio: expect roughly 2 minutes per hour of
+  recording, on the CPU, after the transcript has finished. The first job that
+  uses it downloads ~42 MB of models from GitHub.
+
+  The labels are **anonymous and per-recording**. `Speaker 1` in today's standup
+  is not the same person as `Speaker 1` in tomorrow's, and nothing here
+  recognises a voice across files. What it can do is tell apart the people in
+  *this* meeting.
+
+  **Set Speakers to the real count if you know it** — it sits right next to the
+  box for that reason. Left on _Auto_ it guesses, and the guess is a clustering
+  threshold tuned on a handful of recordings: call audio in particular (Zoom,
+  Teams) tends to make one voice sound like several, and a two-person call can
+  come back as five speakers. Pinned to the real number it is much more
+  reliable. On two similar voices, or on a video call
+  where each remote participant arrives through a different codec, even that can
+  merge people or split one person in two. `Speaker 2` appearing for a single
+  line is usually the diarizer being unsure, not a new person.
+
+  The labels ride along in every export: `Speaker 1: ...` in `.txt` and `.srt`,
+  `<v Speaker 1>` in `.vtt`, and a `speaker` field per segment plus a `speakers`
+  totals block in `.json`. If the diarization pass fails, the transcript still
+  finishes and the job says why — an hour of transcription is worth more than
+  its labels.
 - **Follow** — in the header above the job cards, since it acts on them rather
   than on the next run. Keeps the newest line of every live preview in view.
   Remembered for the browser session. Scrolling up pauses it (the preview border goes
@@ -411,31 +439,6 @@ hour-long recording.
   are useful on their own, and **Identify speakers** turns this on for you. That
   box is ticked by default, so this one is too and is locked while it is; on a
   server started with `--no-diarize` neither happens.
-- **Identify speakers** — labels the voices in the recording `Speaker 1`,
-  `Speaker 2` and so on, and splits a sentence at the point the speaker changes.
-  **Ticked by default on this page**, so a file you drop comes back labelled;
-  untick it for a plain transcript. The API defaults it off, so a script has to
-  ask. It is a second pass over the audio: expect roughly 2 minutes per hour of
-  recording, on the CPU, after the transcript has finished. The first job that
-  uses it downloads ~42 MB of models from GitHub.
-
-  The labels are **anonymous and per-recording**. `Speaker 1` in today's standup
-  is not the same person as `Speaker 1` in tomorrow's, and nothing here
-  recognises a voice across files. What it can do is tell apart the people in
-  *this* meeting.
-
-  **Set the speaker count if you know it.** Left at 0 it guesses, and the guess
-  is a clustering threshold tuned on a handful of recordings; pinned to the real
-  number it is much more reliable. On two similar voices, or on a video call
-  where each remote participant arrives through a different codec, even that can
-  merge people or split one person in two. `Speaker 2` appearing for a single
-  line is usually the diarizer being unsure, not a new person.
-
-  The labels ride along in every export: `Speaker 1: ...` in `.txt` and `.srt`,
-  `<v Speaker 1>` in `.vtt`, and a `speaker` field per segment plus a `speakers`
-  totals block in `.json`. If the diarization pass fails, the transcript still
-  finishes and the job says why — an hour of transcription is worth more than
-  its labels.
 - **Carry context forward** — off by default, and that's deliberate. Whisper's
   `condition_on_previous_text` is the usual cause of repetition loops on long
   recordings: one bad segment poisons the context and it repeats a phrase for

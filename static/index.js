@@ -111,10 +111,11 @@ async function refreshStatus(){
       // Precision is a property of this machine, not of a recording. It only
       // appears if the operator explicitly opened it up.
       if(s.allow_precision_choice) el("compute-field").classList.remove("locked");
+      fillSpeakers(s.diarize_max_speakers);
       if(!DIARIZE_OK){
         el("diarize").checked = false;
-        el("diarize-row").classList.add("locked");
-        el("diarize-hint").classList.add("locked");
+        for(const id of ["diarize-field", "speakers-field", "diarize-hint"])
+          el(id).classList.add("locked");
       }
       /* Now that DIARIZE_OK is known, apply the word-timing coupling -- or
          leave that box alone if the server has no diarization to couple it
@@ -136,6 +137,25 @@ async function refreshStatus(){
 
 /* ---------- upload ---------- */
 let MAX_MB = 0, RETRY_OK = true, POPULATED = false, DIARIZE_OK = false;
+
+/* Auto, then every count the server accepts. A pure list so the choices can be
+   tested without a browser; fillSpeakers() only turns it into options. */
+function speakerChoices(max){
+  const out = [["0", "Auto"]];
+  for(let n = 1; n <= (Number(max) || 0); n++) out.push([String(n), String(n)]);
+  return out;
+}
+
+function fillSpeakers(max){
+  const node = el("speakers");
+  node.textContent = "";
+  for(const [value, label] of speakerChoices(max)){
+    const o = document.createElement("option");
+    o.value = value;
+    o.textContent = label;
+    node.append(o);
+  }
+}
 
 function fill(id, values, selected){
   const node = el(id);
@@ -372,6 +392,8 @@ function syncDiarize(){
   if(on) el("words").checked = true;
   el("words").disabled = on;
   el("words").title = on ? "Required for speaker labels" : "";
+  // A count for labels nobody asked for would read as a setting that applies.
+  el("speakers").disabled = !el("diarize").checked;
 }
 el("diarize").addEventListener("change", syncDiarize);
 /* Deliberately not called here: DIARIZE_OK is only known once /api/status has

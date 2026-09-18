@@ -375,7 +375,7 @@ def test_locked_wins_against_the_rule_it_is_hiding():
     is styled by. A bare `.locked{display:none}` does not: `label.field` and
     `.adv-row` are element selectors in index.css, which loads after app.css, so
     the Precision field stayed visible on a server that pins precision and the
-    speaker row stayed visible on one started with --no-diarize."""
+    speaker controls stayed visible on one started with --no-diarize."""
     assert re.search(
         r"\.locked\s*\{\s*display:\s*none\s*!important", asset("app.css")
     ), ".locked must outrank the display rules it hides"
@@ -383,8 +383,9 @@ def test_locked_wins_against_the_rule_it_is_hiding():
     # The two the bug was visible on, pinned by name so the reason is on record.
     html = asset("index.html")
     assert re.search(r'class="field locked"[^>]*id="compute-field"', html)
-    assert re.search(r'class="adv-row"[^>]*id="diarize-row"', html)
-    assert re.search(r"\.adv-row\{[^}]*display:flex", asset("index.css"))
+    assert re.search(r'class="field"[^>]*id="diarize-field"', html)
+    assert re.search(r'class="field"[^>]*id="speakers-field"', html)
+    assert re.search(r"label\.field\{[^}]*display:flex", asset("index.css"))
 
 
 # --------------------------------------------------------------------------- #
