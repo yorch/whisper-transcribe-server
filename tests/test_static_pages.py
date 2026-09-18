@@ -262,6 +262,50 @@ def test_static_assets_are_served_with_a_usable_type(client, name, mime):
     assert mime in response.headers["content-type"]
 
 
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/",
+        "/audit",
+        "/static/index.js",
+        "/static/common.js",
+        "/static/audit.js",
+        "/static/app.css",
+        "/static/index.css",
+        "/static/audit.css",
+    ],
+)
+def test_the_page_and_its_assets_are_revalidated(client, path):
+    """A reload after an upgrade must not mix a new page with the old script.
+
+    StaticFiles answers with ETag and Last-Modified but no Cache-Control, which
+    lets a browser reuse its own copy without asking; the HTML routes send no
+    validators at all, so those are always refetched. Together that served a new
+    page next to the previous version of index.js — a Transcribe button that did
+    nothing, and a bug already fixed in the script still happening, with nothing
+    on screen saying which version was running. no-cache (not no-store) keeps the
+    revalidation, and its 304, cheap.
+    """
+    response = client.get(path)
+
+    assert response.headers.get("Cache-Control") == "no-cache", (
+        f"{path} may be reused from the browser cache without asking"
+    )
+
+
+def test_revalidation_still_answers_304_with_the_header(client):
+    """no-cache means revalidate, not re-download: the ETag must still work, and
+    the 304 has to carry the header too or the copy goes back to being fresh."""
+    first = client.get("/static/index.js")
+
+    again = client.get(
+        "/static/index.js", headers={"if-none-match": first.headers["etag"]}
+    )
+
+    assert again.status_code == 304
+    assert again.headers.get("Cache-Control") == "no-cache"
+
+
 def test_a_missing_static_dir_is_a_clear_error_not_a_blank_page(client, monkeypatch):
     monkeypatch.setattr(s, "STATIC_DIR", s.STATIC_DIR / "nope")
 

@@ -148,17 +148,23 @@ const TICKS = 40;
 const views = new Map();
 const RETRY_OK = true;
 const jobsBox = {children: [], prepend: (kid) => { jobsBox.children.unshift(kid); }};
+const domIds = new Map();
 function makeNode(){
   const node = {
-    className: "", id: "", title: "", dataset: {}, children: [],
+    className: "", title: "", dataset: {}, children: [],
     isConnected: true, scrollHeight: 0, scrollTop: 0, clientHeight: 100,
-    _text: "",
+    _text: "", _id: "",
     append(...kids){
       node.children.push(...kids);
       if(node.className === "transcript") node.scrollHeight = node.children.length * 20;
     },
     prepend(kid){ node.children.unshift(kid); },
     addEventListener(){},
+    remove(){
+      domIds.delete(node._id);
+      const at = jobsBox.children.indexOf(node);
+      if(at >= 0) jobsBox.children.splice(at, 1);
+    },
     classList: {add(){}, remove(){}, toggle(name, on){ if(name === "paused") node.paused = on; }},
   };
   // A browser drops the children when textContent is set, which is how
@@ -171,11 +177,21 @@ function makeNode(){
       if(node.className === "transcript"){ node.scrollHeight = 0; node.scrollTop = 0; }
     },
   });
+  // Ids are looked up by the stale-job sweep, so assigning one has to register.
+  Object.defineProperty(node, "id", {
+    get(){ return node._id; },
+    set(value){ domIds.delete(node._id); node._id = value; if(value) domIds.set(value, node); },
+  });
   return node;
 }
 const document = {
   createElement: () => makeNode(),
-  getElementById: (id) => (id === "jobs" ? jobsBox : {checked: true}),
+  getElementById: (id) => {
+    if(id === "jobs") return jobsBox;
+    if(id === "follow") return {checked: true};
+    // Anything else is a control tick() only toggles a class on.
+    return domIds.get(id) || {classList: {toggle(){}}};
+  },
 };
 const el = (id) => document.getElementById(id);
 """
@@ -208,6 +224,124 @@ def card_probe(body: str) -> dict:
         + "})()));"
     )
     return json.loads(run_node(program))
+
+
+# A fake server whose transcript grows a segment per poll, the way the real one
+# does, plus the state tick() keeps between polls.
+POLL_SERVER = """
+const known = new Map();
+let unlocked = true;
+let polls = [];
+const server = {listed: true, segments: [], state: "running", progress: 0,
+                labeled: false};
+async function api(path){
+  polls.push(path);
+  if(path === "/api/jobs")
+    return {json: async () => ({jobs: server.listed ? [{id: "abc", state: server.state,
+      progress: server.progress, segment_count: server.segments.length}] : []})};
+  const since = Number(/since=(\\d+)/.exec(path)[1]);
+  return {json: async () => ({id: "abc", filename: "a.wav", state: server.state,
+    progress: server.progress, opts: {model: "small"}, elapsed: 4, duration: 20,
+    language: "en", segment_start: since, segment_count: server.segments.length,
+    speaker_labels: server.labeled, segments: server.segments.slice(since)})};
+}
+"""
+
+
+def poll_probe(body: str) -> dict:
+    """Run `body` against the real tick(), a fake server and the DOM stub."""
+    program = (
+        CARD_HARNESS
+        + POLL_SERVER
+        + "\n".join(
+            function_source(name)
+            for name in (
+                "viewKey",
+                "fmtStamp",
+                "fmtTime",
+                "meter",
+                "statusLine",
+                "jobTags",
+                "followOn",
+                "stick",
+                "setPaused",
+                "appendSegments",
+                "actions",
+                "createCard",
+                "render",
+                "tick",
+            )
+        )
+        + "\n(async () => { process.stdout.write(JSON.stringify(await (async () => {"
+        + body
+        + "})())); })();"
+    )
+    return json.loads(run_node(program))
+
+
+@needs_node
+def test_several_jobs_at_once_each_keep_one_card():
+    """The multi-file case: three jobs in different states, ten polls, and one
+    card per job — with each card's transcript grown from its own tail."""
+    probe = poll_probe(
+        """
+        // A second and third job, alongside the running one the harness sets up.
+        const others = [
+          {id: "done-1", filename: "b.wav", state: "done", progress: 1,
+           segments: [{start: 0, text: "finished"}], labeled: false},
+          {id: "queued-1", filename: "c.wav", state: "queued", progress: 0,
+           segments: [], labeled: false},
+        ];
+        const jobJson = (j) => ({id: j.id, filename: j.filename, state: j.state,
+          progress: j.progress, opts: {model: "small"}, elapsed: 2, duration: 9,
+          language: "en", segment_count: j.segments.length, speaker_labels: j.labeled,
+          segments: j.segments});
+        api = async (path) => {
+          polls.push(path);
+          if(path === "/api/jobs")
+            return {json: async () => ({jobs: [
+              {id: "abc", state: server.state, progress: server.progress,
+               segment_count: server.segments.length},
+              ...others.map(j => ({id: j.id, state: j.state, progress: j.progress,
+                                   segment_count: j.segments.length}))]})};
+          const since = Number(/since=(\\d+)/.exec(path)[1]);
+          const box = /\\/api\\/jobs\\/([^?]+)/.exec(path)[1];
+          const j = box === "abc"
+            ? {id: "abc", filename: "a.wav", state: server.state,
+               progress: server.progress, segments: server.segments, labeled: server.labeled}
+            : others.find(o => o.id === box);
+          return {json: async () => Object.assign(jobJson(j),
+            {segment_start: since, segments: j.segments.slice(since)})};
+        };
+        const counts = [];
+        for(let i = 1; i <= 10; i++){
+          server.progress = i / 10;
+          server.segments.push({start: i * 3, text: "line " + i});
+          if(i === 3) others[1].state = "running";   // the queue starts moving
+          if(i === 6) others[1].state = "done";
+          await tick();
+          counts.push(jobsBox.children.length);
+        }
+        const rowsFor = (id) => views.get(viewKey(id)).transcript.children
+          .map(r => r.children[2].textContent);
+        return {
+          counts,
+          cards: jobsBox.children.length,
+          remembered: views.size,
+          running: rowsFor("abc"),
+          done: rowsFor("done-1"),
+          wasQueued: rowsFor("queued-1"),
+        };
+        """
+    )
+    assert probe["counts"] == [3] * 10, probe["counts"]
+    assert probe["cards"] == 3
+    assert probe["remembered"] == 3
+    assert probe["running"] == [f"line {i}" for i in range(1, 11)]
+    assert probe["done"] == ["finished"], (
+        "a finished job's transcript must not be rebuilt"
+    )
+    assert probe["wasQueued"] == [], "a queued job has nothing to show yet"
 
 
 # --------------------------------------------------------------------------- #
@@ -269,6 +403,127 @@ def test_every_view_lookup_keys_the_map_the_same_way():
 
 
 @needs_node
+def test_a_whole_job_run_leaves_exactly_one_card():
+    """The symptom the operator reported, executed end to end: ten polls of a
+    job whose transcript grows, through the real tick() and render(). Exactly
+    one card, one meter and every segment — the bug built one per step."""
+    probe = poll_probe(
+        """
+        const afterEach = [];
+        for(let i = 1; i <= 10; i++){
+          server.progress = i / 10;
+          server.segments.push({start: i * 3, text: "line " + i});
+          await tick();
+          afterEach.push(jobsBox.children.length);
+        }
+        const view = views.get(viewKey("abc"));
+        return {
+          cardsPerStep: afterEach,
+          cards: jobsBox.children.length,
+          remembered: views.size,
+          rows: view.transcript.children.length,
+          texts: view.transcript.children.map(r => r.children[2].textContent),
+          lit: view.meter.children.filter(c => c.className === "lit").length,
+          fullRefetches: polls.filter(p => p.endsWith("since=0")).length,
+          status: view.status.textContent,
+        };
+        """
+    )
+    assert probe["cardsPerStep"] == [1] * 10, probe["cardsPerStep"]
+    assert probe["cards"] == 1
+    assert probe["remembered"] == 1
+    assert probe["rows"] == 10, "a poll added nothing, or rebuilt the rows"
+    assert probe["texts"] == [f"line {i}" for i in range(1, 11)]
+    assert probe["lit"] == 40, "the last poll is 100% done"
+    # One full fetch, on the first poll when the client has nothing yet; every
+    # later poll asks for the tail only.
+    assert probe["fullRefetches"] == 1, probe["fullRefetches"]
+    assert probe["status"].startswith("100% \u00b7 10 segments"), probe["status"]
+
+
+@needs_node
+def test_the_card_survives_the_labels_landing_and_a_job_ending():
+    """Diarization rewrites the transcript in one batch, then the job finishes —
+    the order run_job actually patches it. The label patch alone does not change
+    what the poll signature watches (state, progress, segment count), so that
+    tick is skipped; the finish that follows immediately is what brings the
+    labels in. Either way the card keeps its identity and its rows."""
+    probe = poll_probe(
+        """
+        const snap = () => ({cards: jobsBox.children.length,
+                             same: views.get(viewKey("abc")) === first});
+        server.segments.push({start: 0, text: "one"});
+        await tick();
+        const first = views.get(viewKey("abc"));
+        const beforeLabels = snap();
+        server.segments.push({start: 3, text: "two"});
+        server.progress = 0.9;
+        await tick();
+        const running = snap();
+        /* The diarization patch: the same two segments, now labelled, with
+           nothing else about the job moved. */
+        server.labeled = true;
+        server.segments[0].speaker = 1;
+        server.segments[1].speaker = 2;
+        await tick();
+        const labelledOnly = {cards: jobsBox.children.length, rows: first.transcript.children.length,
+                              speakers: first.transcript.children.map(r => r.children[1].textContent)};
+        /* And the finish, which is what the client actually reacts to. */
+        server.state = "done";
+        server.progress = 1;
+        await tick();
+        return {beforeLabels, running, labelledOnly, done: snap(),
+                speakers: first.transcript.children.map(r => r.children[1].textContent),
+                rows: first.transcript.children.length,
+                fullRefetches: polls.filter(p => p.endsWith("since=0")).length};
+        """
+    )
+    assert probe["beforeLabels"] == {"cards": 1, "same": True}
+    assert probe["running"] == {"cards": 1, "same": True}
+    assert probe["labelledOnly"] == {"cards": 1, "rows": 2, "speakers": ["", ""]}, (
+        "nothing about the job moved, so the poll had nothing to act on"
+    )
+    assert probe["done"] == {"cards": 1, "same": True}
+    assert probe["speakers"] == ["Speaker 1", "Speaker 2"], (
+        "the label refetch did not rebuild the rows in place"
+    )
+    assert probe["rows"] == 2, "the rebuild must not duplicate or drop rows"
+    assert probe["fullRefetches"] == 2, (
+        "one full fetch to start, one when the labels landed"
+    )
+
+
+@needs_node
+def test_the_sweep_removes_the_card_and_forgets_the_view():
+    """A job that leaves the list takes its card with it and is forgotten, so a
+    job that comes back is rebuilt once rather than accumulated."""
+    probe = poll_probe(
+        """
+        server.segments.push({start: 0, text: "one"});
+        await tick();
+        const painted = jobsBox.children.length;
+        server.listed = false;
+        await tick();
+        const gone = {cards: jobsBox.children.length, remembered: views.size,
+                      known: known.size};
+        // It comes back — a re-queued or re-added job — and must be one card.
+        server.listed = true;
+        server.segments.push({start: 4, text: "two"});
+        await tick();
+        server.segments.push({start: 8, text: "three"});
+        await tick();
+        return {painted, gone, back: {cards: jobsBox.children.length,
+                                      remembered: views.size,
+                                      rows: views.get(viewKey("abc")).transcript.children.length}};
+        """
+    )
+    assert probe["painted"] == 1
+    assert probe["gone"] == {"cards": 0, "remembered": 0, "known": 0}
+    assert probe["back"] == {"cards": 1, "remembered": 1, "rows": 3}, (
+        "a returning job must start one fresh card, not a second one"
+    )
+
+
 def test_a_progress_step_reuses_the_card_instead_of_building_another_one():
     """The regression, executed: two polls of the same running job must leave
     exactly one card in the DOM, holding one meter and both segments."""

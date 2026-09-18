@@ -2681,6 +2681,17 @@ async def guard(request: Request, call_next):
     elapsed = round((time.perf_counter() - started) * 1000, 1)
     hardened(response)
 
+    # The page and the assets it loads must be revalidated, never reused blind.
+    # StaticFiles sends ETag and Last-Modified but no Cache-Control, which lets
+    # a browser keep its own copy without asking -- and an HTML page cannot be
+    # cached that way, because it carries no validators at all. So a reload
+    # after an upgrade used to hand the operator the *new* page next to the
+    # *old* script: a Transcribe button that did nothing, and a bug fixed in
+    # the script still happening, with nothing on screen to say which version
+    # was running. no-cache (not no-store) keeps the 304 revalidation cheap.
+    if path in ("/", "/audit") or path.startswith("/static/"):
+        response.headers["Cache-Control"] = "no-cache"
+
     # Polling endpoints are chatty, so reads are opt-in. Everything that
     # changes state or moves a transcript out logs itself at the source.
     if path.startswith("/api/") and not path.startswith("/api/audit"):
