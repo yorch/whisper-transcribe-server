@@ -29,10 +29,16 @@ push failure as a blocker.
 ## Tests
 
 ```bash
-.venv/bin/pytest -q                    # 192 tests (2 skip without the CUDA wheels)
+.venv/bin/pytest -q                    # whole suite; no GPU or model needed
 uvx ruff check .                       # configured by ruff.toml
+uvx ruff format --check .              # the formatter that rewrites files post-commit
 uvx pyright --project pyrightconfig.json
 ```
+
+The test count is deliberately not quoted: it went 170 → 212 in a single day of
+parallel sessions, and a stale number is worse than none. `uvx ruff format
+--check .` is the same formatter that rewrites files *after* a commit (see Git
+hygiene above); a clean `ruff check` does not imply a formatted file.
 
 `uv run tests/test_cuda_bootstrap.py` runs the same suite in a throwaway env
 with no `.venv` and no CUDA wheels; the two `tests/test_gpu.py` tests that need
