@@ -1,0 +1,16 @@
+# The workflow pins its actions to commit SHAs, which is the hardening zizmor
+# asks for: a moved tag cannot silently change what runs in CI. The cost is that
+# pins do not update themselves, so this keeps them current instead.
+#
+# The cooldown is the other half of that trade: a release adopted within hours
+# of publication is a release nobody has had time to notice is malicious.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: "ci"

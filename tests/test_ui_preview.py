@@ -22,11 +22,12 @@ import subprocess
 import pytest
 
 import transcribe_server as s
+from transcribe_server import STATIC_DIR
 
 # The pages used to be embedded in the module as PAGE/AUDIT_PAGE. They are now
 # files under static/, shared helpers split out into common.js and app.css, so
 # the harness reads those instead of scraping a Python string literal.
-STATIC = s.STATIC_DIR
+STATIC = STATIC_DIR
 
 
 def static(name: str) -> str:
