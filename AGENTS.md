@@ -44,8 +44,24 @@ Tests never start the worker thread, so they queue uploads without loading a
 model or touching a GPU.
 
 Note: pi-lens's own pyright runner does not use the project venv, so it reports
-`fastapi`/`uvicorn` as unresolved imports. `uvx pyright --project
+`fastapi`/`uvicorn`/`pystray`/`PIL` as unresolved imports. `uvx pyright --project
 pyrightconfig.json` is the authoritative check.
+
+## Packaging
+
+`launcher/` and `packaging/` ship a Windows **tray launcher**, not a frozen
+server. The launcher owns the process, the access token and the port, and hands
+them to the server via `TRANSCRIBE_TOKEN` and `--port`, so the server needs no
+launcher-aware code. Keep it that way — no state file, no protocol.
+
+The CUDA runtime is deliberately not bundled (2.2 GB; `uv` resolves it on first
+run). `packaging/README.md` records what is and is not verified: the launcher
+logic is tested, the Windows build is not (no Windows machine was available).
+
+```bash
+launcher/transcribe_tray.py --self-test                # fast, headless
+launcher/transcribe_tray.py --self-test --with-server   # also probes a real server
+```
 
 ## Constraints
 

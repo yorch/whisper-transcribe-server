@@ -21,3 +21,8 @@ transcripts/
 
 # agent runtime scratch
 .pi/
+
+# packaging: vendored binaries and build output are produced by
+# packaging/build-windows.ps1, not committed (uv.exe ~30 MB, ffmpeg.exe ~80 MB)
+packaging/vendor/
+packaging/output/

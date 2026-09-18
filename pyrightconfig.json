@@ -2,7 +2,7 @@
   "venvPath": ".",
   "venv": ".venv",
   "pythonVersion": "3.12",
-  "include": ["transcribe_server.py", "tests"],
+  "include": ["transcribe_server.py", "tests", "launcher"],
   "exclude": [".venv", "**/__pycache__"],
   "reportMissingImports": "error",
   "reportMissingTypeStubs": "none"
