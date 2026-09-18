@@ -312,7 +312,12 @@ Files older than `audit_retain_days` (30 by default) are deleted at startup
 **and** on each daily rollover, sidecars included; `0` keeps everything. A day
 file also stops at `audit_max_mb` (1 GB by default) rather than filling the
 disk — see **Integrity** below. With `--no-audit` nothing is pruned at all, so
-turning auditing off can never delete a trail it is not managing.
+turning auditing off can never delete a trail it is not managing. Note the two
+stores expire by different clocks: day files by the date in their filename,
+sidecars by their own modification time. A sidecar amended after its day file
+was written can therefore outlive that day. That is deliberate — the filename
+identifies the job, not the day — and `audit_max_sidecars` is what bounds the
+directory between prunes.
 
 Two details worth knowing:
 
@@ -707,7 +712,10 @@ What's enforced:
 - **The audit trail has its own token**, so read access to "who did what" is
   separable from the ability to transcribe. Job ids are validated before they
   reach a filename, and audit files are written `0600` (best effort: on Windows
-  `chmod` does not set ACLs, so treat the claim as POSIX-only). It is generated
+  `chmod` does not set ACLs, so treat the claim as POSIX-only; the same caveat
+  covers the sidecar's `os.replace` and the torn-write `truncate`, both stdlib
+  calls on regular files that are correct on POSIX and unverified here on
+  Windows). It is generated
   per run when unset; `--audit-open` is the single explicit way to drop it, and
   a server running that way says so on startup and records `audit_api: "open"`
   in its `server.started` snapshot.
