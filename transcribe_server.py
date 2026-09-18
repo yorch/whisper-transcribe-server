@@ -69,7 +69,7 @@ from collections import OrderedDict, deque
 from collections.abc import Callable, MutableMapping
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, TypeVar
+from typing import Any, NamedTuple, TypeVar
 from urllib.parse import quote
 
 import uvicorn
@@ -929,6 +929,29 @@ def digest(value: str) -> str | None:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
+# Fields the trail assigns itself. They are dropped from caller fields rather
+# than merged: `ts`/`event` would be overwritten, and a caller passing `carry`
+# or `lost` could poison the chain or forge an attestation.
+RESERVED_FIELDS = frozenset(
+    {"ts", "event", "seq", "prev", "chain", "carry", "chain_reset", "lost"}
+)
+
+
+class AuditPage(NamedTuple):
+    """One page of a day file, with a front-anchored cursor.
+
+    `cursor` is the line number (1-based, counting non-empty lines) of the
+    oldest record in the page. Line numbers do not move when new records are
+    appended, so handing it back as `before_line` cannot duplicate or skip a
+    record the way an offset into the newest-first window does.
+    """
+
+    lines: list[str]
+    total: int
+    cursor: int | None
+    has_more: bool
+
+
 class AuditLog:
     """Append-only JSONL trail, one file per UTC day, newest events last.
 
@@ -948,6 +971,7 @@ class AuditLog:
         retain_days: int = 30,
         prompts: bool = True,
         max_mb: int = 0,
+        max_sidecars: int = 0,
     ) -> None:
         self.dir = Path(directory)
         self.prompts_dir = self.dir / "prompts"
@@ -956,6 +980,7 @@ class AuditLog:
         self.store_prompts = prompts
         self.max_mb = max(0, max_mb)
         self.max_bytes = self.max_mb * 1024 * 1024
+        self.max_sidecars = max(0, max_sidecars)
         self._lock = threading.Lock()
         # Sidecars get their own lock: a read-modify-write (a rename) must not
         # interleave with the plain write of a prompt, and the day-file lock is
@@ -988,12 +1013,18 @@ class AuditLog:
         self._chain_reset = False
         self._bytes = 0
         self.suppressed = 0
+        # Sidecar write failures. They are a separate counter because they are a
+        # separate store: a lost prompt is not a lost day-file event, but it is
+        # still text silently dropped, so it must set `degraded` too.
+        self.sidecar_lost = 0
+        self.sidecar_lost_total = 0
 
     def degraded(self) -> bool:
-        """True while the trail is not keeping up: events are being dropped,
-        or the day file has hit its ceiling. A past failure that a later record
-        already attested to is not degraded -- the gap is in the file."""
-        return bool(self.lost) or self.full
+        """True while the trail is not keeping up: day-file events are being
+        dropped or capped, or sidecar writes are failing. A past failure that a
+        later record already attested to is not degraded -- the gap is in the
+        file."""
+        return bool(self.lost) or self.full or bool(self.sidecar_lost)
 
     # -- writing ---------------------------------------------------------- #
 
@@ -1068,7 +1099,7 @@ class AuditLog:
         if existing:
             self._chain_reset = True
         else:
-            self._carry = self._previous_chain(day)
+            self._carry = self._previous_head(day)[1]
 
     @staticmethod
     def _tail_chain(path: Path) -> tuple[int, str] | None:
@@ -1085,15 +1116,27 @@ class AuditLog:
         if size <= 0:
             return None
         window = min(size, 262144)
-        try:
-            with path.open("rb") as fh:
-                fh.seek(size - window)
-                chunk = fh.read(window)
-        except OSError:
-            return None
-        lines = chunk.decode("utf-8", errors="replace").splitlines()
-        if size > window and lines:
-            lines = lines[1:]  # the first is a partial line
+        lines: list[str] = []
+        while True:
+            try:
+                with path.open("rb") as fh:
+                    fh.seek(size - window)
+                    chunk = fh.read(window)
+            except OSError:
+                return None
+            lines = chunk.decode("utf-8", errors="replace").splitlines()
+            if size <= window:
+                break  # the whole file is in view
+            if len(lines) > 1:
+                lines = lines[1:]  # the first is a partial line
+                break
+            # One line and the file is bigger than the window: the last record
+            # may be longer than what we read. Widen rather than mistake a
+            # complete record for a torn tail.
+            wider = min(size, window * 4)
+            if wider == window:
+                break
+            window = wider
         for raw in reversed(lines):
             raw = raw.strip()
             if not raw:
@@ -1108,12 +1151,15 @@ class AuditLog:
             return None
         return None
 
-    def _previous_chain(self, day: str) -> str | None:
-        """The final hash of the nearest earlier day, if it can be read.
+    def _previous_head(self, day: str) -> tuple[bool, str | None]:
+        """(an earlier day file exists, its final hash if it could be read).
 
-        Only the nearest: skipping past an unreadable day would carry a link
-        that never existed. A missing or broken earlier day yields no carry,
-        which is itself visible as a gap in the sequence of days.
+        The two are separate because they mean different things: no earlier file
+        (nothing to compare against) and an earlier file whose tail will not
+        parse (cannot compare) are both indeterminate, while a readable head
+        that disagrees with this day's `carry` is a real break. Only the nearest
+        earlier day is considered -- skipping past an unreadable one would carry
+        a link that never existed.
         """
         for path in sorted(
             self.dir.glob("audit-*.jsonl"), key=lambda p: p.stem, reverse=True
@@ -1122,8 +1168,8 @@ class AuditLog:
             if other >= day:
                 continue
             tail = self._tail_chain(path)
-            return tail[1] if tail is not None else None
-        return None
+            return True, (tail[1] if tail is not None else None)
+        return False, None
 
     def _append(self, fh: Any, record: dict[str, Any]) -> None:
         """Number, link and write one record. The caller holds `_lock`.
@@ -1155,12 +1201,16 @@ class AuditLog:
         self._bytes += len(blob.encode("utf-8"))
 
     def _rollback(self) -> None:
-        """Drop a torn record left by a failed write.
+        """Cut a failed append back to the last good length.
 
-        A half-written line would sit in the file forever and make every later
-        verification fail on a record that was never meant to be there. Cutting
-        back to the last known-good length keeps the file verifiable, and the
-        lost event is still attested by the next record's `lost` field.
+        On success `_clean` is left exactly as it was before the append, because
+        truncating to `_bytes` restores that state byte for byte -- including a
+        file that already ended mid-record from an earlier failure. Declaring it
+        clean there is how a torn fragment gets inherited and the next record's
+        `lost` attestation gets buried.
+
+        The caller holds `_lock`, so no other thread can append onto the torn
+        bytes between the failed write and this cut.
         """
         fh = self._fh
         if fh is None:
@@ -1172,11 +1222,9 @@ class AuditLog:
             fh.truncate(self._bytes)
             fh.flush()
         except (OSError, ValueError, AttributeError):
-            # The torn record is still there; _append closes the line off first
-            # so the next record does not inherit its damage.
+            # Could not cut it back at all: the torn bytes are still there, so
+            # the next append must close the line off first.
             self._clean = False
-        else:
-            self._clean = True
 
     def _warn_once(self, what: str, exc: BaseException) -> None:
         """Warn once per (path, exception type), not once per process.
@@ -1201,48 +1249,60 @@ class AuditLog:
             .replace("+00:00", "Z"),
             "event": event,
         }
-        record.update({k: v for k, v in fields.items() if v is not None})
-        # The gap, stamped onto the first record that actually lands after it.
-        # Riding the next real event beats a synthetic marker: it cannot loop,
-        # and it cannot itself be the thing that gets lost.
-        if self.lost:
-            record["lost"] = self.lost
+        record.update(
+            {
+                k: v
+                for k, v in fields.items()
+                if v is not None and k not in RESERVED_FIELDS
+            }
+        )
         try:
             with self._lock:
-                day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-                if self._day is not None and day < self._day:
-                    day = self._day  # never rotate backwards on a boundary race
-                if self._day != day or self._fh is None:
-                    fh = self._rotate(day)
-                    self._day = day
-                else:
-                    fh = self._fh
-                if self.max_bytes and self._bytes >= self.max_bytes:
-                    # The day file is full. Say so once, in the file, then stop
-                    # taking events: a bounded trail that states its own gap
-                    # beats a full disk, and the cap resets at the next day.
-                    if self.full:
-                        self.suppressed += 1
-                        return
-                    self.full = True
-                    marker: dict[str, Any] = {
-                        "ts": record["ts"],
-                        "event": "audit.full",
-                        "max_mb": self.max_mb,
-                        "bytes": self._bytes,
-                    }
+                try:
+                    day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+                    if self._day is not None and day < self._day:
+                        day = self._day  # never rotate backwards on a boundary race
+                    if self._day != day or self._fh is None:
+                        fh = self._rotate(day)
+                        self._day = day
+                    else:
+                        fh = self._fh
+                    # Read under the lock: a concurrent emit must not change the
+                    # count between reading it and writing what attests to it.
                     if self.lost:
-                        marker["lost"] = self.lost
-                    self._append(fh, marker)
-                    self.suppressed += 1
+                        record["lost"] = self.lost
+                    if self.max_bytes and self._bytes >= self.max_bytes:
+                        # The day file is full. Say so once, in the file, then
+                        # stop taking events: a bounded trail that states its own
+                        # gap beats a full disk, and the cap resets at the next
+                        # day.
+                        if self.full:
+                            self.suppressed += 1
+                            return
+                        self.full = True
+                        marker: dict[str, Any] = {
+                            "ts": record["ts"],
+                            "event": "audit.full",
+                            "max_mb": self.max_mb,
+                            "bytes": self._bytes,
+                        }
+                        if self.lost:
+                            marker["lost"] = self.lost
+                        self._append(fh, marker)
+                        self.suppressed += 1
+                        self.lost = 0
+                        return
+                    self._append(fh, record)
                     self.lost = 0
-                    return
-                self._append(fh, record)
-            self.lost = 0
+                except Exception:
+                    # Roll back while the lock is still held. Released first, a
+                    # concurrent emit would append onto the torn fragment and
+                    # this cut would then slice that record in half.
+                    self.lost += 1
+                    self.lost_total += 1
+                    self._rollback()
+                    raise
         except Exception as exc:  # noqa: BLE001
-            self.lost += 1
-            self.lost_total += 1
-            self._rollback()
             self._warn_once("write", exc)
 
     def write_prompt(self, job_id: str, payload: dict[str, Any]) -> None:
@@ -1252,6 +1312,7 @@ class AuditLog:
             return
         with self._sidecar_lock:
             self._write_prompt_locked(job_id, payload)
+        self._cap_sidecars()
 
     def amend_prompt(
         self,
@@ -1273,6 +1334,7 @@ class AuditLog:
             record = self._read_prompt_locked(job_id) or dict(default)
             record.update(changes)
             self._write_prompt_locked(job_id, record)
+        self._cap_sidecars()
 
     def _write_prompt_locked(self, job_id: str, payload: dict[str, Any]) -> None:
         """Write the sidecar by atomic replace, never by truncate-in-place.
@@ -1297,7 +1359,10 @@ class AuditLog:
                 os.fsync(fh.fileno())
             os.replace(tmp, path)
             tmp = None
+            self.sidecar_lost = 0
         except Exception as exc:  # noqa: BLE001
+            self.sidecar_lost += 1
+            self.sidecar_lost_total += 1
             self._warn_once("sidecar write", exc)
             if tmp is not None:
                 with contextlib.suppress(OSError):
@@ -1307,6 +1372,39 @@ class AuditLog:
         if not SAFE_JOB_ID.fullmatch(job_id):
             return None
         return self._read_prompt_locked(job_id)
+
+    def _cap_sidecars(self) -> None:
+        """Keep the sidecar directory under `max_sidecars`, oldest text first.
+
+        Dropping the oldest *text* does not drop the evidence that a prompt was
+        used: the day file keeps the length and hash for every job. The cap is a
+        count, not bytes, because prompt and hotword length are already bounded
+        (PROMPT_LIMIT / HOTWORDS_LIMIT), so a count bounds the directory. 0 keeps
+        everything. Called outside `_sidecar_lock`, because it emits.
+        """
+        if not self.max_sidecars:
+            return
+        try:
+            files = list(self.prompts_dir.glob("*.json"))
+        except OSError:
+            return
+        excess = len(files) - self.max_sidecars
+        if excess <= 0:
+            return  # the common case: no stat() calls at all
+        try:
+            files.sort(key=lambda p: p.stat().st_mtime)
+        except OSError:
+            return
+        removed = 0
+        for path in files[:excess]:
+            if self._unlink(path):
+                removed += 1
+        if removed:
+            self.emit(
+                "audit.sidecars_pruned",
+                removed=removed,
+                max_sidecars=self.max_sidecars,
+            )
 
     def _read_prompt_locked(self, job_id: str) -> dict[str, Any] | None:
         try:
@@ -1378,8 +1476,16 @@ class AuditLog:
                     out["reason"] = "Unparsable record (torn write or edited line)"
                     return out
                 if "chain" not in rec:
-                    # Predates the chain. It cannot be checked, and it must not
-                    # make the whole day look broken.
+                    # Records written before the chain existed have no hash to
+                    # check -- but only at the *start* of a day. Once a chained
+                    # record has been seen, a chain-less one means the field was
+                    # removed, which is what an editor would do to hide a change
+                    # to the last record of the day.
+                    if out["checked"]:
+                        out["first_bad_line"] = line_no
+                        out["first_bad_seq"] = expected_seq
+                        out["reason"] = "Record has no chain hash after the chain began"
+                        return out
                     out["legacy"] += 1
                     continue
                 seq, prev, chain = rec.get("seq"), rec.get("prev"), rec.get("chain")
@@ -1413,41 +1519,55 @@ class AuditLog:
                 expected_seq += 1
                 expected_prev = chain
         out["ok"] = out["first_bad_line"] is None
-        # Tie the day to the one before it, when both can still be read.
-        if out["carry"] is not None:
-            previous = self._previous_chain(day)
-            out["carry_ok"] = previous is not None and previous == out["carry"]
+        # Tie the day to the one before it. A missing or unreadable earlier day
+        # is indeterminate, NOT a mismatch: retention deletes the previous day
+        # routinely, and reporting that as "carry does NOT match" would cry wolf
+        # on a pristine trail every prune cycle.
+        found, previous = self._previous_head(day)
+        if not found or previous is None:
+            out["carry_ok"] = None
+        elif out["carry"] is not None:
+            out["carry_ok"] = previous == out["carry"]
         elif out["checked"] and not first_reset:
-            if self._previous_chain(day) is not None:
-                out["carry_ok"] = False  # a previous day exists but was not carried
+            out["carry_ok"] = False  # a readable earlier day exists but was not carried
         return out
 
-    def read(
+    def read_page(
         self,
         day: str,
         limit: int = 200,
         offset: int = 0,
         job: str | None = None,
         needle: str | None = None,
-    ) -> tuple[list[str], int]:
-        """Return (raw lines newest-first, total matching) for one day.
+        before_line: int | None = None,
+    ) -> AuditPage:
+        """One page of a day, newest first, plus a cursor for the next one.
 
         Only the requested page is held in memory: a flooded day file can be
-        enormous, and the audit UI re-reads every few seconds.
+        enormous, and the audit UI re-reads every few seconds. `before_line`
+        takes precedence over `offset`.
         """
         try:
             fh = (self.dir / f"audit-{day}.jsonl").open(
                 "r", encoding="utf-8", errors="replace"
             )
         except OSError:
-            return [], 0
-        window: deque[str] = deque(maxlen=max(1, limit) + max(0, offset))
+            return AuditPage([], 0, None, False)
+        span = (
+            max(1, limit) if before_line is not None else max(1, limit) + max(0, offset)
+        )
+        window: deque[tuple[int, str]] = deque(maxlen=span)
         total = 0
+        dropped = 0
+        line_no = 0
         low = needle.lower() if needle else None
         with fh:
             for raw in fh:
                 raw = raw.strip()
                 if not raw:
+                    continue
+                line_no += 1
+                if before_line is not None and line_no >= before_line:
                     continue
                 if low and low not in raw.lower():
                     continue
@@ -1459,9 +1579,29 @@ class AuditLog:
                     if rec.get("job") != job and rec.get("from_job") != job:
                         continue
                 total += 1
-                window.append(raw)
-        lines = list(window)[::-1]
-        return lines[offset : offset + limit], total
+                if window.maxlen is not None and len(window) == window.maxlen:
+                    dropped += 1  # a match older than this page
+                window.append((line_no, raw))
+        pairs = list(window)[::-1]  # newest first
+        if before_line is None:
+            pairs = pairs[offset : offset + max(1, limit)]
+        else:
+            pairs = pairs[: max(1, limit)]
+        cursor = pairs[-1][0] if pairs else None
+        return AuditPage([raw for _, raw in pairs], total, cursor, dropped > 0)
+
+    def read(
+        self,
+        day: str,
+        limit: int = 200,
+        offset: int = 0,
+        job: str | None = None,
+        needle: str | None = None,
+    ) -> tuple[list[str], int]:
+        """The (lines newest-first, total matching) pair callers had before
+        cursors existed. New callers want read_page()."""
+        page = self.read_page(day, limit=limit, offset=offset, job=job, needle=needle)
+        return page.lines, page.total
 
     # -- retention -------------------------------------------------------- #
 
@@ -1581,7 +1721,12 @@ def _collapse_logged(key: tuple[str, str], limit: int) -> tuple[bool, int]:
 
 
 def audit_rejection(event: str, request: Request, **fields: Any) -> None:
-    """Record a refused request, collapsing a burst from one source."""
+    """Record a refused request, collapsing a burst from one source.
+
+    The suppressed count is reconciled when the window rolls over, in one
+    summary per source per window -- see audit_repeated for why that bound is
+    chosen over an exact per-call count.
+    """
     client = (request.client.host if request.client else "-")[:64]
     log_now, suppressed = _collapse_logged((event, client), REJECT_LOG_LIMIT)
     if log_now:
@@ -1599,7 +1744,12 @@ def audit_repeated(event: str, request: Request, **fields: Any) -> None:
     """Record an action a client can repeat, collapsing a burst from one source.
 
     Unlike a refusal this loses a real action when it collapses, so the count is
-    preserved in a summary record rather than dropped silently.
+    reconciled in an `audit.repeated_summary` record when the window rolls over.
+    That is deliberately bounded -- one summary per source per window -- which
+    means a burst that simply stops, with no further call from that source, has
+    its tail count unreconciled until the next call. Exact counts and bounded
+    disk are in tension, and the byte cap already fails closed on the other
+    side; this keeps the trail from growing with the attack.
     """
     client = (request.client.host if request.client else "-")[:64]
     log_now, suppressed = _collapse_logged(
@@ -1666,25 +1816,30 @@ def store_speaker_names(job_id: str, filename: str, names: dict[str, str]) -> No
     """Keep a job's speaker names in its audit sidecar, beside any prompt.
 
     The sidecar is the one place the audit trail holds sensitive text in clear,
-    readable only with the audit token; the main log has a hash. Read, amend
-    and rewrite, so a prompt already stored for the job survives.
-    --no-audit-prompts turns this off along with the prompts.
+    readable only with the audit token; the main log has a hash. The amend is a
+    single locked read-modify-write, so a prompt stored for the job survives and
+    a concurrent writer cannot drop it. --no-audit-prompts turns this off along
+    with the prompts.
     """
     if AUDIT is None:
         return
-    record = AUDIT.read_prompt(job_id) or {
-        "job": job_id,
-        "filename": filename,
-        "source": "names",
-        "from_job": None,
-        "prompt": "",
-        "hotwords": "",
-    }
-    record["speaker_names"] = names
-    record["ts"] = (
-        datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+    AUDIT.amend_prompt(
+        job_id,
+        default={
+            "job": job_id,
+            "filename": filename,
+            "source": "names",
+            "from_job": None,
+            "prompt": "",
+            "hotwords": "",
+        },
+        changes={
+            "speaker_names": names,
+            "ts": datetime.now(timezone.utc)
+            .isoformat(timespec="seconds")
+            .replace("+00:00", "Z"),
+        },
     )
-    AUDIT.write_prompt(job_id, record)
 
 
 def new_job(filename: str, path: Path, opts: dict[str, Any]) -> str:
@@ -3981,12 +4136,14 @@ def audit_query(
     job: str = "",
     q: str = "",
     include_prompts: int = 0,
+    before_line: int = 0,
 ) -> dict[str, Any]:
     if AUDIT is None:
         raise HTTPException(status_code=503, detail="Audit trail unavailable")
 
     limit = clamp(as_int(limit, 200), 1, 1000)
     offset = max(0, as_int(offset, 0))
+    cursor = max(0, as_int(before_line, 0)) or None
     prompt_jobs: list[str] = []
     days = AUDIT.dates()
     day = (date or "").strip() or (
@@ -4000,9 +4157,15 @@ def audit_query(
         raise HTTPException(status_code=400, detail="Malformed job id")
 
     needle = q.strip() or None
-    raw, total = AUDIT.read(
-        day, limit=limit, offset=offset, job=job or None, needle=needle
+    page = AUDIT.read_page(
+        day,
+        limit=limit,
+        offset=offset,
+        job=job or None,
+        needle=needle,
+        before_line=cursor,
     )
+    raw, total = page.lines, page.total
 
     events: list[dict[str, Any]] = []
     for line in raw:
@@ -4039,6 +4202,7 @@ def audit_query(
         search_sha256=digest(needle or ""),
         job=job or None,
         include_prompts=bool(include_prompts),
+        before_line=cursor,
         prompts_returned=len(prompt_jobs) or None,
         prompt_jobs=prompt_jobs[:50] or None,
     )
@@ -4049,10 +4213,15 @@ def audit_query(
         "total": total,
         "offset": offset,
         "limit": limit,
+        # Paging state: hand next_before_line back as before_line to get the next
+        # page without the drift an offset has as records land.
+        "next_before_line": page.cursor,
+        "has_more": page.has_more,
         "retain_days": AUDIT.retain_days,
         "prompts_available": AUDIT.store_prompts,
         "last_error": AUDIT.last_error,
         "lost_total": AUDIT.lost_total,
+        "sidecar_lost_total": AUDIT.sidecar_lost_total,
         "degraded": AUDIT.degraded(),
         "full": AUDIT.full,
         "suppressed": AUDIT.suppressed,
@@ -4217,6 +4386,10 @@ DEFAULTS: dict[str, Any] = {
     # Per-day ceiling on a day file, in MB; 0 keeps everything. A bounded trail
     # that says where it stopped beats a full disk.
     "audit_max_mb": 1024,
+    # Ceiling on the prompts/ directory, in files; oldest text first. The day
+    # file keeps the length and hash of every prompt, so dropping the oldest
+    # text loses the wording, not the evidence a prompt was used. 0 keeps all.
+    "audit_max_sidecars": 5000,
     "audit_open": False,
     "audit_token": "",
 }
@@ -4262,6 +4435,7 @@ ENV_OPTIONS: dict[str, tuple[str, str]] = {
     "TRANSCRIBE_AUDIT_PROMPTS": ("audit_prompts", "bool"),
     "TRANSCRIBE_AUDIT_RETAIN_DAYS": ("audit_retain_days", "int"),
     "TRANSCRIBE_AUDIT_MAX_MB": ("audit_max_mb", "int"),
+    "TRANSCRIBE_AUDIT_MAX_SIDECARS": ("audit_max_sidecars", "int"),
     "TRANSCRIBE_AUDIT_OPEN": ("audit_open", "bool"),
     "TRANSCRIBE_AUDIT_TOKEN": ("audit_token", "str"),
 }
@@ -4308,6 +4482,7 @@ CONFIG_ALIASES: dict[str, str] = {
     "audit.prompts": "audit_prompts",
     "audit.retain_days": "audit_retain_days",
     "audit.max_mb": "audit_max_mb",
+    "audit.max_sidecars": "audit_max_sidecars",
     "audit.open": "audit_open",
     "audit.token": "audit_token",
 }
@@ -4458,6 +4633,9 @@ CONFIG_TEMPLATE = """\
 # Stop recording once a day file reaches this many MB, after writing one
 # audit.full marker; the cap resets at the next day. 0 keeps everything.
 # max_mb = 1024
+# Keep at most this many prompt sidecar files, oldest text first. The trail
+# still records every prompt's length and hash. 0 keeps every sidecar.
+# max_sidecars = 5000
 # Serve the trail with no credential at all, prompt and hotword text included.
 # Only on a network you control. Refused together with the token below.
 # open = false
@@ -4759,6 +4937,14 @@ def build_parser() -> argparse.ArgumentParser:
         "audit.full marker (default 1024; 0 keeps everything)",
     )
     aud.add_argument(
+        "--audit-max-sidecars",
+        type=int,
+        default=argparse.SUPPRESS,
+        metavar="N",
+        help="keep at most N prompt sidecar files, oldest text first "
+        "(default 5000; 0 keeps everything)",
+    )
+    aud.add_argument(
         "--audit-open",
         action="store_true",
         default=argparse.SUPPRESS,
@@ -4840,7 +5026,13 @@ def resolve_args(
     for name in ("max_upload_mb", "max_queue"):
         if merged[name] < 1:
             raise SystemExit(f"!  {name} must be at least 1, got {merged[name]}")
-    for name in ("model_cache", "max_jobs", "audit_retain_days", "audit_max_mb"):
+    for name in (
+        "model_cache",
+        "max_jobs",
+        "audit_retain_days",
+        "audit_max_mb",
+        "audit_max_sidecars",
+    ):
         if merged[name] < 0:
             raise SystemExit(f"!  {name} cannot be negative, got {merged[name]}")
     # Unset follows the model: each embedding has its own distance scale.
@@ -4924,6 +5116,7 @@ def startup_snapshot(
         "audit_prompts": args.audit_prompts,
         "audit_retain_days": args.audit_retain_days,
         "audit_max_mb": args.audit_max_mb,
+        "audit_max_sidecars": args.audit_max_sidecars,
         "audit_api": audit_api_mode(args),
         "max_upload_mb": args.max_upload_mb,
         "max_queue": args.max_queue,
@@ -5057,6 +5250,7 @@ def main() -> None:
         retain_days=args.audit_retain_days,
         prompts=args.audit_prompts,
         max_mb=args.audit_max_mb,
+        max_sidecars=args.audit_max_sidecars,
     )
 
     args.model_cache = max(1, args.model_cache)
@@ -5184,6 +5378,7 @@ def main() -> None:
             f"  prompts={'stored' if args.audit_prompts else 'omitted'}"
             f"  retention={args.audit_retain_days}d"
             f"  cap={str(args.audit_max_mb) + 'MB/day' if args.audit_max_mb else 'none'}"
+            f"  sidecars={args.audit_max_sidecars or 'unlimited'}"
         )
         if pruned:
             print(f"           pruned {len(pruned)} expired file(s)")

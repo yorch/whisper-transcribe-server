@@ -153,6 +153,7 @@ Useful flags:
 | `--no-audit-prompts`          | never write prompt/hotword text to the sidecar files                                                                        |
 | `--audit-retain-days 30`      | delete audit files older than N days at startup (`0` keeps everything)                                                      |
 | `--audit-max-mb 1024`         | stop a day file at N MB, after one `audit.full` marker (`0` keeps everything)                                               |
+| `--audit-max-sidecars 5000`   | keep at most N prompt sidecar files, oldest text first (`0` keeps everything)                                               |
 
 `--help` groups these under network/access, model/hardware, limits/storage and
 audit trail.
@@ -228,6 +229,7 @@ reads = false
 prompts = true
 retain_days = 30
 max_mb = 1024
+max_sidecars = 5000
 open = false    # true serves the trail with no credential at all
 ```
 
@@ -290,8 +292,14 @@ Then open `http://<host>:8765/audit?token=<audit-token>` for a filterable view
 
 ```http
 GET /api/audit?date=2026-09-18&limit=200&offset=0&job=<id>&q=exported&include_prompts=1
+GET /api/audit?date=2026-09-18&limit=200&before_line=<next_before_line>
 GET /api/audit/prompts/<job_id>
 ```
+
+Pages carry `next_before_line` and `has_more`. Hand `next_before_line` back as
+`before_line` for the next page: it is a line number from the front of the file,
+so it does not shift when new records land the way an `offset` into a
+newest-first window does. The UI's **Load more** uses it; `offset` still works.
 
 Both need `x-audit-token`, which is checked separately from the app token —
 you can hand out one without the other. Leave it unset and the server mints one
@@ -343,27 +351,41 @@ never reported as a break, so a day from before the feature does not read as
 tampered.
 
 This makes the trail **tamper-evident, not tamper-proof**. It detects an edited
-record, a deleted or reordered line, and a truncated file. It cannot stop someone
+record, an interior deletion (a `seq` gap), a record whose `chain` field was
+stripped, and a line truncated mid-record. It does **not** by itself detect a
+clean cut at a line boundary — deleting the last few whole records leaves a
+shorter but internally consistent chain, and nothing in the file pins the count
+it should have. That case is what the anchor is for. Nor can it stop someone
 with write access from rewriting the tail and recomputing every hash after it —
-an unkeyed chain holds no secret that would make that impossible. What closes
-that hole is the anchor: copy the `chain` from `/api/audit/head` somewhere off
-this machine, and an altered record no longer matches the value you kept. The
-trail answers "what did the web app do, and has the file changed since", not
-"prove it to a third party".
+an unkeyed chain holds no secret that would make that impossible. Copy the
+`chain` from `/api/audit/head` somewhere off this machine and a rewritten or
+truncated file no longer matches the value you kept. The trail answers "what did
+the web app do, and has the file changed since", not "prove it to a third
+party".
 
-A write that fails is counted rather than lost quietly: the next record that
-lands carries `lost: N`, and `/api/audit` reports `last_error`, `lost_total` and
-`degraded`. `/api/status` carries `audit_degraded` as a plain boolean, so the
-app side can warn without the app token seeing the audit path or the failure
-text.
+A write that fails is counted rather than lost quietly. For the day file, the
+next record that lands carries `lost: N`, and `/api/audit` reports `last_error`,
+`lost_total` and `degraded`. Sidecar failures have their own counter
+(`sidecar_lost_total`) because they are a different store, and they set
+`degraded` too — a prompt silently not stored must not look like a quiet day.
+`/api/status` carries `audit_degraded` as a plain boolean, so the app side can
+warn without the app token seeing the audit path or the failure text.
 
 `audit_max_mb` bounds a single day file. When it is reached, one `audit.full`
 record is written and the day then takes no further events; the cap resets at the
 next day, and `0` removes it. Actions an app token can repeat — an export in a
-loop — are collapsed the same way refusals are, with the count preserved in
-`audit.repeated_summary`. One thing the cap deliberately does **not** bound:
-`prompts/` sidecars, which outlive their jobs by design and are removed only by
-retention. If prompt text must never accumulate, use `--no-audit-prompts`.
+loop — are collapsed the same way refusals are: the suppressed count is
+reconciled in an `audit.repeated_summary` record when the window rolls over, so a
+burst that simply stops leaves its tail count unreconciled until that source
+calls again. That bound is deliberate — an exact count per burst would mean a
+record per burst, which is what the collapse exists to avoid.
+
+`audit_max_sidecars` bounds `prompts/` separately, oldest text first, so a
+capped day file does not sit next to an unbounded store of the sensitive text.
+Dropping the oldest sidecar loses the wording, not the evidence: the day file
+keeps `prompt_len` and `prompt_sha256` for every job, so the trail still shows
+that a prompt was used. `0` keeps every sidecar, and `--no-audit-prompts` stops
+the text being written at all.
 
 ### Origin attribution behind a tunnel
 

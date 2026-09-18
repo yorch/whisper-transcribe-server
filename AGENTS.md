@@ -184,6 +184,33 @@ launcher/transcribe_tray.py --self-test --with-server   # also probes a real ser
   tampering — the exact false positive the `lost: N` field exists to avoid.
   `tests/test_audit_chain.py::test_a_failed_write_is_attested_and_does_not_gap_the_chain`
   pins it.
+- **`_rollback` runs under `_lock`, and does not claim a torn file is clean.**
+  Both are load-bearing. Released before the rollback, a concurrent `emit`
+  appends onto the torn fragment and the truncate then slices that record in
+  half; declaring `_clean = True` after truncating back to a *pre-existing* torn
+  tail makes the next record merge into it and bury its `lost` attestation.
+  `_rollback` therefore leaves `_clean` exactly as the failed append found it,
+  and `_rotate`/`_resume` seed it from whether the tail parsed.
+- **A chain-less record after the first chained one is a break, not legacy.**
+  `verify` tolerates legacy only while `checked == 0`; otherwise stripping the
+  `chain` key is how a tail edit is hidden.
+- **`carry_ok` is indeterminate, never `False`, when the previous day is gone.**
+  Retention deletes the oldest surviving day's predecessor on every prune cycle;
+  reporting that as a mismatch would raise a tamper signal from housekeeping.
+  Only a *readable* previous head that disagrees is a break.
+- **Sidecar failures are counted too.** `degraded()` covers `sidecar_lost`, not
+  just day-file `lost`/`full`: the sidecar holds the sensitive text, so a prompt
+  silently not stored must not look like a quiet day. `store_speaker_names` must
+  go through `amend_prompt` (one locked read-modify-write) — a separate
+  `read_prompt` then `write_prompt` is two lock acquisitions and loses whichever
+  writer lands first.
+- **`audit_max_sidecars` bounds `prompts/`; the day-file cap does not.** A count
+  is enough because prompt and hotword length are already bounded. Dropping the
+  oldest *text* is safe only because the day file keeps `prompt_len` and
+  `prompt_sha256` — the evidence survives the wording.
+- **Paging uses `before_line`, a front-anchored line number.** An `offset` into a
+  newest-first window shifts when records land and duplicates or skips rows.
+  `read()` keeps its old 2-tuple shape; new callers want `read_page()`.
 - **Never return an audit token, and never let the app token reach the trail's
   detail.** `audit_degraded` on `/api/status` is a boolean on purpose: the
   `last_error` text and the audit dir stay behind the audit credential.

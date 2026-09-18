@@ -9,7 +9,7 @@ const TOKENS = tokenStore("atk");
    from a failed request, which made a switched-off API look like a bad token. */
 const MODE = document.body.dataset.mode;
 
-let unlocked = false, offset = 0, timer = null;
+let unlocked = false, offset = 0, cursor = null, timer = null;
 
 function relock(){
   unlocked = false;
@@ -103,11 +103,15 @@ function fillDates(dates, selected){
 
 async function load(more){
   if(!unlocked) return;
-  if(!more) offset = 0;
+  if(!more){ offset = 0; cursor = null; }
   const params = new URLSearchParams();
   params.set("date", el("date").value);
   params.set("limit", el("limit").value);
-  params.set("offset", String(offset));
+  /* The cursor is a line number from the front of the file, so it does not move
+     when new records land; an offset into a newest-first window does, which
+     duplicates or skips a row. Falls back to the offset on the first page. */
+  if(more && cursor) params.set("before_line", String(cursor));
+  else params.set("offset", String(offset));
   if(el("job").value.trim()) params.set("job", el("job").value.trim());
   if(el("q").value.trim()) params.set("q", el("q").value.trim());
   if(el("prompts").checked) params.set("include_prompts", "1");
@@ -132,9 +136,10 @@ async function load(more){
     // pi-lens-ignore: no-inner-html
     el("events").insertAdjacentHTML("beforeend", data.events.map(row).join(""));
     offset += data.events.length;
+    cursor = data.next_before_line;
 
     el("empty").classList.toggle("locked", data.total > 0);
-    el("more").disabled = offset >= data.total;
+    el("more").disabled = !data.has_more;
     el("meta").textContent = data.total + " event(s) on " + data.date
       + " UTC \u00b7 showing " + Math.min(offset, data.total)
       + " \u00b7 retention " + (data.retain_days ? data.retain_days + " days" : "unlimited")
@@ -146,6 +151,7 @@ async function load(more){
     if(data.degraded){
       const bits = [];
       if(data.lost_total) bits.push(data.lost_total + " event(s) dropped");
+      if(data.sidecar_lost_total) bits.push(data.sidecar_lost_total + " prompt sidecar(s) not written");
       if(data.last_error) bits.push(data.last_error);
       warn.textContent = "The audit trail is not keeping up: " + (bits.join(" \u00b7 ") || "unknown")
         + ". Events are being lost until the sink is fixed.";
