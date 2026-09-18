@@ -39,9 +39,11 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import ctypes
 import gc
 import hashlib
 import hmac
+import importlib.util
 import json
 import os
 import queue
@@ -49,6 +51,7 @@ import re
 import secrets
 import shutil
 import socket
+import sys
 import threading
 import time
 import traceback
@@ -700,6 +703,60 @@ def build_opts(
 # --------------------------------------------------------------------------- #
 
 
+def enable_cuda_libraries() -> list[str]:
+    """Make the CUDA runtime that ships in the nvidia-* wheels loadable.
+
+    ctranslate2 dlopen()s libcublas/libcudnn by soname at *encode* time, but the
+    wheels install them under site-packages/nvidia/<lib>/lib, which is not on the
+    loader path. Without this, the model loads happily and then every job fails
+    with "Library libcublas.so.12 is not found or cannot be loaded" — the exact
+    failure mode that makes a broken GPU look healthy at startup.
+
+    Loading them here with RTLD_GLOBAL means the later dlopen resolves against
+    the already-loaded soname. Returns the names it managed to preload.
+    """
+    loaded: list[str] = []
+    for module, names in (
+        ("nvidia.cublas.lib", ("libcublas.so.12", "libcublasLt.so.12")),
+        ("nvidia.cudnn.lib", ("libcudnn.so.9",)),
+    ):
+        try:
+            spec = importlib.util.find_spec(module)
+        except (ImportError, ValueError):
+            continue
+        locations = getattr(spec, "submodule_search_locations", None)
+        if not locations:
+            continue
+        libdir = Path(next(iter(locations)))
+        if sys.platform == "win32":
+            # Windows resolves DLLs from the directories added here.
+            with contextlib.suppress(OSError):
+                os.add_dll_directory(str(libdir))
+            loaded.append(str(libdir))
+            continue
+        for name in names:
+            candidate = libdir / name
+            if not candidate.exists():
+                continue
+            with contextlib.suppress(OSError):
+                ctypes.CDLL(str(candidate), mode=ctypes.RTLD_GLOBAL)
+                loaded.append(name)
+    return loaded
+
+
+def verify_device(model: Any, name: str) -> None:
+    """Prove the model can actually encode, not merely load.
+
+    A model can load and still fail on the first encode (a missing cuBLAS, for
+    instance), so --preload would otherwise report a healthy device that cannot
+    transcribe anything. One second of silence is enough to exercise the path.
+    """
+    import numpy as np
+
+    silence = np.zeros(16000, dtype="float32")
+    list(model.transcribe(silence, beam_size=1, vad_filter=False)[0])
+
+
 def load_model(name: str, device: str, compute_type: str):
     key = (name, device, compute_type)
     with _MODEL_LOCK:
@@ -709,12 +766,12 @@ def load_model(name: str, device: str, compute_type: str):
 
         from faster_whisper import WhisperModel
 
-        model = WhisperModel(name, device=device, compute_type=compute_type)
-        _MODEL_CACHE[key] = model
-        audit("model.loaded", model=name, device=device, compute_type=compute_type)
-
         cap = max(1, ARGS.model_cache if READY else 1)
-        while len(_MODEL_CACHE) > cap:
+
+        # Evict *before* loading: inserting first would hold the outgoing and
+        # incoming models in VRAM at the same time, so a cap of 1 would
+        # transiently need room for 2 and could OOM on a tight GPU.
+        while len(_MODEL_CACHE) >= cap:
             old_key, old_model = _MODEL_CACHE.popitem(last=False)
             del old_model
             gc.collect()
@@ -726,6 +783,10 @@ def load_model(name: str, device: str, compute_type: str):
                 compute_type=old_key[2],
                 reason="vram-cache",
             )
+
+        model = WhisperModel(name, device=device, compute_type=compute_type)
+        _MODEL_CACHE[key] = model
+        audit("model.loaded", model=name, device=device, compute_type=compute_type)
         return model
 
 
@@ -3078,6 +3139,30 @@ def sweep_uploads() -> tuple[int, int]:
     return count, total
 
 
+def preload_model(args: argparse.Namespace) -> None:
+    """Load the default model and prove it can encode, or exit with advice.
+
+    Loading alone is not enough: a missing CUDA runtime only surfaces on the
+    first encode, so a plain "Model ready." can promise a GPU that cannot
+    transcribe anything. Refusing to start beats serving jobs that all fail.
+    """
+    print(f"Loading {args.model} on {args.device} ({args.compute_type}) ...")
+    try:
+        model = load_model(args.model, args.device, args.compute_type)
+        verify_device(model, args.model)
+    except Exception as exc:  # noqa: BLE001
+        print(f"\n!  {args.model} on {args.device} cannot run: {exc}")
+        if args.device in ("cuda", "auto"):
+            print("   The model loaded but failed to encode, which usually means the")
+            print("   CUDA runtime is missing. In order of preference:")
+            print("     - run through uv so the declared runtime is installed:")
+            print("         uv run transcribe_server.py --preload")
+            print("     - fall back to the CPU:  --device cpu --compute-type int8")
+        print("   Refusing to serve jobs that cannot succeed.\n")
+        raise SystemExit(1) from None
+    print("Model ready.")
+
+
 def main() -> None:
     global ARGS, ALLOWED_HOSTS, ALLOWED_SUFFIXES, AUDIT, WORK_DIR, UPLOAD_DIR, READY
     args, cfg_path, cfg_required = resolve_args()
@@ -3130,10 +3215,14 @@ def main() -> None:
 
     threading.Thread(target=worker_loop, daemon=True, name="transcriber").start()
 
+    if args.device in ("cuda", "auto"):
+        # ctranslate2 resolves the CUDA runtime lazily, at encode time.
+        preloaded = enable_cuda_libraries()
+        if preloaded:
+            print(f"CUDA libs  preloaded {len(preloaded)} librar(y/ies) from the wheels")
+
     if args.preload:
-        print(f"Loading {args.model} on {args.device} ({args.compute_type}) ...")
-        load_model(args.model, args.device, args.compute_type)
-        print("Model ready.")
+        preload_model(args)
 
     print()
     if cfg_path.exists():

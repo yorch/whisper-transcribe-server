@@ -16,6 +16,18 @@ runtime libs CTranslate2 needs (`nvidia-cublas-cu12` and `nvidia-cudnn-cu12`) â€
 faster-whisper does **not** use PyTorch, so those two packages are the real
 GPU dependency.
 
+Those wheels drop `libcublas`/`libcudnn` into `site-packages/nvidia/â€¦/lib`, which
+is not on the dynamic loader path, and CTranslate2 only `dlopen`s them when it
+starts encoding. The server preloads them at startup so this works out of the
+box; without that you get a model that loads fine and then fails every job with
+`Library libcublas.so.12 is not found or cannot be loaded`. If you ever see that
+message from another entry point, set `LD_LIBRARY_PATH` (Linux/macOS) or use
+`uv run` rather than a bare `python transcribe_server.py`.
+
+`--preload` therefore **verifies the device can encode**, not just load, and
+exits with an explanation if it cannot. A green "Model ready." means a job will
+genuinely run.
+
 Optionally, installing PyTorch gives the status strip a proper GPU name
 ("NVIDIA GeForce RTX 3080") instead of a device count. Not required:
 
@@ -418,6 +430,8 @@ What it still doesn't do, by design:
   both pages.
 - `create_job` streams the upload through a threadpool, but a very large upload
   still occupies the threadpool for its duration.
+- **Verified on CPU and on a single RTX 3060** (`base`, fp16, ~10x realtime).
+  `large-v3`, multi-GPU and Windows are untested by the author.
 
 ## Tests
 
