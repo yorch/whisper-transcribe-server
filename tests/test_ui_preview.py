@@ -46,6 +46,7 @@ def page_script() -> str:
     """The main page's JS: the shared helpers plus its own script."""
     return static("common.js") + "\n" + static("index.js")
 
+
 NODE = shutil.which("node")
 needs_node = pytest.mark.skipif(NODE is None, reason="node is not installed")
 
@@ -576,6 +577,6 @@ def test_the_page_never_refetches_the_whole_transcript_on_a_tick():
     """Guards against the regression this change exists to fix."""
     tick = function_source("tick")
     assert "?since=" in tick, "tick() must be incremental"
-    assert re.search(r'api\("/api/jobs/" \+ encodeURIComponent\([^)]*\)\)', tick) is None, (
-        "tick() must not fetch the full detail endpoint any more"
-    )
+    assert (
+        re.search(r'api\("/api/jobs/" \+ encodeURIComponent\([^)]*\)\)', tick) is None
+    ), "tick() must not fetch the full detail endpoint any more"

@@ -575,7 +575,9 @@ def test_a_windows_path_in_a_literal_toml_string_also_works(tmp_path, monkeypatc
     """Single quotes are the friendlier form for a path; they must work too."""
     monkeypatch.delenv("TRANSCRIBE_CONFIG", raising=False)
     cfg = tmp_path / "config.toml"
-    cfg.write_text("[server]\nwork_dir = 'C:\\Users\\somebody\\state'\n", encoding="utf-8")
+    cfg.write_text(
+        "[server]\nwork_dir = 'C:\\Users\\somebody\\state'\n", encoding="utf-8"
+    )
 
     args, _, _ = s.resolve_args(["--config", str(cfg)])
 
