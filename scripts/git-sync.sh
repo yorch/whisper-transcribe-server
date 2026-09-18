@@ -25,7 +25,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     -q|--quiet) QUIET=1; shift ;;
     -c|--commit) COMMIT_MSG="${2:-}"; [[ -n "$COMMIT_MSG" ]] || { echo "-c needs a message" >&2; exit 64; }; shift 2 ;;
-    -h|--help) sed -n '2,16p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '2,13p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 64 ;;
   esac
 done
