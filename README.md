@@ -394,8 +394,9 @@ hour-long recording.
   `thorough` buys a little accuracy for noticeably more time.
 - **Skip silence** — VAD filtering. Speeds up meetings with long dead air and
   reduces hallucinated text during silence. Worth leaving on.
-- **Follow** — keeps the newest line of every live preview in view. Remembered
-  for the browser session. Scrolling up pauses it (the preview border goes
+- **Follow** — in the header above the job cards, since it acts on them rather
+  than on the next run. Keeps the newest line of every live preview in view.
+  Remembered for the browser session. Scrolling up pauses it (the preview border goes
   amber) and scrolling back to the bottom resumes; the switch is the off switch.
 
 **Advanced**

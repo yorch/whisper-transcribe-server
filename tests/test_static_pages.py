@@ -71,6 +71,7 @@ def served_markup(page: str) -> str:
 #   - .staged*, .runbar, .run-note, #start*: files are staged and sent by a
 #     button now, instead of the drop starting the job on the spot
 #   - .uploading*, .up-*: the file on the wire, with its progress
+#   - .jobs-head*: the cards' header, which the Follow switch moved into
 INDEX_SELECTORS_ADDED = {
     "#r-ffmpeg.bad",
     ".offscreen",
@@ -98,6 +99,8 @@ INDEX_SELECTORS_ADDED = {
     ".uploading progress::-webkit-progress-bar",
     ".uploading progress::-webkit-progress-value",
     ".uploading progress::-moz-progress-bar",
+    ".jobs-head",
+    ".jobs-head h2",
 }
 
 

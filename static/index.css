@@ -200,6 +200,18 @@
   select:focus-visible{outline:2px solid var(--amber);outline-offset:1px}
 
 
+  /* The cards' own header, holding the one switch that acts on them. */
+  .jobs-head{
+    margin-top:28px;
+    display:flex;align-items:baseline;justify-content:space-between;gap:12px;
+  }
+
+  .jobs-head h2{
+    margin:0;
+    font-family:var(--display);font-weight:600;font-size:13px;
+    letter-spacing:.14em;text-transform:uppercase;color:var(--muted);
+  }
+
   .job{
     margin-top:18px;
     border:1px solid var(--panel-lo);
@@ -324,7 +336,7 @@
 
   input[type=number]:focus-visible{outline:2px solid var(--amber);outline-offset:1px}
 
-  .empty{margin-top:26px;color:var(--muted);font-size:14px}
+  .empty{margin-top:10px;color:var(--muted);font-size:14px}
 
   /* Set from JS: kept as classes so the page needs no inline styles, which is
      what lets the CSP drop style-src 'unsafe-inline'. */

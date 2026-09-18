@@ -21,7 +21,7 @@
 
   <h1>Transcribe audio on the workstation</h1>
   <p class="sub">Drop a recording here, set the controls, then press Transcribe. It
-  runs through Whisper on the GPU in this machine, and nothing leaves the network.</p>
+  runs through Whisper on this machine, and nothing leaves the network.</p>
 
   <div class="gate locked" id="gate">
     <p>This server needs an access token. It was printed in the terminal when the
@@ -75,7 +75,6 @@
         <select id="compute"></select>
       </label>
       <label class="field"><input type="checkbox" id="vad" checked> Skip silence</label>
-      <label class="field"><input type="checkbox" id="follow" checked> Follow</label>
     </div>
 
     <details class="advanced">
@@ -138,6 +137,13 @@
       <p class="run-note" id="run-note">Drop a recording above to get started.</p>
     </div>
 
+    <!-- Follow lives with the cards it scrolls, not with the controls above:
+         those are read when Transcribe is pressed, and this one is not. -->
+    <div class="jobs-head">
+      <h2>Jobs</h2>
+      <label class="field" title="Keep a running transcript scrolled to its newest line">
+        <input type="checkbox" id="follow" checked> Follow</label>
+    </div>
     <div id="jobs"></div>
     <p class="empty" id="empty">No jobs yet.</p>
   </div>
