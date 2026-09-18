@@ -3316,6 +3316,7 @@ def local_names(bind_host: str, extra: list[str]) -> tuple[set[str], set[str]]:
 # than silently ignored.
 DEFAULTS: dict[str, Any] = {
     "config": None,
+    "starter_config": True,
     "work_dir": None,
     "host": ANY_INTERFACE,
     "port": 8765,
@@ -3354,6 +3355,7 @@ CHOICES: dict[str, list[str]] = {
 # wrapper can override whatever is on disk without rewriting it.
 ENV_OPTIONS: dict[str, tuple[str, str]] = {
     "TRANSCRIBE_CONFIG": ("config", "str"),
+    "TRANSCRIBE_STARTER_CONFIG": ("starter_config", "bool"),
     "TRANSCRIBE_WORK_DIR": ("work_dir", "str"),
     "TRANSCRIBE_HOST": ("host", "str"),
     "TRANSCRIBE_PORT": ("port", "int"),
@@ -3455,6 +3457,125 @@ def load_config_file(path: Path, required: bool) -> dict[str, Any]:
     return flat
 
 
+# Handed to the operator on first run. Deliberately ships with every key
+# commented out: a starter file that wrote the defaults down would pin them,
+# so a later release could never move a default for anyone who had started the
+# server once. A commented key keeps tracking the default instead.
+CONFIG_TEMPLATE = """\
+# Configuration for transcribe_server. The server writes this file once, at the
+# default location, and never rewrites it -- edit it freely. It is skipped for
+# an explicit --config, and --no-starter-config turns it off entirely.
+#
+# Every key below is commented out and shows its default. Uncomment only what
+# you want to change.
+#
+# Precedence, lowest to highest: defaults < this file < flags < TRANSCRIBE_*
+# environment variables. An unknown or misspelled key stops startup instead of
+# being ignored, so a typo cannot quietly leave auth off.
+#
+# The file is created readable only by you. Prefer TRANSCRIBE_TOKEN and
+# TRANSCRIBE_AUDIT_TOKEN over the token keys below: a secret in a config file
+# survives in backups and is easy to commit by accident.
+
+[server]
+# Bind address. 0.0.0.0 is every interface, which is the point on a LAN.
+# host = "0.0.0.0"
+# port = 8765
+# Extra Host header values to accept, for tunnels and reverse proxies. A
+# leading "." is a suffix match.
+# allow_host = []
+# Where uploads and the audit trail live. Setting it here moves the state dir
+# but not this file: only --work-dir and TRANSCRIBE_WORK_DIR move both.
+# work_dir = "/mnt/big/transcribe-state"
+# Pin the access token. Omit it and a fresh one is generated and printed at
+# every startup, which logs out every device on restart.
+# token = ""
+# Serve without a token at all. Only on a network you control: anyone who can
+# reach the port can then read every transcript and upload files.
+# no_auth = false
+
+[model]
+# One of: large-v3, large-v3-turbo, medium, small, base
+# model = "large-v3"
+# cuda stops startup if the GPU cannot be used; auto falls back to the CPU.
+# device = "cuda"
+# float16 needs compute capability 7.0+; Pascal and older want int8 or float32.
+# compute_type = "float16"
+# Default beam size: fast=1, balanced=5, thorough=8
+# quality = "balanced"
+# Load the model at startup instead of on the first job.
+# preload = false
+# Models held in VRAM at once. Raising this keeps several model and precision
+# combinations resident instead of reloading them.
+# model_cache = 1
+# Let clients pick the model per job (--pin-model turns this back off).
+# allow_model_choice = true
+# Expose the precision selector in the UI. Precision is a property of the
+# machine, not the recording, so this is off by default.
+# allow_precision_choice = false
+
+[limits]
+# max_upload_mb = 2048
+# max_queue = 20
+# Finished job records kept before the oldest are evicted.
+# max_jobs = 60
+# run deletes the audio as soon as the job finishes (no retry), job keeps it
+# while the record exists, forever never deletes it.
+# source_retention = "job"
+
+[audit]
+# enabled = true
+# Where the daily files and the prompt sidecars live. Default: <work dir>/audit
+# dir = "/mnt/big/transcribe-state/audit"
+# Also log status/list/detail polls. Chatty, so off by default.
+# reads = false
+# Store prompt and hotword text in the sidecar files. Turning this off keeps
+# the hashes and lengths in the main log and records no text anywhere.
+# prompts = true
+# Delete audit files older than this many days at startup; 0 keeps everything.
+# retain_days = 30
+# Separate token for GET /audit. Unset disables the audit API entirely.
+# token = ""
+"""
+
+
+def init_starter_config(path: Path, required: bool, enabled: bool) -> bool:
+    """Create the commented starter config. True only if this call created it.
+
+    Only the *default* location gets one. An explicit --config names a file the
+    operator expects to exist, and creating it would turn a typo into a server
+    quietly running on defaults.
+    """
+    if required or not enabled:
+        return False
+
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # O_EXCL makes "only if absent" atomic instead of a stat-then-write
+        # race, and sets the mode before anything is in the file.
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        return False
+    except OSError as exc:
+        # A read-only or container home is not a reason to refuse to serve.
+        print(f"!  Could not create a starter config at {path}: {exc}")
+        print("   Continuing with defaults. Create the file yourself, or pass")
+        print("   --no-starter-config to stop seeing this.\n")
+        return False
+
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(CONFIG_TEMPLATE)
+    except OSError as exc:
+        # Half a template is worse than none: the next start would reject it as
+        # invalid TOML. The file is ours by construction, so drop it.
+        with contextlib.suppress(OSError):
+            path.unlink()
+        print(f"!  Could not write the starter config at {path}: {exc}\n")
+        return False
+    return True
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Flags use SUPPRESS so an unset flag is absent, letting the config file
     and environment fill it in rather than a hard-coded argparse default."""
@@ -3471,6 +3592,13 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="PATH",
         default=argparse.SUPPRESS,
         help="TOML config file (default: <work dir>/config.toml)",
+    )
+    net.add_argument(
+        "--no-starter-config",
+        dest="starter_config",
+        action="store_false",
+        default=argparse.SUPPRESS,
+        help="never create a starter config at the default location",
     )
     net.add_argument(
         "--work-dir",
@@ -3854,6 +3982,15 @@ def main() -> None:
     with contextlib.suppress(OSError):
         os.chmod(UPLOAD_DIR, 0o700)
 
+    # The state dir exists from here on, which makes this the first safe moment
+    # for a starter config -- and it is deliberately after the CUDA check,
+    # which must not leave files behind on its way out. The file is inert by
+    # construction (every key is commented out), so writing it after the
+    # config was read cannot change how this run is configured.
+    created = init_starter_config(cfg_path, cfg_required, args.starter_config)
+    if created:
+        audit("config.created", path=redact(str(cfg_path), 500))
+
     # Job state is in memory only, so after a restart every file in uploads/ is
     # unreferenced by definition. Without this sweep they accumulate forever,
     # including under --source-retention run.
@@ -3874,7 +4011,8 @@ def main() -> None:
 
     print()
     if cfg_path.exists():
-        print(f"Config     {cfg_path}")
+        note = "  (created; every key is commented out)" if created else ""
+        print(f"Config     {cfg_path}{note}")
     elif cfg_required:
         print(f"!  Config     {cfg_path} (missing)")
 

@@ -45,8 +45,9 @@ Must run on Windows; PyInstaller cannot cross-compile.
 - Removed again on uninstall
 
 It deliberately **leaves your data behind** on uninstall: the audit trail in
-`%USERPROFILE%\.transcribe-server\audit` and any retained audio. Deleting a
-user's transcripts as a side effect of an uninstall is a nasty surprise.
+`%USERPROFILE%\.transcribe-server\audit`, the config file next to it, and any
+retained audio. Deleting a user's transcripts as a side effect of an uninstall
+is a nasty surprise.
 
 ## How the launcher and server divide responsibility
 
@@ -61,7 +62,10 @@ The launcher never parses console output. It:
 5. keeps the server's stdout in `%LOCALAPPDATA%\TranscriptionServer\server.log`
 
 Because the token and port are chosen by the launcher and passed in, the server
-needs **no launcher-aware code** — no state file, no protocol, no changes.
+needs **no launcher-aware code** — no state file, no protocol, no changes. The
+config file stays the server's too: it writes a commented starter to
+`%USERPROFILE%\.transcribe-server\config.toml` on first run, and the launcher
+neither reads nor writes it.
 
 ## First run
 
