@@ -91,11 +91,24 @@ Step "Running the launcher self-test from the bundle"
 if ($LASTEXITCODE -ne 0) { throw "Bundled launcher failed its self-test" }
 
 # The pages are files now, so a bundle that forgot static/ would serve 500s.
+# The pages are files now, so a bundle that forgot static/ would serve 500s.
+# PyInstaller 6 collects data under _internal/ for onedir builds, and that is
+# where sys._MEIPASS points, so STATIC_DIR resolves there. Find where the assets
+# actually landed rather than assuming the layout.
 Step "Checking the bundled static assets"
-$missing = @("static\index.html", "static\audit.html", "static\app.css",
-             "static\common.js", "static\index.js", "static\audit.js") |
-    Where-Object { -not (Test-Path (Join-Path $dist $_)) }
-if ($missing) { throw "Bundle is missing: $($missing -join ', ')" }
+$assetRoot = Get-ChildItem -Path $dist -Recurse -Filter "index.html" -ErrorAction SilentlyContinue |
+    Where-Object { $_.Directory.Name -eq "static" } |
+    Select-Object -First 1 -ExpandProperty DirectoryName
+if (-not $assetRoot) {
+    Write-Host "Bundle tree:"
+    Get-ChildItem $dist -Recurse -Depth 2 | Select-Object -ExpandProperty FullName
+    throw "static/ did not ship in the bundle"
+}
+$missing = @("index.html", "audit.html", "app.css", "index.css", "audit.css",
+             "common.js", "index.js", "audit.js") |
+    Where-Object { -not (Test-Path (Join-Path $assetRoot $_)) }
+if ($missing) { throw "Bundled static/ is missing: $($missing -join ', ')" }
+Write-Host "    all 8 assets present in $assetRoot"
 
 # --- installer -------------------------------------------------------------- #
 

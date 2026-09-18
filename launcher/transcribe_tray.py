@@ -557,7 +557,13 @@ def self_test(with_server: bool = False) -> int:
     token = ensure_token()
     check("token is stable", ensure_token() == token)
     check("token is long enough", len(token) >= 16, f"{len(token)} chars")
-    check("token is not world readable", not (token_path().stat().st_mode & 0o077))
+    if sys.platform == "win32":
+        # chmod does not set ACLs on Windows, so the mode bits say nothing about
+        # who can read this. The file is protected by the user profile's ACLs
+        # instead, which is why the permission claim is POSIX-only.
+        check("token file exists", token_path().is_file())
+    else:
+        check("token is not world readable", not (token_path().stat().st_mode & 0o077))
 
     free = pick_port(0)
     check("pick_port returns a usable port", 1024 < free < 65536, str(free))
