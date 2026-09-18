@@ -135,6 +135,11 @@ launcher/transcribe_tray.py --self-test --with-server   # also probes a real ser
   without a new state. `transcribed` is a second copy of the transcript:
   `job_public` must keep excluding it, or every 1.2 s poll carries it.
   `relabel_refusal` is the single rule behind both the 409 and `can_relabel`.
+  A *merge* (`POST /api/jobs/{id}/speakers/merge`) is the one edit of a
+  finished job: it moves speaker numbers only, reads and writes the segments
+  under a single hold of `JOBS_LOCK` (no `get_job`/`patch_job` inside), and
+  bumps `labels_rev` -- the page's poll signature includes it, because a merge
+  changes nothing else a poll can see.
 - **Alignment splits on speaker change, so `word_timestamps` is not optional.**
   Asking for diarization forces it on. Without word timings a whole segment can
   only go to its dominant speaker, which is the version of the feature that is

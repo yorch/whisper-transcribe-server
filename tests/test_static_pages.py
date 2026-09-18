@@ -74,6 +74,7 @@ def served_markup(page: str) -> str:
 #   - .jobs-head*: the cards' header, which the Follow switch moved into
 #   - .save-*, .actions > button*: the formats as one group, Remove kept apart
 #   - .transcript:not(.labeled) .seg .sp: no speaker column until there are labels
+#   - .people*, .speaker-edit: speaker chips and the merge/rename editor
 INDEX_SELECTORS_ADDED = {
     "#r-ffmpeg.bad",
     ".offscreen",
@@ -111,6 +112,12 @@ INDEX_SELECTORS_ADDED = {
     ".save-group button:last-child",
     ".save-group button:focus-visible",
     ".transcript:not(.labeled) .seg .sp",
+    ".people",
+    ".people .chip",
+    ".people .chip.s0",
+    ".people .chip.s1",
+    ".people .chip.s2",
+    ".speaker-edit",
 }
 
 

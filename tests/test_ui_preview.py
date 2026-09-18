@@ -216,6 +216,7 @@ def card_probe(body: str) -> dict:
                 "setPaused",
                 "appendSegments",
                 "actions",
+                "speakerChips",
                 "createCard",
                 "render",
             )
@@ -235,7 +236,7 @@ let unlocked = true;
 let polling = null, pollAgain = false;
 let polls = [];
 const server = {listed: true, segments: [], state: "running", progress: 0,
-                labeled: false, phase: null, message: ""};
+                labeled: false, phase: null, message: "", rev: 0};
 const seg = (start, text) => ({start, text});
 const cellOf = (row, cls) => (row.children.find(
   (kid) => kid.className.split(" ").includes(cls)) || {}).textContent || "";
@@ -246,11 +247,11 @@ async function api(path){
   if(path === "/api/jobs")
     return {ok: true, status: 200, json: async () => ({jobs: server.listed ? [{id: "abc", state: server.state,
       progress: server.progress, phase: server.phase, message: server.message,
-      segment_count: server.segments.length}] : []})};
+      labels_rev: server.rev, segment_count: server.segments.length}] : []})};
   const since = Number(/since=(\\d+)/.exec(path)[1]);
   return {ok: true, status: 200, json: async () => ({id: "abc", filename: "a.wav", state: server.state,
     progress: server.progress, phase: server.phase, message: server.message,
-    opts: {model: "small"}, elapsed: 4, duration: 20,
+    labels_rev: server.rev, opts: {model: "small"}, elapsed: 4, duration: 20,
     language: "en", segment_start: since, segment_count: server.segments.length,
     speaker_labels: server.labeled, segments: server.segments.slice(since)})};
 }
@@ -276,6 +277,7 @@ def poll_probe(body: str) -> dict:
                 "setPaused",
                 "appendSegments",
                 "actions",
+                "speakerChips",
                 "createCard",
                 "render",
                 "tick",
@@ -584,6 +586,53 @@ def test_a_relabellable_job_offers_relabel_and_says_which_job():
 
 
 @needs_node
+def test_a_merge_redraws_rows_that_are_already_on_screen():
+    """A merge renumbers speakers without changing how many rows there are, so
+    the tail is empty and the row count cannot notice: labels_rev is the only
+    signal, and it has to trigger a refetch from zero."""
+    probe = poll_probe(
+        """
+        server.state = "done"; server.progress = 1; server.labeled = true;
+        server.segments = [Object.assign(seg(0, "hi"), {speaker: 1}),
+                           Object.assign(seg(3, "yo"), {speaker: 2})];
+        await tick();
+        const before = speakers(views.get(viewKey("abc")).transcript.children);
+        server.segments = server.segments.map(x => Object.assign({}, x, {speaker: 1}));
+        server.rev = 1;
+        await tick();
+        return {before, after: speakers(views.get(viewKey("abc")).transcript.children),
+                refetched: polls.filter(p => p.endsWith("since=0")).length};
+        """
+    )
+    assert probe["before"] == ["Speaker 1", "Speaker 2"]
+    assert probe["after"] == ["Speaker 1", "Speaker 1"], probe
+    assert probe["refetched"] == 2, "once at first sight, once for the merge"
+
+
+@needs_node
+def test_a_finished_labelled_card_shows_a_chip_per_speaker():
+    probe = card_probe(
+        """
+        const job = {id: "d", filename: "x", state: "done", opts: {model: "m"},
+          segments: [], segment_count: 0, elapsed: 4, duration: 4, language: "en",
+          speakers: [{speaker: 1, label: "Speaker 1", seconds: 70},
+                     {speaker: 2, label: "Speaker 2", seconds: 5}]};
+        render(job);
+        const people = views.get(viewKey("d")).people.children;
+        const first = people[0];
+        render(job);   // the same totals again: a poll must not rebuild them
+        return {chips: people.map(c => [c.textContent, c.dataset]),
+                same: views.get(viewKey("d")).people.children[0] === first};
+        """
+    )
+    assert probe["chips"] == [
+        ["Speaker 1 \u00b7 1m 10s", {"chip": "d", "speaker": "1"}],
+        ["Speaker 2 \u00b7 5s", {"chip": "d", "speaker": "2"}],
+    ]
+    assert probe["same"], "an open editor would be thrown away every poll"
+
+
+@needs_node
 def test_a_running_job_keeps_its_cancel_button_between_polls():
     """The action buttons were rebuilt on every render, which for a running job
     is every poll. A click whose press and release straddled a poll landed on
@@ -658,7 +707,14 @@ def test_every_view_lookup_keys_the_map_the_same_way():
     the wire on every tick, and each stale card leaked out of the DOM for good
     because the sweep removes one node per id."""
     calls = re.findall(r"views\.(get|set|delete)\(([^)]*)\)", page_script())
-    assert sorted(name for name, _ in calls) == ["delete", "get", "get", "set"], calls
+    # The speaker chips' click handler is the third lookup.
+    assert sorted(name for name, _ in calls) == [
+        "delete",
+        "get",
+        "get",
+        "get",
+        "set",
+    ], calls
     wrongly_keyed = [arg.strip() for _, arg in calls if "viewKey(" not in arg]
     assert not wrongly_keyed, (
         f"a view is keyed differently from the rest: {wrongly_keyed}"

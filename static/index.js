@@ -547,7 +547,9 @@ function createCard(job){
   view.actions.className = "actions";
   const body = document.createElement("div");
   body.className = "job-body";
-  body.append(view.status, view.transcript, view.actions);
+  view.people = document.createElement("div");
+  view.people.className = "people locked";
+  body.append(view.status, view.people, view.transcript, view.actions);
   node.append(view.head, view.meter, body);
   el("jobs").prepend(node);
 
@@ -619,6 +621,63 @@ function appendSegments(view, segments, live, total, labeled){
      clearing the transcript resets the scroll, so someone who was following a
      live job would be thrown back to the top the moment the labels landed. */
   if(live || rebuilt) stick(view);
+}
+
+/* One chip per speaker, coloured like the transcript's gutter. A chip opens
+   the editor below the row; built with textContent, like everything a job
+   carries. */
+function speakerChips(node, jobId, people){
+  node.textContent = "";
+  node.classList.toggle("locked", people.length === 0);
+  for(const p of people){
+    const chip = document.createElement("button");
+    chip.type = "button";
+    chip.className = "chip s" + ((p.speaker - 1) % 3);
+    chip.dataset.chip = jobId;
+    chip.dataset.speaker = String(p.speaker);
+    chip.textContent = p.label + " \u00b7 " + fmtTime(p.seconds);
+    chip.title = "Merge or rename " + p.label;
+    node.append(chip);
+  }
+}
+
+/* The editor for one speaker: merge into another. Only one is open per card. */
+function openSpeakerEdit(view, jobId, speaker){
+  const open = view.people.querySelector(".speaker-edit");
+  if(open) open.remove();
+  if(open && open.dataset.speaker === String(speaker)) return;   // a second click closes
+  const box = document.createElement("div");
+  box.className = "speaker-edit";
+  box.dataset.speaker = String(speaker);
+  const others = view.peopleList.filter(p => p.speaker !== speaker);
+  const me = view.peopleList.find(p => p.speaker === speaker);
+  if(others.length){
+    const label = document.createElement("label");
+    label.className = "field";
+    label.append((me ? me.label : "This speaker") + " is really");
+    const into = document.createElement("select");
+    into.className = "merge-into";
+    for(const p of others){
+      const o = document.createElement("option");
+      o.value = String(p.speaker);
+      o.textContent = p.label;
+      into.append(o);
+    }
+    label.append(into);
+    const go = document.createElement("button");
+    go.type = "button";
+    go.textContent = "Merge";
+    go.dataset.merge = jobId;
+    go.dataset.speaker = String(speaker);
+    box.append(label, go);
+  }
+  const close = document.createElement("button");
+  close.type = "button";
+  close.className = "ghost";
+  close.textContent = "Close";
+  close.dataset.closeEdit = "1";
+  box.append(close);
+  view.people.append(box);
 }
 
 /* A button per action. Built rather than written: a job id lands in a data
@@ -702,6 +761,16 @@ function render(job){
   meter(view.meter, job);
   view.status.className = job.state === "error" ? "status err" : "status";
   view.status.textContent = statusLine(job);
+  /* Who spoke and for how long, and the way into fixing it. Rebuilt only when
+     the totals change, so an editor left open survives the poll. */
+  const people = job.state === "done" && job.speakers ? job.speakers : [];
+  const peopleKey = JSON.stringify(people);
+  if(view.peopleKey !== peopleKey){
+    view.peopleKey = peopleKey;
+    view.peopleList = people;
+    speakerChips(view.people, job.id, people);
+  }
+  view.labelsRev = job.labels_rev || 0;
   /* Rebuilt only when the set of buttons changes. A running job renders every
      poll, and a fresh Cancel under the pointer each time ate any click whose
      press and release straddled a poll, and threw keyboard focus off it. */
@@ -779,6 +848,30 @@ el("jobs").addEventListener("click", async (e) => {
       }
       await tick();
     }
+    if(b.dataset.chip){
+      const view = views.get(viewKey(b.dataset.chip));
+      if(view) openSpeakerEdit(view, b.dataset.chip, Number(b.dataset.speaker));
+    }
+    if(b.dataset.closeEdit){
+      const box = b.closest(".speaker-edit");
+      if(box) box.remove();
+    }
+    if(b.dataset.merge){
+      const into = b.closest(".speaker-edit").querySelector(".merge-into").value;
+      const fd = new FormData();
+      fd.append("speaker", b.dataset.speaker);
+      fd.append("into", into);
+      b.disabled = true;
+      const r = await api("/api/jobs/" + encodeURIComponent(b.dataset.merge)
+                          + "/speakers/merge", {method:"POST", body:fd});
+      if(!r.ok){
+        let detail = r.statusText;
+        try{ detail = (await r.json()).detail || detail; }catch{}
+        alert("Merge failed: " + detail);
+        b.disabled = false;
+      }
+      await tick();
+    }
     if(b.dataset.relabel){
       b.disabled = true;
       const fd = new FormData();
@@ -852,7 +945,8 @@ async function poll(){
          the meter nor the segment count, and the card would go on promising an
          ETA for the whole download. */
       const sig = [summary.state, summary.phase, summary.message,
-                   summary.progress, summary.segment_count].join(":");
+                   summary.progress, summary.segment_count,
+                   summary.labels_rev || 0].join(":");
       if(known.get(summary.id) === sig) continue;
 
       /* Ask for only what this card has not seen. A card that lost its rows
@@ -875,12 +969,14 @@ async function poll(){
       if(!detail.ok) continue;
       let full = await detail.json();
       if(!full || full.id !== summary.id) continue;
-      /* Two things a tail cannot repair, both answered by one full refetch:
+      /* Three things a tail cannot repair, all answered by one full refetch:
          labels arriving in one batch when diarization finishes, which rows
-         already drawn do not have, and a transcript that shrank between the
-         list and this read, whose tail from `since` is empty. */
+         already drawn do not have; a transcript that shrank between the list
+         and this read, whose tail from `since` is empty; and a merge, which
+         renumbers rows already drawn without changing how many there are. */
       if(view && view.shown > 0 && (full.speaker_labels !== view.labeled
-                                    || full.segment_count < since)){
+                                    || full.segment_count < since
+                                    || (full.labels_rev || 0) !== view.labelsRev)){
         view.transcript.textContent = "";
         view.shown = 0;
         const again = await api(url + "?since=0");

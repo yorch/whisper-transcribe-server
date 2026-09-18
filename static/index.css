@@ -286,6 +286,26 @@
 
   .transcript:not(.labeled) .seg .sp{display:none}
 
+  /* Who spoke, and for how long: the way into merging and naming speakers. */
+  .people{display:flex;flex-wrap:wrap;align-items:center;gap:6px;margin:0 0 10px}
+
+  .people .chip{
+    font-family:var(--display);font-size:12.5px;letter-spacing:.02em;
+    padding:3px 10px;border-radius:12px;background:#fbfbfc;
+  }
+
+  .people .chip.s0{color:var(--amber)}
+
+  .people .chip.s1{color:var(--red)}
+
+  .people .chip.s2{color:var(--green)}
+
+  .speaker-edit{
+    flex:1 1 100%;display:flex;flex-wrap:wrap;align-items:center;gap:8px 12px;
+    padding:8px 10px;border:1px solid var(--panel-lo);border-radius:3px;
+    background:rgba(255,255,255,.5);
+  }
+
   .seg .sp.s0{color:var(--amber)}
 
   .seg .sp.s1{color:var(--red)}

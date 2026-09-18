@@ -1833,6 +1833,23 @@ def fold_minor_speakers(
     return relabel_speakers(out), len(minor)
 
 
+def renumber_segments(
+    segments: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], dict[int, int]]:
+    """Renumber speakers 1..N by first appearance, as relabel_speakers does for
+    turns. Returns the segments and the old-to-new mapping."""
+    order: dict[int, int] = {}
+    out = []
+    for segment in segments:
+        speaker = segment_speaker(segment)
+        if speaker is not None:
+            if speaker not in order:
+                order[speaker] = len(order) + 1
+            segment = {**segment, "speaker": order[speaker]}
+        out.append(segment)
+    return out, order
+
+
 def speaker_label(speaker: int) -> str:
     return f"Speaker {speaker}"
 
@@ -3207,6 +3224,52 @@ def relabel_speakers_endpoint(
     return {"id": new_id}
 
 
+@app.post("/api/jobs/{job_id}/speakers/merge")
+def merge_speakers(
+    job_id: str, request: Request, speaker: int = Form(...), into: int = Form(...)
+) -> dict[str, Any]:
+    """Give every line of one speaker to another, then renumber 1..N.
+
+    Edits the finished job in place -- a merge moves numbers, nothing else --
+    so the segments, the per-speaker totals and every export follow it.
+    labels_rev goes up so an open card notices: nothing a poll signs for (state,
+    progress, segment count) changes otherwise.
+    """
+    # Read, change and write under one hold of the lock: two quick merges from
+    # two tabs must not both start from the same segments. Nothing in here
+    # calls get_job or patch_job, which take the lock themselves.
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="No such job")
+        if job["state"] != "done":
+            raise HTTPException(
+                status_code=409, detail="Only a finished job's speakers can be merged"
+            )
+        present = {segment_speaker(x) for x in job["segments"]} - {None}
+        if speaker == into or speaker not in present or into not in present:
+            raise HTTPException(
+                status_code=400, detail="Pick two different speakers on this job"
+            )
+        moved = [
+            {**x, "speaker": into} if segment_speaker(x) == speaker else x
+            for x in job["segments"]
+        ]
+        job["segments"], renumbered = renumber_segments(moved)
+        job["labels_rev"] = job.get("labels_rev", 0) + 1
+        filename = job["filename"]
+    audit(
+        "job.speakers_merged",
+        request,
+        job=job_id,
+        file=filename,
+        speaker=speaker,
+        into=into,
+        speakers=len(renumbered),
+    )
+    return {"renumbered": {str(old): new for old, new in renumbered.items()}}
+
+
 @app.get("/api/jobs")
 def list_jobs() -> dict[str, Any]:
     with JOBS_LOCK:
@@ -3244,6 +3307,9 @@ def job_detail(job_id: str, since: int = 0) -> dict[str, Any]:
     # lets the client notice and refetch, which is the only way it can rebuild
     # rows that were already drawn without labels.
     out["speaker_labels"] = any(s.get("speaker") is not None for s in segments)
+    # Per-speaker totals for the card's speaker chips. Computed from the same
+    # snapshot as the tail, and only read when the list says something changed.
+    out["speakers"] = speaker_summary(segments)
     return out
 
 
