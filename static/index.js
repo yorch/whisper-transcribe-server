@@ -64,9 +64,14 @@ async function refreshStatus(){
       // appears if the operator explicitly opened it up.
       if(s.allow_precision_choice) el("compute-field").classList.remove("locked");
       if(!DIARIZE_OK){
+        el("diarize").checked = false;
         el("diarize-row").classList.add("locked");
         el("diarize-hint").classList.add("locked");
       }
+      /* Now that DIARIZE_OK is known, apply the word-timing coupling -- or
+         leave that box alone if the server has no diarization to couple it
+         to. */
+      syncDiarize();
       if(!s.allow_model_choice){
         el("model").disabled = true;
         el("model").title = "Pinned by the server";
@@ -161,15 +166,26 @@ el("vad").addEventListener("change", () => {
 /* Asking for speaker labels asks for word timings, because without them a whole
    Whisper segment can only be handed to its dominant speaker — which is the
    version of this feature that is confidently wrong. The box is ticked and
-   locked rather than quietly overridden, so the cost is visible. */
+   locked rather than quietly overridden, so the cost is visible.
+
+   Split out from the DOM work because the interesting part is the decision: a
+   server started with --no-diarize hides the control, and the page must not
+   then leave word timings ticked and disabled behind it. A separate function
+   is one that can be tested without a browser. */
+function locksWordTimings(diarizeAvailable, boxTicked){
+  return !!diarizeAvailable && !!boxTicked;
+}
+
 function syncDiarize(){
-  const on = el("diarize").checked;
+  const on = locksWordTimings(DIARIZE_OK, el("diarize").checked);
   if(on) el("words").checked = true;
   el("words").disabled = on;
   el("words").title = on ? "Required for speaker labels" : "";
 }
 el("diarize").addEventListener("change", syncDiarize);
-syncDiarize();
+/* Deliberately not called here: DIARIZE_OK is only known once /api/status has
+   answered, and running this before then would lock the word-timing box for a
+   feature the server may not offer. Called from the status handler instead. */
 
 /* ---------- following the transcript ---------- */
 /* Auto-scroll for the job previews, on by default and remembered for the

@@ -176,6 +176,111 @@ def test_the_transcript_dom_survives_a_poll():
 
 
 # --------------------------------------------------------------------------- #
+# The diarization controls
+# --------------------------------------------------------------------------- #
+
+# Enough of the control panel for syncDiarize: the two boxes it touches, plus
+# the flag the status handler sets.
+CONTROL_HARNESS = """
+const controls = {
+  diarize: {checked: true},
+  words: {checked: false, disabled: false, title: ""},
+};
+const el = (id) => controls[id];
+let DIARIZE_OK = false;
+"""
+
+
+def control_probe(body: str) -> dict:
+    """Run `body` against the real syncDiarize and a two-element DOM stub."""
+    program = (
+        CONTROL_HARNESS
+        + function_source("locksWordTimings")
+        + function_source("syncDiarize")
+        + "\nprocess.stdout.write(JSON.stringify((() => {"
+        + body
+        + "})()));"
+    )
+    return json.loads(run_node(program))
+
+
+def test_the_page_ticks_identify_speakers_and_not_word_timings():
+    """A dropped file should come back labelled, so that box ships ticked.
+
+    Word timings do NOT: the script ticks them once the server has confirmed it
+    offers diarization, so a --no-diarize server never forces them on. Both
+    sides of that are covered by the control_probe tests below.
+    """
+    html = page_html()
+    assert re.search(r'id="diarize"\s+checked', html), (
+        "the Identify speakers box is no longer ticked by default"
+    )
+    assert not re.search(r'id="words"[^>]*checked', html), (
+        "word timings must not be forced from the markup alone"
+    )
+
+
+@needs_node
+def test_a_server_without_diarization_does_not_force_word_timings():
+    """The bug this pins: the markup ships the box ticked so a dropped file is
+    labelled, but a --no-diarize server hides that control and must not leave
+    word timings ticked and disabled behind it."""
+    probe = control_probe(
+        """
+        DIARIZE_OK = false;
+        controls.diarize.checked = false;   // what the status handler does
+        syncDiarize();
+        return {words: controls.words.checked, disabled: controls.words.disabled,
+                title: controls.words.title};
+        """
+    )
+    assert probe == {"words": False, "disabled": False, "title": ""}, probe
+
+
+@needs_node
+def test_asking_for_speakers_ticks_and_locks_word_timings():
+    probe = control_probe(
+        """
+        DIARIZE_OK = true;
+        controls.diarize.checked = true;
+        syncDiarize();
+        return {words: controls.words.checked, disabled: controls.words.disabled,
+                title: controls.words.title};
+        """
+    )
+    assert probe["words"] is True
+    assert probe["disabled"] is True, "the operator should see why it is on"
+    assert "speaker" in probe["title"]
+
+
+@needs_node
+def test_unticking_speakers_releases_the_word_timing_box():
+    """Unlocking must not also untick it: once the box is the operator's again,
+    whatever they last chose should stand."""
+    probe = control_probe(
+        """
+        DIARIZE_OK = true; controls.diarize.checked = true; syncDiarize();
+        controls.diarize.checked = false; syncDiarize();
+        return {disabled: controls.words.disabled, title: controls.words.title,
+                words: controls.words.checked};
+        """
+    )
+    assert probe["disabled"] is False and probe["title"] == ""
+    assert probe["words"] is True, "the tick itself is left as it was"
+
+
+@needs_node
+def test_the_lock_is_applied_after_status_not_at_load():
+    """DIARIZE_OK is unknown until /api/status answers, so an unconditional call
+    at parse time would lock the box for a feature that may not exist."""
+    script = page_script()
+    assert "syncDiarize();" in script, "the status handler must still apply it"
+    assert not re.search(
+        r'addEventListener\("change", syncDiarize\);\s*syncDiarize\(\)', script
+    ), "syncDiarize() must not run at load, before DIARIZE_OK is known"
+
+
+# --------------------------------------------------------------------------- #
 # The script parses, and the clock is right
 # --------------------------------------------------------------------------- #
 

@@ -399,8 +399,9 @@ drop applies to that job.
   vocabulary more broadly than the term list. `initial_prompt` under the hood.
 - **Translate to English** — switches the task from transcribe to translate.
 - **Word-level timings** — costs time, but the exported `.json` word timings
-  are useful on their own, and asking for **Identify speakers** turns this on for
-  you (see below).
+  are useful on their own, and **Identify speakers** turns this on for you. That
+  box is ticked by default, so this one is too and is locked while it is; on a
+  server started with `--no-diarize` neither happens.
 - **Identify speakers** — labels the voices in the recording `Speaker 1`,
   `Speaker 2` and so on, and splits a sentence at the point the speaker changes.
   **Ticked by default on this page**, so a file you drop comes back labelled;
