@@ -2395,9 +2395,10 @@ CONFIG_TEMPLATE = """\
 # Extra Host header values to accept, for tunnels and reverse proxies. A
 # leading "." is a suffix match.
 # allow_host = []
-# Where uploads and the audit trail live. Setting it here moves the state dir
-# but not this file: only --work-dir and TRANSCRIBE_WORK_DIR move both.
-# work_dir = "/mnt/big/transcribe-state"
+# Where uploads and the audit trail live is deliberately not settable here:
+# this file was found in that directory, so the key belongs to --work-dir and
+# TRANSCRIBE_WORK_DIR, which move the state dir and this file together. Setting
+# it here is a startup error, not a silent no-op.
 # Pin the access token. Omit it and a fresh one is generated and printed at
 # every startup, which logs out every device on restart.
 # token = ""
@@ -2485,6 +2486,28 @@ def init_starter_config(path: Path, required: bool, enabled: bool) -> bool:
         print(f"!  Could not write the starter config at {path}: {exc}\n")
         return False
     return True
+
+
+def check_default_state_dir(cfg_path: Path, value: Any, target: Path) -> None:
+    """Refuse a default-location config that moves the state dir out from under itself.
+
+    The default config path is <work dir>/config.toml, so `work_dir` inside that
+    file cannot move the file it was found in: the state would move, this file
+    would not, and a config written next to the new state would be ignored with
+    nothing on screen to say so. --work-dir and TRANSCRIBE_WORK_DIR move both,
+    which is what someone reaching for this key actually wants. An explicit
+    --config is fixed independently of the work dir, so the key is honest there
+    and stays allowed.
+    """
+    if target.resolve() == cfg_path.parent.resolve():
+        return  # a no-op: the file already sits in the dir it names
+    raise SystemExit(
+        f"!  {cfg_path} sets work_dir = {value!r}\n"
+        f"   This file lives in the state dir, so it cannot move the state dir: the\n"
+        f"   state would move, this file would not, and a config written in\n"
+        f"   {target} would be silently ignored. Use --work-dir {target} (or\n"
+        f"   TRANSCRIBE_WORK_DIR) to move both, or delete the key."
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -2747,6 +2770,16 @@ def resolve_args(
     for name in ("model_cache", "max_jobs", "audit_retain_days"):
         if merged[name] < 0:
             raise SystemExit(f"!  {name} cannot be negative, got {merged[name]}")
+
+    # Only the default location is self-referential, and the comparison is on the
+    # effective value: --work-dir and TRANSCRIBE_WORK_DIR already moved the config
+    # path along with the state, so they can only ever agree here.
+    if not required and merged["work_dir"]:
+        check_default_state_dir(
+            path,
+            merged["work_dir"],
+            Path(str(merged["work_dir"])).expanduser(),
+        )
 
     return argparse.Namespace(**merged), path, required
 
