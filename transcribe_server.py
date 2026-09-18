@@ -2716,8 +2716,29 @@ def list_jobs() -> dict[str, Any]:
 
 
 @app.get("/api/jobs/{job_id}")
-def job_detail(job_id: str) -> dict[str, Any]:
-    return job_public(get_job(job_id))
+def job_detail(job_id: str, since: int = 0) -> dict[str, Any]:
+    """One job, optionally only the segments after `since`.
+
+    The page polls this while a job runs. Re-sending the whole transcript on
+    every tick is quadratic in the length of the recording — an hour-long
+    meeting is hundreds of ticks over a transcript that keeps growing — so the
+    client says how many segments it already has and gets only the tail.
+
+    `since=0` (the default) still returns everything, so this stays a plain
+    detail endpoint for anything that is not the polling loop.
+    """
+    job = get_job(job_id)
+    out = job_public(job, include_segments=False)
+    total = len(job["segments"])
+    start = clamp(as_int(since, 0), 0, total)
+    out["segments"] = job["segments"][start:]
+    out["segment_start"] = start
+    # Speaker labels land in one batch when the diarization pass finishes, so a
+    # tail carrying no new segments would never reveal them. Reporting the shape
+    # lets the client notice and refetch, which is the only way it can rebuild
+    # rows that were already drawn without labels.
+    out["speaker_labels"] = any(s.get("speaker") is not None for s in job["segments"])
+    return out
 
 
 @app.delete("/api/jobs/{job_id}")
@@ -3559,25 +3580,31 @@ function createCard(job){
 /* Append only what is new. The server grows job["segments"] and never rewrites
    one, so counting is enough. textContent rather than innerHTML: transcript
    text needs no escaping and cannot become markup. */
-function appendSegments(view, segments, live){
+function appendSegments(view, segments, live, total, labeled){
   view.live = live;
-  /* Labels arrive in one batch when the diarization pass ends, so every row
-     already on screen was drawn without them, and counting new segments is not
-     enough to notice. Compare the shape and rebuild once when it changes. */
-  const labeled = segments.length > 0 && segments[0].speaker != null;
   let rebuilt = false;
-  if(labeled !== view.labeled){
+  /* `segments` is the tail the server has not sent yet, so there is nothing to
+     de-duplicate: a poll with no new text sends an empty list. `total` is the
+     server's own count, which is the only way to notice that a job's segment
+     list went backwards (a restart, or a re-queued job) and the preview has to
+     be rebuilt rather than appended to. */
+  if(total !== undefined && total < view.shown + segments.length){
+    view.transcript.textContent = "";
+    view.shown = 0;
+    rebuilt = true;
+  }
+  /* Labels arrive in one batch when the diarization pass ends, so every row
+     already on screen was drawn without them, and counting new segments cannot
+     notice. The server reports the shape, because a tail carrying no new
+     segments would otherwise never reveal it, and the caller refetches from
+     zero when this fires — a tail cannot rebuild rows already drawn. */
+  if(labeled !== undefined && labeled !== view.labeled){
     view.transcript.textContent = "";
     view.shown = 0;
     view.labeled = labeled;
     rebuilt = true;
   }
-  if(segments.length < view.shown){
-    view.transcript.textContent = "";
-    view.shown = 0;
-  }
-  for(let i = view.shown; i < segments.length; i++){
-    const seg = segments[i];
+  for(const seg of segments){
     const row = document.createElement("div");
     row.className = "seg";
     const ts = document.createElement("span");
@@ -3598,7 +3625,7 @@ function appendSegments(view, segments, live){
     row.append(ts, sp, tx);
     view.transcript.append(row);
   }
-  view.shown = segments.length;
+  view.shown += segments.length;
   /* Only chase a job that is still producing text: a finished transcript should
      open at its first line, not at its last. A rebuild is the exception —
      clearing the transcript resets the scroll, so someone who was following a
@@ -3638,7 +3665,9 @@ function render(job){
   view.node.querySelector(".actions").innerHTML = actionsHtml(job);
 
   appendSegments(view, job.segments || [],
-                 ["queued","loading","running"].includes(job.state));
+                 ["queued","loading","running"].includes(job.state),
+                 job.segment_count,
+                 job.speaker_labels);
 }
 
 /* Downloads go through fetch so the token stays in a header, never a URL. */
@@ -3725,7 +3754,26 @@ async function tick(){
       const sig = summary.state + ":" + summary.progress + ":" + summary.segment_count;
       if(known.get(summary.id) === sig) continue;
       known.set(summary.id, sig);
-      const full = await (await api("/api/jobs/" + encodeURIComponent(summary.id))).json();
+
+      /* Ask for only what this card has not seen. A card that lost its rows
+         (the job's segments went backwards) starts from zero again. */
+      const view = views.get("job-" + summary.id);
+      let since = view ? view.shown : 0;
+      if(view && summary.segment_count < view.shown){
+        view.transcript.textContent = "";
+        view.shown = 0;
+        since = 0;
+      }
+      const url = "/api/jobs/" + encodeURIComponent(summary.id);
+      let full = await (await api(url + "?since=" + since)).json();
+      /* Labels arrive in one batch when diarization finishes, and the tail
+         cannot carry them: refetch the whole transcript once when the shape
+         changes, so rows drawn without labels are rebuilt with them. */
+      if(view && full.speaker_labels !== view.labeled && view.shown > 0){
+        view.transcript.textContent = "";
+        view.shown = 0;
+        full = await (await api(url + "?since=0")).json();
+      }
       render(full);
     }
   }catch(e){ /* server blip or 401; next tick retries */ }
