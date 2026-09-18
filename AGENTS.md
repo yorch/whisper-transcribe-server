@@ -86,10 +86,18 @@ launcher/transcribe_tray.py --self-test --with-server   # also probes a real ser
 ## Invariants worth not breaking
 
 - **Prompt/hotword text never reaches an app-token holder.** It is the one field
-  the audit token gates. `job_public()` and `render(..., "json")` must emit
+  the audit credential gates. `job_public()` and `render(..., "json")` must emit
   `public_opts()`, which returns a flag and a length, never the text. Only
-  `AuditLog.read_prompt` (audit-token routes) may return it. A regression here
-  silently voids the two-token split.
+  `AuditLog.read_prompt` (audit-token routes) may return it, and the only thing
+  allowed to drop that gate is the explicit `--audit-open` opt-in. A regression
+  here silently voids the two-token split.
+- **The audit API is reachable without configuration.** `main()` mints an audit
+  token when none is set and the banner prints it; `--audit-open` is the only
+  way to serve the trail without one. Do not reintroduce a silent "no token means
+  404": that is what made `/audit` ask for a token that did not exist.
+- **The audit token and `--audit-open` are mutually exclusive**, refused in
+  `resolve_args` rather than resolved by precedence, because the environment
+  wins over flags here and would otherwise discard a token without a word.
 - **`JOBS_LOCK` is a non-reentrant `threading.Lock`.** Never call `drop_source`,
   `source_shared`, `patch_job` or `get_job` while holding it — that deadlocked
   the whole server once, because the async endpoints take the same lock on the

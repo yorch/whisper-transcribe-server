@@ -1607,6 +1607,18 @@ def refuse(detail: str, status: int) -> Response:
     return hardened(JSONResponse({"detail": detail}, status_code=status))
 
 
+def audit_api_mode(args: argparse.Namespace) -> str:
+    """How the audit API is reachable: 'open', 'token' or 'off'.
+
+    One rule, three consumers: the middleware gate, the mode the page renders
+    server-side, and the startup record. 'off' is only reachable when ARGS was
+    built by hand -- main() always leaves either a token or an explicit opt-out.
+    """
+    if args.audit_open:
+        return "open"
+    return "token" if args.audit_token else "off"
+
+
 @app.middleware("http")
 async def guard(request: Request, call_next):
     if not READY:
@@ -1639,10 +1651,15 @@ async def guard(request: Request, call_next):
         if path.startswith("/api/audit"):
             # The audit trail has its own credential, deliberately independent
             # of the app token: one can be handed out without the other.
-            if not ARGS.audit_token:
+            # --audit-open is the only way past that gate, and it stays
+            # explicit: this prefix is where prompt text becomes readable.
+            mode = audit_api_mode(ARGS)
+            if mode == "off":
                 return refuse("Audit API disabled: set --audit-token", 404)
             supplied = request.headers.get("x-audit-token") or ""
-            if not hmac.compare_digest(supplied.encode(), ARGS.audit_token.encode()):
+            if mode == "token" and not hmac.compare_digest(
+                supplied.encode(), ARGS.audit_token.encode()
+            ):
                 audit_rejection(
                     "security.auth_failed",
                     request,
@@ -1728,8 +1745,19 @@ def index() -> str:
 
 @app.get("/audit", response_class=HTMLResponse)
 def audit_ui() -> str:
-    """The page is public like `/`; the data behind it needs the audit token."""
-    return AUDIT_PAGE
+    """The page is public like `/`; the data behind it needs the audit token,
+    unless the operator opened it with --audit-open. The mode is rendered
+    server-side so a switched-off API cannot look like a rejected token."""
+    mode = audit_api_mode(ARGS)
+    # The gate ships visible, so token mode works with no script at all. Every
+    # other mode starts with it hidden: the alternative is a visible prompt for
+    # a token that does not exist, which is the bug this page used to have.
+    # relock() takes over from there, for a server that restarts mid-session.
+    return (
+        AUDIT_PAGE.replace("__MODE__", mode)
+        .replace("__GATE_CLASS__", "gate" if mode == "token" else "gate locked")
+        .replace("__OFF_CLASS__", "gate" if mode == "off" else "gate locked")
+    )
 
 
 @app.get("/api/status")
@@ -3027,25 +3055,32 @@ AUDIT_PAGE = r"""<!doctype html>
   @media (prefers-reduced-motion:reduce){*{transition:none!important}}
 </style>
 </head>
-<body>
+<body data-mode="__MODE__">
 <div class="wrap">
   <div class="topbar">
     <h1>Audit trail</h1>
     <a class="back" href="/">&larr; Transcription</a>
   </div>
   <p class="sub">Every action the web app took &mdash; uploads, exports, deletions,
-  worker lifecycle and refused requests &mdash; newest first. This page needs the
-  audit token, which is separate from the app token.</p>
+  worker lifecycle and refused requests &mdash; newest first. Access to the trail
+  is controlled separately from the app token.</p>
 
-  <div class="gate" id="gate">
-    <p>Paste the audit token. It is printed in the terminal when the server starts
-    with <code>--audit-token</code> or <code>TRANSCRIBE_AUDIT_TOKEN</code>.</p>
+  <div class="__GATE_CLASS__" id="gate">
+    <p>Paste the audit token. The server prints it at startup; pass
+    <code>--audit-token</code> or <code>TRANSCRIBE_AUDIT_TOKEN</code> to pin it
+    across restarts.</p>
     <div class="row">
       <input type="password" id="gate-token" autocomplete="off" spellcheck="false"
              placeholder="Audit token" aria-label="Audit token">
       <button id="gate-go">Unlock</button>
     </div>
     <p class="gate-err locked" id="gate-err">That token was rejected.</p>
+  </div>
+
+  <div class="__OFF_CLASS__" id="off">
+    <p>This server has the audit API switched off, so there is nothing to show
+    here. Restart it with <code>--audit-token</code> (or
+    <code>TRANSCRIBE_AUDIT_TOKEN</code>) to turn the endpoint back on.</p>
   </div>
 
   <div id="main" class="locked">
@@ -3090,16 +3125,28 @@ let TOKEN = sessionStorage.getItem("atk") || "";
   }
 }
 
+/* Which of the three modes the server rendered. The page used to infer this
+   from a failed request, which made a switched-off API look like a bad token. */
+const MODE = document.body.dataset.mode;
+
 let unlocked = false, offset = 0, timer = null;
+
+function relock(){
+  unlocked = false;
+  clearInterval(timer);
+  el("main").classList.add("locked");
+  // Only "off" owns the switched-off notice; anything else that lands here is
+  // a credential problem, where the gate is the useful thing to show.
+  el("gate").classList.toggle("locked", MODE === "off");
+  el("off").classList.toggle("locked", MODE !== "off");
+}
 
 async function api(path){
   const headers = {};
   if(TOKEN) headers["x-audit-token"] = TOKEN;
   const r = await fetch(path, {headers, credentials:"omit"});
   if(r.status === 401 || r.status === 404){
-    unlocked = false;
-    el("gate").classList.remove("locked");
-    el("main").classList.add("locked");
+    relock();
     throw new Error("unauthorised");
   }
   return r;
@@ -3252,15 +3299,17 @@ el("q").addEventListener("keydown", (e) => { if(e.key === "Enter") load(false); 
 el("auto").addEventListener("change", schedule);
 
 (async function boot(){
-  if(!TOKEN) return;
+  // No early return on a missing token: --audit-open means there is none to
+  // have, and this one probe is what tells the three modes apart.
   try{
-    const r = await fetch("/api/audit?limit=1", {headers:{"x-audit-token":TOKEN}, credentials:"omit"});
+    const headers = TOKEN ? {"x-audit-token":TOKEN} : {};
+    const r = await fetch("/api/audit?limit=1", {headers, credentials:"omit"});
     if(!r.ok) throw new Error("rejected");
     unlocked = true;
     await load(false);
     schedule();
   }catch(e){
-    el("gate").classList.remove("locked");
+    relock();
   }
 })();
 </script>
@@ -3340,6 +3389,7 @@ DEFAULTS: dict[str, Any] = {
     "audit_reads": False,
     "audit_prompts": True,
     "audit_retain_days": 30,
+    "audit_open": False,
     "audit_token": "",
 }
 
@@ -3377,6 +3427,7 @@ ENV_OPTIONS: dict[str, tuple[str, str]] = {
     "TRANSCRIBE_AUDIT_READS": ("audit_reads", "bool"),
     "TRANSCRIBE_AUDIT_PROMPTS": ("audit_prompts", "bool"),
     "TRANSCRIBE_AUDIT_RETAIN_DAYS": ("audit_retain_days", "int"),
+    "TRANSCRIBE_AUDIT_OPEN": ("audit_open", "bool"),
     "TRANSCRIBE_AUDIT_TOKEN": ("audit_token", "str"),
 }
 
@@ -3421,6 +3472,7 @@ CONFIG_ALIASES: dict[str, str] = {
     "audit.dir": "audit_dir",
     "audit.prompts": "audit_prompts",
     "audit.retain_days": "audit_retain_days",
+    "audit.open": "audit_open",
     "audit.token": "audit_token",
 }
 
@@ -3535,7 +3587,12 @@ CONFIG_TEMPLATE = """\
 # prompts = true
 # Delete audit files older than this many days at startup; 0 keeps everything.
 # retain_days = 30
-# Separate token for GET /audit. Unset disables the audit API entirely.
+# Serve the trail with no credential at all, prompt and hotword text included.
+# Only on a network you control. Refused together with the token below.
+# open = false
+# Separate token for GET /audit and /api/audit. Generated for this run when
+# left empty and printed at startup, so the endpoint works unconfigured; pin it
+# to keep bookmarks and scripts working across restarts.
 # token = ""
 """
 
@@ -3787,10 +3844,17 @@ def build_parser() -> argparse.ArgumentParser:
         "0 keeps everything)",
     )
     aud.add_argument(
+        "--audit-open",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="drop the audit credential: /audit and /api/audit become public, "
+        "prompt and hotword text included (only on a network you control)",
+    )
+    aud.add_argument(
         "--audit-token",
         default=argparse.SUPPRESS,
-        help="separate token for GET /audit and /api/audit; unset disables "
-        "the audit API entirely (prefer TRANSCRIBE_AUDIT_TOKEN)",
+        help="separate token for GET /audit and /api/audit; generated for this "
+        "run when unset, like the app token (prefer TRANSCRIBE_AUDIT_TOKEN)",
     )
     return p
 
@@ -3870,6 +3934,16 @@ def resolve_args(
             Path(str(merged["work_dir"])).expanduser(),
         )
 
+    # Refused rather than resolved by precedence: the environment beats flags
+    # here, so a service wrapper's TRANSCRIBE_AUDIT_TOKEN would otherwise be
+    # dropped without a word by [audit] open = true in a config file.
+    if merged["audit_open"] and merged["audit_token"]:
+        raise SystemExit(
+            "!  --audit-open and an audit token are mutually exclusive: "
+            "--audit-open would ignore the token. Drop one, or unset "
+            "TRANSCRIBE_AUDIT_TOKEN / [audit] token."
+        )
+
     return argparse.Namespace(**merged), path, required
 
 
@@ -3894,7 +3968,7 @@ def startup_snapshot(args: argparse.Namespace, cfg: Path | None) -> dict[str, An
         "audit_reads": args.audit_reads,
         "audit_prompts": args.audit_prompts,
         "audit_retain_days": args.audit_retain_days,
-        "audit_api": bool(args.audit_token),
+        "audit_api": audit_api_mode(args),
         "max_upload_mb": args.max_upload_mb,
         "max_queue": args.max_queue,
         "max_jobs": args.max_jobs,
@@ -3962,6 +4036,14 @@ def main() -> None:
         generated = not args.token
         if generated:
             args.token = secrets.token_urlsafe(24)
+
+    # The audit API is on by default for the same reason the app API is: an
+    # unset credential that silently disables the endpoint is a trap for
+    # whoever later goes looking for /audit. --audit-open is the way out.
+    audit_generated = False
+    if not args.audit_open and not args.audit_token:
+        args.audit_token = secrets.token_urlsafe(24)
+        audit_generated = True
 
     WORK_DIR = (
         Path(args.work_dir).expanduser()
@@ -4090,16 +4172,27 @@ def main() -> None:
         )
         if pruned:
             print(f"           pruned {len(pruned)} expired file(s)")
-        if args.audit_token:
-            print(f"Audit token: {args.audit_token}")
-            print(
-                f"Audit UI:  http://<this-machine-ip>:{args.port}/audit"
-                "?token=<audit-token>"
-            )
-        else:
-            print("Audit API  disabled (set --audit-token or TRANSCRIBE_AUDIT_TOKEN)")
     else:
-        print("\nAudit      disabled (--no-audit)")
+        print("\nAudit      off (--no-audit); existing files stay readable")
+
+    # The audit API carries its own credential, so it announces itself on its
+    # own lines -- and always, because it stays usable for existing files even
+    # when recording is off.
+    if args.audit_open:
+        print()
+        print("!  Audit API open. Anyone who can reach this port can read the")
+        print("   prompt and hotword text recorded for every job.")
+        print(f"\nAudit UI:  http://<this-machine-ip>:{args.port}/audit")
+    else:
+        print(f"\nAudit token: {args.audit_token}")
+        if audit_generated:
+            print(
+                "             (generated for this run; pass --audit-token or "
+                "TRANSCRIBE_AUDIT_TOKEN to pin it)"
+            )
+        print(
+            f"Audit UI:  http://<this-machine-ip>:{args.port}/audit?token=<audit-token>"
+        )
 
     if swept:
         print(

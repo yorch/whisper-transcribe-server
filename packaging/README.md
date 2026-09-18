@@ -1,7 +1,7 @@
 # Packaging for Windows
 
 Ships a **tray launcher**, not a frozen server. The launcher owns the process,
-the access token and the port; `transcribe_server.py` stays a PEP 723 script and
+the credentials and the port; `transcribe_server.py` stays a PEP 723 script and
 is executed by `uv`, which resolves its dependencies on first run.
 
 ## Why not freeze the server
@@ -54,14 +54,20 @@ is a nasty surprise.
 The launcher never parses console output. It:
 
 1. generates a stable token (`%LOCALAPPDATA%\TranscriptionServer\token`, `0600`)
+   and a second one for the audit trail (`...\audit-token`), because the server
+   would otherwise mint a fresh audit token per run and print it to a log file
+   the tray user never opens, leaving `/audit` unreachable
 2. picks the documented port, or any free one if 8765 is taken
 3. starts `uv run --no-project transcribe_server.py --port N` with
-   `TRANSCRIBE_TOKEN` set, and prepends the vendored ffmpeg to `PATH`
+   `TRANSCRIBE_TOKEN` and `TRANSCRIBE_AUDIT_TOKEN` set, and prepends the
+   vendored ffmpeg to `PATH`. An `--audit-open` in the passthrough arguments (or
+   an inherited `TRANSCRIBE_AUDIT_OPEN`) suppresses the audit token instead,
+   since the server refuses a token it has been told to ignore
 4. polls `GET /api/status` with that token until it answers, then opens the
    browser
 5. keeps the server's stdout in `%LOCALAPPDATA%\TranscriptionServer\server.log`
 
-Because the token and port are chosen by the launcher and passed in, the server
+Because the tokens and port are chosen by the launcher and passed in, the server
 needs **no launcher-aware code** — no state file, no protocol, no changes. The
 config file stays the server's too: it writes a commented starter to
 `%USERPROFILE%\.transcribe-server\config.toml` on first run, and the launcher

@@ -108,6 +108,7 @@ def configured(tmp_path, monkeypatch):
         source_retention="job",
         audit_reads=True,
         audit=True,
+        audit_open=False,
         host="127.0.0.1",
         port=8765,
     )
@@ -123,6 +124,22 @@ def configured(tmp_path, monkeypatch):
     while not s.JOB_QUEUE.empty():
         s.JOB_QUEUE.get_nowait()
         s.JOB_QUEUE.task_done()
+
+
+@pytest.fixture(autouse=True)
+def fresh_rejection_bursts():
+    """Refusal burst-collapse is process-global state.
+
+    audit_rejection() logs at most REJECT_LOG_LIMIT refusals per (event,
+    client) per minute, and every TestClient request arrives from the same
+    client host. Without this, whether a refusal was recorded depends on how
+    many refusals earlier tests happened to make.
+    """
+    with s._REJECT_LOCK:
+        s._REJECT_STATE.clear()
+    yield
+    with s._REJECT_LOCK:
+        s._REJECT_STATE.clear()
 
 
 @pytest.fixture

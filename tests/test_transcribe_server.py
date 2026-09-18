@@ -625,6 +625,52 @@ def test_audit_section_aliases(tmp_path, monkeypatch):
     assert args.audit is False
 
 
+def test_audit_open_alias_and_mode_rule(tmp_path, monkeypatch):
+    """[audit] open, the flag and the env var all reach the same option, and
+    the three-way mode rule is what the gate and the page read."""
+    monkeypatch.delenv("TRANSCRIBE_AUDIT_OPEN", raising=False)
+    monkeypatch.delenv("TRANSCRIBE_AUDIT_TOKEN", raising=False)
+    cfg = tmp_path / "c.toml"
+    cfg.write_text("[audit]\nopen = true\n")
+
+    args, _, _ = s.resolve_args(["--config", str(cfg)])
+    assert args.audit_open is True
+    assert s.audit_api_mode(args) == "open"
+
+    # No token and no opt-out is 'off'; a token alone is 'token'.
+    args, _, _ = s.resolve_args(["--audit-token", "secret"])
+    assert args.audit_open is False
+    assert s.audit_api_mode(args) == "token"
+
+    args, _, _ = s.resolve_args([])
+    assert s.audit_api_mode(args) == "off"
+
+    monkeypatch.setenv("TRANSCRIBE_AUDIT_OPEN", "1")
+    args, _, _ = s.resolve_args([])
+    assert args.audit_open is True
+
+
+def test_audit_open_and_an_audit_token_are_mutually_exclusive(tmp_path, monkeypatch):
+    """Refusing beats precedence: the token would otherwise be dropped without
+    a word, and the environment layer is the one that wins."""
+    monkeypatch.delenv("TRANSCRIBE_AUDIT_OPEN", raising=False)
+    monkeypatch.delenv("TRANSCRIBE_AUDIT_TOKEN", raising=False)
+
+    with pytest.raises(SystemExit) as exc:
+        s.resolve_args(["--audit-open", "--audit-token", "secret"])
+    assert "mutually exclusive" in str(exc.value)
+
+    monkeypatch.setenv("TRANSCRIBE_AUDIT_TOKEN", "from-env")
+    with pytest.raises(SystemExit):
+        s.resolve_args(["--audit-open"])
+
+    cfg = tmp_path / "c.toml"
+    cfg.write_text('[audit]\ntoken = "from-file"\n')
+    monkeypatch.delenv("TRANSCRIBE_AUDIT_TOKEN")
+    with pytest.raises(SystemExit):
+        s.resolve_args(["--config", str(cfg), "--audit-open"])
+
+
 # --------------------------------------------------------------------------- #
 # Starter config
 # --------------------------------------------------------------------------- #

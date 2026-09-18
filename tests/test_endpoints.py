@@ -122,13 +122,45 @@ def test_audit_api_requires_its_own_token(client, configured):
     assert "events" in response.json() and "dates" in response.json()
 
 
-def test_audit_api_is_404_when_no_audit_token_is_configured(client, configured):
-    configured.audit_token = ""
+def test_audit_api_is_404_when_neither_a_token_nor_open_is_configured(client):
+    """'off' is only reachable with ARGS built by hand: main() always leaves
+    either a generated token or an explicit --audit-open."""
+    saved = s.ARGS.audit_token
     s.ARGS.audit_token = ""
     try:
         assert client.get("/api/audit").status_code == 404
     finally:
-        s.ARGS.audit_token = configured.audit_token
+        s.ARGS.audit_token = saved
+
+
+def test_audit_open_serves_the_trail_and_the_prompt_text(client, configured):
+    """--audit-open is the one deliberate way past the audit credential."""
+    job_id = upload(client, prompt=PROMPT_TEXT, hotwords=TERMS_TEXT).json()["id"]
+    s.ARGS.audit_open = True
+    try:
+        response = client.get("/api/audit", params={"include_prompts": 1})
+        assert response.status_code == 200
+        revealed = [
+            e
+            for e in response.json()["events"]
+            if e.get("job") == job_id and e.get("prompt_text")
+        ]
+        # The exposure is the entire point of the flag, so assert it is real
+        # rather than trusting that the gate quietly stopped being checked.
+        assert revealed and revealed[-1]["prompt_text"] == PROMPT_TEXT
+    finally:
+        s.ARGS.audit_open = False
+
+
+def test_audit_open_does_not_open_the_app_api(configured):
+    """Opening the trail must not widen what an app client can reach."""
+    s.ARGS.audit_open = True
+    try:
+        with TestClient(s.app) as anon:
+            assert anon.get("/api/audit").status_code == 200
+            assert anon.get("/api/jobs").status_code == 401
+    finally:
+        s.ARGS.audit_open = False
 
 
 def test_unknown_host_is_refused_and_carries_security_headers(configured):
@@ -263,6 +295,33 @@ def test_pages_are_served_and_audit_page_is_data_free(client):
     assert "Audit trail" in page.text
     # The page itself must not embed any trail data.
     assert "job.created" not in page.text
+
+
+def test_audit_page_renders_the_mode_the_server_runs(client, configured):
+    """The mode is server-rendered: the page must never have to guess from a
+    failed request whether the token or the endpoint itself is the problem."""
+    page = client.get("/audit").text
+    assert 'data-mode="token"' in page
+    assert 'class="gate" id="gate"' in page, "token mode needs no script to work"
+    assert 'class="gate locked" id="off"' in page
+
+    s.ARGS.audit_open = True
+    try:
+        opened = client.get("/audit").text
+        assert 'data-mode="open"' in opened
+        # Starting hidden is what stops a flash of "paste the audit token".
+        assert 'class="gate locked" id="gate"' in opened
+    finally:
+        s.ARGS.audit_open = False
+
+    s.ARGS.audit_token = ""
+    try:
+        off = client.get("/audit").text
+        assert 'data-mode="off"' in off
+        assert 'class="gate locked" id="gate"' in off
+        assert 'class="gate" id="off"' in off, "the notice replaces the gate"
+    finally:
+        s.ARGS.audit_token = configured.audit_token
 
 
 def test_delete_cancels_a_queued_job_and_keeps_the_record(client, configured):

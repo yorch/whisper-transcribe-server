@@ -9,11 +9,12 @@
 """Windows tray launcher for the transcription server.
 
 This is a supervisor, not a second implementation. It owns three things the
-server deliberately does not: process lifetime, the access token, and the port.
+server deliberately does not: process lifetime, the credentials, and the port.
 
-The token and port are chosen here and handed to the server through
-TRANSCRIBE_TOKEN and --port, so the launcher never has to parse console output
-to discover them — and transcribe_server.py needs no launcher-aware code.
+The app token, the audit token and the port are chosen here and handed to the
+server through TRANSCRIBE_TOKEN, TRANSCRIBE_AUDIT_TOKEN and --port, so the
+launcher never has to parse console output to discover them — and
+transcribe_server.py needs no launcher-aware code.
 
     uv run launcher/transcribe_tray.py            # tray
     uv run launcher/transcribe_tray.py --no-tray  # supervisor only (headless)
@@ -77,13 +78,16 @@ def token_path() -> Path:
     return launcher_dir() / "token"
 
 
-def ensure_token() -> str:
-    """A stable per-install token, so a bookmarked URL keeps working.
+def audit_token_path() -> Path:
+    return launcher_dir() / "audit-token"
+
+
+def _stable_token(path: Path) -> str:
+    """A stable per-install secret, so a bookmarked URL keeps working.
 
     Generated once with 192 bits of entropy and stored 0600. The server compares
     it with hmac.compare_digest; this only has to be unguessable and stable.
     """
-    path = token_path()
     with contextlib.suppress(OSError, ValueError):
         existing = path.read_text(encoding="utf-8").strip()
         if len(existing) >= 16:
@@ -95,6 +99,22 @@ def ensure_token() -> str:
     with contextlib.suppress(OSError):
         os.chmod(path, 0o600)
     return token
+
+
+def ensure_token() -> str:
+    """The app credential, handed over as TRANSCRIBE_TOKEN."""
+    return _stable_token(token_path())
+
+
+def ensure_audit_token() -> str:
+    """The audit credential, handed over as TRANSCRIBE_AUDIT_TOKEN.
+
+    The server generates one per run when this is missing, which would leave
+    /audit unreachable: the value would only ever appear in a log file the tray
+    user never opens. Opening the endpoint instead is not an option either, since
+    the server binds every interface by default.
+    """
+    return _stable_token(audit_token_path())
 
 
 # --------------------------------------------------------------------------- #
@@ -183,6 +203,12 @@ def as_int(value: Any, default: int) -> int:
         return int(value)
     except (TypeError, ValueError):
         return default
+
+
+def as_bool(value: Any) -> bool:
+    # Matches transcribe_server.as_bool, so a value one layer accepts is not
+    # silently ignored by the other.
+    return str(value).strip().lower() in ("1", "true", "yes", "on")
 
 
 # --------------------------------------------------------------------------- #
@@ -314,6 +340,22 @@ def server_url(port: int, token: str) -> str:
     return f"http://127.0.0.1:{port}/?token={token}"
 
 
+def audit_url(port: int, token: str) -> str:
+    return f"http://127.0.0.1:{port}/audit?token={token}"
+
+
+def audit_open_requested(server_args: list[str], env: dict[str, str]) -> bool:
+    """Whether the child was told to serve without an audit credential.
+
+    Both layers count: the passthrough flag, and an inherited
+    TRANSCRIBE_AUDIT_OPEN. Injecting a token on top of either would turn the
+    operator's opt-out into the server's mutual-exclusion error.
+    """
+    return "--audit-open" in server_args or as_bool(
+        env.get("TRANSCRIBE_AUDIT_OPEN", "")
+    )
+
+
 def open_browser(url: str) -> None:
     import webbrowser
 
@@ -363,6 +405,7 @@ class Supervisor:
         self.args = args
         self.port = args.port or pick_port()
         self.token = ensure_token()
+        self.audit_token = ensure_audit_token()
         self.log_path = launcher_dir() / "server.log"
         self.ffmpeg_dir = self._ffmpeg_dir()
         self.server: ServerProcess | None = None
@@ -381,11 +424,16 @@ class Supervisor:
     def url(self) -> str:
         return server_url(self.port, self.token)
 
+    def audit_url(self) -> str:
+        return audit_url(self.port, self.audit_token)
+
     def start(self) -> None:
         uv = ensure_uv()
         command = build_command(uv, self.port, self.args.server_args)
         env = child_env(self.ffmpeg_dir)
-        env["TRANSCRIBE_TOKEN"] = self.token  # the launcher owns the credential
+        env["TRANSCRIBE_TOKEN"] = self.token  # the launcher owns the credentials
+        if not audit_open_requested(self.args.server_args, env):
+            env["TRANSCRIBE_AUDIT_TOKEN"] = self.audit_token
         self.server = ServerProcess(command, env, self.log_path)
         self.server.start()
         server = self.server
@@ -477,6 +525,9 @@ def run_tray(supervisor: Supervisor) -> int:
     def on_copy(icon, item):  # noqa: ARG001
         copy_to_clipboard(supervisor.token)
 
+    def on_copy_audit(icon, item):  # noqa: ARG001
+        copy_to_clipboard(supervisor.audit_token)
+
     def on_log(icon, item):  # noqa: ARG001
         open_in_editor(supervisor.log_path)
 
@@ -493,6 +544,7 @@ def run_tray(supervisor: Supervisor) -> int:
         pystray.Menu.SEPARATOR,
         pystray.MenuItem("Open in browser", on_open),
         pystray.MenuItem("Copy access token", on_copy),
+        pystray.MenuItem("Copy audit token", on_copy_audit),
         pystray.MenuItem("Show log", on_log),
         pystray.MenuItem("Restart", on_restart),
         pystray.Menu.SEPARATOR,
@@ -520,6 +572,7 @@ def run_headless(supervisor: Supervisor) -> int:
     supervisor.start()
     print(f"token: {supervisor.token}")
     print(f"url:   {supervisor.url()}")
+    print(f"audit: {supervisor.audit_url()}")
     print(f"log:   {supervisor.log_path}")
     if not supervisor.ready.wait(timeout=supervisor.args.timeout):
         print(f"!  {supervisor.failed or 'timed out'}", file=sys.stderr)
@@ -541,7 +594,7 @@ def self_test(with_server: bool = False) -> int:
 
     With --with-server this also starts a real server, waits for readiness the
     same way the tray does, and stops it — the only way to prove the readiness
-    probe matches what the server actually serves.
+    probe and the audit credential match what the server actually serves.
     """
     failures: list[str] = []
 
@@ -558,6 +611,31 @@ def self_test(with_server: bool = False) -> int:
     check("token is stable", ensure_token() == token)
     check("token is long enough", len(token) >= 16, f"{len(token)} chars")
     check("token is not world readable", not (token_path().stat().st_mode & 0o077))
+
+    audit_token = ensure_audit_token()
+    check("audit token is stable", ensure_audit_token() == audit_token)
+    check(
+        "audit token is long enough",
+        len(audit_token) >= 16,
+        f"{len(audit_token)} chars",
+    )
+    check(
+        "audit token is not world readable",
+        not (audit_token_path().stat().st_mode & 0o077),
+    )
+    check("the two tokens are distinct", audit_token != token)
+    check(
+        "--audit-open suppresses the audit token",
+        audit_open_requested(["--audit-open"], {}),
+    )
+    check(
+        "an inherited TRANSCRIBE_AUDIT_OPEN suppresses the audit token",
+        audit_open_requested([], {"TRANSCRIBE_AUDIT_OPEN": "true"}),
+    )
+    check(
+        "an ordinary passthrough still gets the audit token",
+        not audit_open_requested(["--model", "base"], {}),
+    )
 
     free = pick_port(0)
     check("pick_port returns a usable port", 1024 < free < 65536, str(free))
@@ -576,7 +654,9 @@ def self_test(with_server: bool = False) -> int:
     check("icon renders", make_icon_image().size == (64, 64))
 
     if with_server:
-        check("readiness probe against a real server", end_to_end_probe())
+        ready, audit_ready = end_to_end_probe()
+        check("readiness probe against a real server", ready)
+        check("audit API accepts the launcher's token", audit_ready)
 
     print(
         f"\n{'all checks passed' if not failures else 'FAILURES: ' + ', '.join(failures)}"
@@ -598,21 +678,43 @@ def busy_port() -> int:
     return as_int(sock.getsockname()[1], 0)
 
 
-def end_to_end_probe(timeout: float = 900.0) -> bool:
-    """Start the server exactly as the tray would, and poll it."""
+def audit_probe(port: int, token: str, timeout: float = 5.0) -> bool:
+    """Prove the audit credential opens /api/audit."""
+    request = urllib.request.Request(  # noqa: S310
+        f"http://127.0.0.1:{port}/api/audit?limit=1",
+        headers={"x-audit-token": token},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:  # noqa: S310
+            return response.status == 200
+    except (urllib.error.URLError, TimeoutError, ConnectionError, OSError):
+        return False
+
+
+def end_to_end_probe(timeout: float = 900.0) -> tuple[bool, bool]:
+    """Start the server exactly as the tray would, and probe it.
+
+    Returns (ready, audit_api). The second value is what proves the launcher's
+    audit credential is the one the server accepts: it is checked by request,
+    not by reading startup output the launcher deliberately never parses.
+    """
     token = ensure_token()
+    audit_token = ensure_audit_token()
     port = pick_port(0)
     uv = find_uv()
     if uv is None:
-        return False
+        return False, False
     script = server_script()
     command = build_command(uv, port, [], script)
     env = child_env(None)
     env["TRANSCRIBE_TOKEN"] = token
+    if not audit_open_requested([], env):
+        env["TRANSCRIBE_AUDIT_TOKEN"] = audit_token
     server = ServerProcess(command, env, launcher_dir() / "self-test.log")
     server.start()
     try:
-        return wait_for_ready(port, token, server, timeout)
+        ready = wait_for_ready(port, token, server, timeout)
+        return ready, ready and audit_probe(port, audit_token)
     finally:
         server.stop()
 

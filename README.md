@@ -91,7 +91,23 @@ $env:TRANSCRIBE_TOKEN = "something-long"
 uv run transcribe_server.py --preload
 ```
 
-`--no-auth` disables the token entirely. Only on a network you fully control.
+`--no-auth` disables the app token entirely. Only on a network you fully
+control.
+
+The **audit trail** has a second credential of its own, generated the same way,
+so a default start prints both:
+
+```
+Audit token: 3Zx9wT...
+             (generated for this run; pass --audit-token or TRANSCRIBE_AUDIT_TOKEN to pin it)
+Audit UI:  http://<this-machine-ip>:8765/audit?token=<audit-token>
+```
+
+`--audit-token` is what `/audit` and `/api/audit` check, separately from the app
+token. `--audit-open` drops it altogether, making the trail — including the
+prompt and hotword text it can read — public to anyone who can reach the port.
+`--no-auth` does *not* do that: it drops only the app token, so an audit token is
+still required, and the startup banner prints the one for this run.
 
 On macOS or Linux you can also mark it executable and run it directly, since the
 shebang hands off to uv:
@@ -126,7 +142,8 @@ Useful flags:
 | `--config PATH`               | TOML config file (default `<work dir>/config.toml`)                                                                         |
 | `--no-starter-config`         | never create a starter config at the default location                                                                       |
 | `--audit-dir PATH`            | where daily audit files live (default `<work dir>/audit`)                                                                   |
-| `--audit-token`               | separate token for `/audit` and `/api/audit`; unset disables the audit API                                                  |
+| `--audit-token`               | separate token for `/audit` and `/api/audit`; generated for the run when unset, like the app token                          |
+| `--audit-open`                | drop the audit credential: `/audit` and `/api/audit` become public, prompt/hotword text included                            |
 | `--audit-reads`               | also log status/list/detail polls (chatty; off by default)                                                                  |
 | `--no-audit`                  | stop recording the audit trail (existing files stay readable)                                                               |
 | `--no-audit-prompts`          | never write prompt/hotword text to the sidecar files                                                                        |
@@ -188,6 +205,7 @@ enabled = true
 reads = false
 prompts = true
 retain_days = 30
+open = false    # true serves the trail with no credential at all
 ```
 
 Precedence, lowest to highest: **defaults → config file → flags → environment
@@ -252,8 +270,11 @@ GET /api/audit/prompts/<job_id>
 ```
 
 Both need `x-audit-token`, which is checked separately from the app token —
-you can hand out one without the other. With no audit token configured the
-whole audit API returns `404`, so it is off unless you ask for it.
+you can hand out one without the other. Leave it unset and the server mints one
+for the run and prints it, so the endpoint works with no configuration at all;
+pin it with `TRANSCRIBE_AUDIT_TOKEN` to keep bookmarks and scripts working
+across restarts. `--audit-open` is the only way to serve the trail with no
+credential at all.
 
 Files older than `audit_retain_days` (30 by default) are deleted at startup
 **and** on each daily rollover, sidecars included; `0` keeps everything. With
@@ -513,10 +534,14 @@ What's enforced:
 - **The audit trail has its own token**, so read access to "who did what" is
   separable from the ability to transcribe. Job ids are validated before they
   reach a filename, and audit files are written `0600` (best effort: on Windows
-  `chmod` does not set ACLs, so treat the claim as POSIX-only).
+  `chmod` does not set ACLs, so treat the claim as POSIX-only). It is generated
+  per run when unset; `--audit-open` is the single explicit way to drop it, and
+  a server running that way says so on startup and records `audit_api: "open"`
+  in its `server.started` snapshot.
 - **Prompt and hotword text is never returned to an app-token holder** — not in
   the job list, not in the job detail, not in the JSON export. Only the audit
-  token can read it. The trail itself carries a length and a SHA-256.
+  token can read it, or anyone at all if you deliberately chose `--audit-open`.
+  The trail itself carries a length and a SHA-256.
 - **Uploads and audit directories are created `0700`**, and uploaded audio
   `0600`, so other local accounts cannot read meeting audio.
 - **Every response carries the hardening headers**, including `421`/`403`/`401`
