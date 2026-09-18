@@ -444,9 +444,10 @@ a second press rather than a second drag of an hour-long recording.
 recording, so it's pinned to `--compute-type` unless you pass
 `--allow-precision-choice`.
 
-**Retry** appears on any finished job whose source audio is still on disk. It
-re-runs the same file with whatever the controls say _now_ — so you can fix a bad
-transcript by adding the term list and retrying, without re-uploading an hour of
+**Retry** appears on any finished or cancelled job whose source audio is still
+on disk. It re-runs the same file with whatever the controls say _now_ — so you
+can fix a bad transcript by adding the term list and retrying, or cancel a job
+started with the wrong model and run it again, without re-uploading an hour of
 audio. Disabled by `--source-retention run`.
 
 Transcripts stream in live as segments finish, with a rough ETA. Each segment

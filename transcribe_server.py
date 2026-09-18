@@ -3026,6 +3026,11 @@ def delete_job(job_id: str, request: Request) -> dict[str, Any]:
             file=job["filename"],
             state=job["state"],
         )
+        # The record stays, and 'job' retention keeps the audio as long as the
+        # record does: that is what lets a job cancelled over a wrong model or
+        # language be retried. Remove, or eviction, is what lets it go.
+        if ARGS.source_retention == "run":
+            drop_source(job)
     else:
         with JOBS_LOCK:
             JOBS.pop(job_id, None)
@@ -3037,7 +3042,7 @@ def delete_job(job_id: str, request: Request) -> dict[str, Any]:
             state=job["state"],
             segments=len(job["segments"]),
         )
-    drop_source(job)
+        drop_source(job)
     return {"ok": True}
 
 

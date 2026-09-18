@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import time
+from pathlib import Path
 
 from fastapi.testclient import TestClient
 
@@ -333,6 +334,24 @@ def test_delete_cancels_a_queued_job_and_keeps_the_record(client, configured):
     assert s.JOBS[job_id]["state"] == "cancelled"
     cancelled = [e for e in configured.events() if e["event"] == "job.cancelled"]
     assert cancelled and cancelled[-1]["job"] == job_id
+
+
+def test_a_cancelled_job_keeps_its_audio_until_the_record_goes(client, configured):
+    """'job' retention keeps the upload while the record exists, and a cancel
+    keeps the record. Deleting the audio anyway made can_retry false for every
+    cancelled job, so the page never offered Retry after a Cancel -- the moment
+    it is most wanted, when the model or the language was wrong."""
+    job_id = upload(client).json()["id"]
+    source = Path(s.JOBS[job_id]["path"])
+    client.delete(f"/api/jobs/{job_id}")
+
+    assert source.exists()
+    assert client.get(f"/api/jobs/{job_id}").json()["can_retry"] is True
+
+    # Removing the record is what lets the audio go.
+    client.delete(f"/api/jobs/{job_id}")
+    assert job_id not in s.JOBS
+    assert not source.exists()
 
 
 def test_delete_removes_a_finished_job(client, configured):
