@@ -1,0 +1,73 @@
+/* Shared by both pages: the design system that used to exist as two
+   copies. Only rules whose declarations agree on both pages live here;
+   names that merely collide (h1, .wrap, .controls) stay per page. */
+
+  :root{
+    --panel:#dcdfe3;
+    --panel-hi:#eef0f2;
+    --panel-lo:#c3c8cd;
+    --ink:#1b2027;
+    --muted:#5c646e;
+    --amber:#b9610f;
+    --amber-dim:#d9b48a;
+    --green:#36704a;
+    --red:#9d3427;
+    --display:"Bahnschrift","DIN Alternate","Roboto Condensed",system-ui,sans-serif;
+    --body:"Segoe UI Variable Text","Segoe UI",system-ui,-apple-system,sans-serif;
+  }
+@media @media (prefers-reduced-motion:reduce){*{transition:none!important}}
+
+  html,body{margin:0}
+
+  body{
+    background:var(--panel);
+    background-image:linear-gradient(180deg,#e3e6e9 0%,#d3d7dc 100%);
+    color:var(--ink);
+    font-family:var(--body);
+    font-size:15px;
+    line-height:1.55;
+    min-height:100vh;
+    padding:28px 20px 72px;
+  }
+
+
+  .gate{
+    border:1px solid var(--panel-lo);
+    border-left:3px solid var(--amber);
+    background:rgba(255,255,255,.5);
+    border-radius:3px;
+    padding:16px 18px;
+    margin-bottom:22px;
+  }
+
+  .gate p{margin:0 0 12px}
+
+  .gate .row{display:flex;gap:8px;flex-wrap:wrap}
+
+  .gate-err{color:var(--red);font-size:13.5px;margin:10px 0 0}
+
+  input[type=checkbox]{accent-color:var(--amber);width:15px;height:15px}
+
+  button{
+    font-family:var(--display);
+    font-size:13px;
+    letter-spacing:.03em;
+    color:var(--ink);
+    background:linear-gradient(180deg,#f4f5f6,#dfe3e7);
+    border:1px solid #a9b0b8;
+    border-radius:3px;
+    padding:6px 12px;
+    cursor:pointer;
+  }
+
+  button:hover{background:linear-gradient(180deg,#fff,#e7ebef)}
+
+  button:active{background:#d8dce0}
+
+  button:focus-visible{outline:2px solid var(--amber);outline-offset:1px}
+
+  button.ghost{background:none;border-color:transparent;color:var(--muted)}
+
+  button.ghost:hover{background:rgba(0,0,0,.05);color:var(--ink)}
+
+  .locked{display:none}

@@ -531,10 +531,17 @@ What it still doesn't do, by design:
   of that, every file in `uploads/` is unreferenced after a restart, so the
   server sweeps that directory at startup and logs `uploads.swept`. Use
   `--source-retention forever` if you want the audio kept regardless.
-- **The two HTML pages duplicate ~1,000 lines** of CSS/JS (escaping helper, token
-  bootstrap, gate, polling). Extracting them into `static/` is the highest-value
-  refactor and has not been done; until then, a change to `esc()` must be made in
-  both pages.
+- **The pages are `static/` files**, not embedded in the module. `app.css` and
+  `common.js` hold what the two pages share; `index.*` and `audit.*` hold what
+  they do not. Rules whose names merely collide (`.wrap`, `h1`, `.controls`) are
+  deliberately kept per page — they have different values.
+  `tests/test_static_pages.py` pins the selector set against a pre-extraction
+  baseline, so a lost rule fails the suite.
+- **The CSP allows no inline script or style.** Both `'unsafe-inline'`
+  directives are gone because the pages carry no inline `<style>`, `<script>`,
+  style attributes or event handlers. Keep it that way: an inline style added in
+  the JS is silently blocked by the browser, and restoring `'unsafe-inline'`
+  would give up what makes `esc()` defence in depth rather than the only line.
 - `create_job` streams the upload through a threadpool, but a very large upload
   still occupies the threadpool for its duration.
 - **Verified on CPU and on a single RTX 3060** (`base`, fp16, ~10x realtime).

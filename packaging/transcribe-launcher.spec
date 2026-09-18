@@ -16,6 +16,10 @@ ROOT = Path(SPECPATH).parent  # noqa: F821 - provided by PyInstaller
 VENDOR = ROOT / "packaging" / "vendor"
 
 datas = [(str(ROOT / "transcribe_server.py"), ".")]
+# The pages are files now, not string literals in the module, so they have to
+# ship alongside the script. STATIC_DIR resolves relative to the script, so
+# "static" next to it is where they must land.
+datas.append((str(ROOT / "static"), "static"))
 for extra in ("ffmpeg.exe", "uv.exe"):
     if (VENDOR / extra).is_file():
         datas.append((str(VENDOR / extra), "vendor"))

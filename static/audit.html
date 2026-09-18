@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>Audit trail</title>
+<link rel="stylesheet" href="/static/app.css">
+<link rel="stylesheet" href="/static/audit.css">
+</head>
+<body>
+<div class="wrap">
+  <div class="topbar">
+    <h1>Audit trail</h1>
+    <a class="back" href="/">&larr; Transcription</a>
+  </div>
+  <p class="sub">Every action the web app took &mdash; uploads, exports, deletions,
+  worker lifecycle and refused requests &mdash; newest first. This page needs the
+  audit token, which is separate from the app token.</p>
+
+  <div class="gate" id="gate">
+    <p>Paste the audit token. It is printed in the terminal when the server starts
+    with <code>--audit-token</code> or <code>TRANSCRIBE_AUDIT_TOKEN</code>.</p>
+    <div class="row">
+      <input type="password" id="gate-token" autocomplete="off" spellcheck="false"
+             placeholder="Audit token" aria-label="Audit token">
+      <button id="gate-go">Unlock</button>
+    </div>
+    <p class="gate-err locked" id="gate-err">That token was rejected.</p>
+  </div>
+
+  <div id="main" class="locked">
+    <div class="controls">
+      <label class="field">Day <select id="date"></select></label>
+      <label class="field">Rows
+        <select id="limit">
+          <option>100</option><option selected>200</option>
+          <option>500</option><option>1000</option>
+        </select>
+      </label>
+      <label class="field">Job <input type="text" id="job" size="10"
+        placeholder="job id" spellcheck="false"></label>
+      <label class="field">Search <input type="text" id="q" size="14"
+        placeholder="substring" spellcheck="false"></label>
+      <label class="field"><input type="checkbox" id="prompts"> Prompts</label>
+      <label class="field"><input type="checkbox" id="auto" checked> Auto</label>
+      <button id="reload">Reload</button>
+      <button class="ghost" id="more">Load more</button>
+    </div>
+    <p class="meta" id="meta">&nbsp;</p>
+    <div id="events"></div>
+    <p class="empty locked" id="empty">No events for this day.</p>
+  </div>
+</div>
+
+<script src="/static/common.js"></script>
+<script src="/static/audit.js"></script>
+</body>
+</html>

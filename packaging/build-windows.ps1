@@ -90,6 +90,13 @@ Step "Running the launcher self-test from the bundle"
 & $exe --self-test
 if ($LASTEXITCODE -ne 0) { throw "Bundled launcher failed its self-test" }
 
+# The pages are files now, so a bundle that forgot static/ would serve 500s.
+Step "Checking the bundled static assets"
+$missing = @("static\index.html", "static\audit.html", "static\app.css",
+             "static\common.js", "static\index.js", "static\audit.js") |
+    Where-Object { -not (Test-Path (Join-Path $dist $_)) }
+if ($missing) { throw "Bundle is missing: $($missing -join ', ')" }
+
 # --- installer -------------------------------------------------------------- #
 
 if ($Installer) {

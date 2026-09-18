@@ -1,0 +1,226 @@
+
+  .wrap{max-width:660px;margin:0 auto}
+
+
+  .readout{
+    border:1px solid var(--panel-lo);
+    border-top-color:var(--panel-hi);
+    background:linear-gradient(180deg,#e9ebee,#d6dade);
+    border-radius:3px;
+    padding:12px 16px;
+    display:flex;
+    flex-wrap:wrap;
+    gap:6px 26px;
+    align-items:baseline;
+    box-shadow:inset 0 1px 0 rgba(255,255,255,.7);
+  }
+
+  .readout dl{margin:0;display:flex;gap:8px;align-items:baseline}
+
+  .readout dt{
+    font-family:var(--display);
+    font-size:10.5px;
+    letter-spacing:.14em;
+    text-transform:uppercase;
+    color:var(--muted);
+  }
+
+  .readout dd{margin:0;font-family:var(--display);font-size:14px;letter-spacing:.01em}
+
+  .lamp{
+    width:8px;height:8px;border-radius:50%;
+    display:inline-block;margin-right:7px;vertical-align:1px;
+    background:var(--amber-dim);
+    box-shadow:0 0 0 1px rgba(0,0,0,.18) inset;
+  }
+
+  .lamp.on{background:var(--amber);box-shadow:0 0 6px rgba(185,97,15,.55)}
+
+  .lamp.bad{background:var(--red)}
+
+
+  h1{
+    font-family:var(--display);
+    font-weight:600;
+    font-size:30px;
+    letter-spacing:-.01em;
+    margin:30px 0 4px;
+  }
+
+  .sub{color:var(--muted);margin:0 0 22px;max-width:52ch}
+
+  input[type=password]{
+    flex:1;min-width:200px;
+    font-family:var(--body);font-size:15px;
+    padding:6px 9px;
+    border:1px solid #a9b0b8;border-radius:3px;background:#fff;color:var(--ink);
+  }
+
+  input[type=password]:focus-visible{outline:2px solid var(--amber);outline-offset:1px}
+
+
+  .intake{
+    border:2px dashed #a9b0b8;
+    border-radius:4px;
+    background:rgba(255,255,255,.42);
+    padding:40px 24px;
+    text-align:center;
+    transition:border-color .14s,background .14s;
+    cursor:pointer;
+  }
+
+  .intake:hover{border-color:#8d959e}
+
+  .intake.hot{border-color:var(--amber);background:rgba(185,97,15,.07)}
+
+  .intake:focus-visible{outline:2px solid var(--amber);outline-offset:3px}
+
+  .intake p{margin:0;font-family:var(--display);font-size:19px}
+
+  .intake small{display:block;margin-top:8px;color:var(--muted);font-size:13px}
+
+  input[type=file]{display:none}
+
+
+  .controls{
+    margin-top:14px;
+    display:flex;
+    flex-wrap:wrap;
+    gap:14px 22px;
+    align-items:center;
+    padding:12px 2px;
+    border-top:1px solid var(--panel-lo);
+  }
+
+  label.field{display:flex;align-items:center;gap:8px;font-size:13.5px;color:var(--muted)}
+
+  select{
+    font-family:var(--display);
+    font-size:14px;
+    color:var(--ink);
+    background:#fff;
+    border:1px solid #a9b0b8;
+    border-radius:3px;
+    padding:5px 8px;
+  }
+
+  select:focus-visible{outline:2px solid var(--amber);outline-offset:1px}
+
+
+  .job{
+    margin-top:18px;
+    border:1px solid var(--panel-lo);
+    border-top-color:var(--panel-hi);
+    border-radius:3px;
+    background:linear-gradient(180deg,#eceef1,#e1e4e8);
+    box-shadow:inset 0 1px 0 rgba(255,255,255,.7);
+    overflow:hidden;
+  }
+
+  .job-head{display:flex;gap:12px;align-items:baseline;padding:13px 16px 11px}
+
+  .job-name{font-family:var(--display);font-size:17px;flex:1;min-width:0;
+    overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+
+  .job-meta{font-family:var(--display);font-size:12.5px;color:var(--muted);letter-spacing:.02em;
+    white-space:nowrap}
+
+
+  .meter{display:flex;gap:2px;padding:0 16px 13px}
+
+  .meter i{
+    flex:1;height:11px;
+    background:#c9ced3;
+    box-shadow:inset 0 0 0 1px rgba(0,0,0,.07);
+    transition:background .18s;
+  }
+
+  .meter i.lit{background:var(--amber)}
+
+  .meter i.done{background:var(--green)}
+
+  .meter i.fail{background:var(--red)}
+
+
+  .job-body{padding:0 16px 14px}
+
+  .status{font-size:13.5px;color:var(--muted);margin:0 0 10px}
+
+  .status.err{color:var(--red)}
+
+  .transcript{
+    background:#fbfbfc;
+    border:1px solid #c9ced3;
+    border-radius:3px;
+    padding:12px 14px;
+    max-height:300px;
+    overflow:auto;
+    font-size:14.5px;
+    word-break:break-word;
+  }
+
+  .transcript:empty{display:none}
+
+  
+  .seg{display:flex;gap:10px;padding:1px 0}
+
+  .seg .ts{
+    flex:0 0 auto;width:9ch;color:var(--muted);
+    font-family:var(--display);font-size:13px;line-height:1.6;
+    font-variant-numeric:tabular-nums;user-select:none;
+  }
+
+  .seg .tx{flex:1 1 auto;min-width:0;white-space:pre-wrap}
+
+  
+  .transcript.paused{border-color:var(--amber-dim)}
+
+  .actions{display:flex;flex-wrap:wrap;gap:8px;margin-top:12px}
+
+
+  details.advanced{margin-top:2px;border-top:1px solid var(--panel-lo);padding-top:10px}
+
+  details.advanced summary{
+    font-family:var(--display);font-size:13px;letter-spacing:.03em;
+    color:var(--muted);cursor:pointer;list-style:none;
+  }
+
+  details.advanced summary::-webkit-details-marker{display:none}
+
+  details.advanced summary::before{content:"+ ";font-weight:600}
+
+  details.advanced[open] summary::before{content:"\2212 "}
+
+  details.advanced summary:focus-visible{outline:2px solid var(--amber);outline-offset:2px}
+
+  .adv-grid{display:flex;flex-direction:column;gap:12px;padding:14px 0 4px}
+
+  .adv-grid textarea{
+    font-family:var(--body);font-size:14px;line-height:1.5;
+    padding:8px 10px;border:1px solid #a9b0b8;border-radius:3px;background:#fff;color:var(--ink);
+    resize:vertical;min-height:62px;width:100%;
+  }
+
+  .adv-grid textarea:focus-visible{outline:2px solid var(--amber);outline-offset:1px}
+
+  .adv-row{display:flex;flex-wrap:wrap;gap:12px 22px;align-items:center}
+
+  .hint{display:block;color:var(--muted);font-size:12.5px;margin-top:4px;max-width:56ch}
+
+  .field-block{display:block;font-size:13.5px;color:var(--muted)}
+
+  .field-block > span{display:block;margin-bottom:5px}
+
+  input[type=number]{
+    font-family:var(--display);font-size:14px;width:88px;
+    padding:5px 7px;border:1px solid #a9b0b8;border-radius:3px;background:#fff;color:var(--ink);
+  }
+
+  input[type=number]:focus-visible{outline:2px solid var(--amber);outline-offset:1px}
+
+  .empty{margin-top:26px;color:var(--muted);font-size:14px}
+
+  /* Set from JS: kept as classes so the page needs no inline styles, which is
+     what lets the CSP drop style-src 'unsafe-inline'. */
+  #r-ffmpeg.bad{color:var(--red)}
+  .offscreen{position:fixed;opacity:0;pointer-events:none}

@@ -23,8 +23,30 @@ import pytest
 
 import transcribe_server as s
 
+# The pages used to be embedded in the module as PAGE/AUDIT_PAGE. They are now
+# files under static/, shared helpers split out into common.js and app.css, so
+# the harness reads those instead of scraping a Python string literal.
+STATIC = s.STATIC_DIR
+
+
+def static(name: str) -> str:
+    return (STATIC / name).read_text(encoding="utf-8")
+
+
+def page_html() -> str:
+    return static("index.html")
+
+
+def page_css() -> str:
+    """Everything that styles the main page: shared rules plus its own."""
+    return static("app.css") + "\n" + static("index.css")
+
+
+def page_script() -> str:
+    """The main page's JS: the shared helpers plus its own script."""
+    return static("common.js") + "\n" + static("index.js")
+
 NODE = shutil.which("node")
-SCRIPT = re.compile(r"<script>\n(.*?)\n</script>", re.S)
 needs_node = pytest.mark.skipif(NODE is None, reason="node is not installed")
 
 # Enough of a DOM for the preview's functions: a transcript element with the
@@ -57,12 +79,6 @@ const seg = (start, text) => ({start, text});
 const times = (rows) => rows.map(r => r.children[0].textContent);
 const texts = (rows) => rows.map(r => r.children[1].textContent);
 """
-
-
-def page_script() -> str:
-    match = SCRIPT.search(s.PAGE)
-    assert match, "the page no longer has a <script> block to check"
-    return match.group(1)
 
 
 def function_source(name: str) -> str:
@@ -107,10 +123,10 @@ def preview_probe(body: str) -> dict:
 
 
 def test_the_page_has_a_follow_switch_that_starts_on():
-    assert re.search(r'id="follow"[^>]*checked', s.PAGE), (
+    assert re.search(r'id="follow"[^>]*checked', page_html()), (
         "auto-scroll needs an on-by-default Follow switch"
     )
-    assert "> Follow<" in s.PAGE, "the switch must say what it does"
+    assert "> Follow<" in page_html(), "the switch must say what it does"
 
 
 def test_the_follow_switch_is_remembered_for_the_session():
@@ -122,10 +138,10 @@ def test_the_follow_switch_is_remembered_for_the_session():
 
 def test_the_time_gutter_keeps_its_width_so_rows_line_up():
     assert 'ts.className = "ts"' in page_script()
-    assert re.search(r"\.seg \.ts\{[^}]*width:9ch", s.PAGE), (
+    assert re.search(r"\.seg \.ts\{[^}]*width:9ch", page_css()), (
         "the gutter needs a fixed width"
     )
-    assert "tabular-nums" in s.PAGE, "digits must not jitter as the clock advances"
+    assert "tabular-nums" in page_css(), "digits must not jitter as the clock advances"
 
 
 def test_the_transcript_dom_survives_a_poll():
