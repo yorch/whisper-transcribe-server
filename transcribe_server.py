@@ -38,6 +38,7 @@ first and no virtualenv to activate.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import gc
 import hashlib
 import hmac
@@ -52,10 +53,10 @@ import threading
 import time
 import traceback
 import uuid
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar
 from urllib.parse import quote
 
 import uvicorn
@@ -74,10 +75,15 @@ except ModuleNotFoundError:  # pragma: no cover - 3.10 only
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse, Response
+from starlette.concurrency import run_in_threadpool
 
 # --------------------------------------------------------------------------- #
 # Config
 # --------------------------------------------------------------------------- #
+
+# Binding every interface is the documented default; the Host allowlist and the
+# access token are what make that safe, not the bind address itself.
+ANY_INTERFACE = "0.0.0.0"  # noqa: S104
 
 MODELS = ["large-v3", "large-v3-turbo", "medium", "small", "base"]
 # float16 needs compute capability >= 7.0 (Turing/Ampere/Ada/Hopper/Blackwell).
@@ -96,7 +102,12 @@ UPLOAD_DIR = WORK_DIR / "uploads"
 
 # Set in main(). Requests are refused until then, so importing this module and
 # serving `app` directly from an ASGI server fails closed rather than open.
-ARGS: argparse.Namespace | None = None
+# Set in main(). Requests are refused until then, so importing this module and
+# serving `app` directly from an ASGI server fails closed rather than open.
+# ARGS is an empty Namespace (not None) so its attributes type-check; READY is
+# the authoritative "main() has populated it" flag that guards every use.
+ARGS: argparse.Namespace = argparse.Namespace()
+READY = False
 ALLOWED_HOSTS: set[str] = set()
 ALLOWED_SUFFIXES: set[str] = set()  # entries like ".trycloudflare.com"
 
@@ -164,28 +175,42 @@ class AuditLog:
         self._lock = threading.Lock()
         self._fh: Any | None = None
         self._day: str | None = None
-        self._warned = False
+        self._warned: set[tuple[str, str]] = set()
+        self.last_error: str | None = None
 
     # -- writing ---------------------------------------------------------- #
 
-    def _rotate(self, day: str) -> None:
+    def _rotate(self, day: str) -> Any:
         if self._fh is not None:
             self._fh.close()
         self.dir.mkdir(parents=True, exist_ok=True)
         path = self.dir / f"audit-{day}.jsonl"
         self._fh = path.open("a", encoding="utf-8", buffering=1)
-        try:
-            os.chmod(path, 0o600)  # the trail names files and callers
-        except OSError:
-            pass
+        for target in (self.dir, path):
+            # A no-op for ACLs on Windows; best effort elsewhere.
+            with contextlib.suppress(OSError):
+                os.chmod(target, 0o700 if target.is_dir() else 0o600)
+        # Retention also runs on rotation: a process that stays up for weeks
+        # would otherwise never prune again after startup.
+        self.prune()
+        return self._fh
 
     def _warn_once(self, what: str, exc: BaseException) -> None:
-        if not self._warned:
-            self._warned = True
-            print(f"!  Audit {what} failed ({exc}); continuing without it")
+        """Warn once per (path, exception type), not once per process.
 
-    def emit(self, event: str, **fields: Any) -> None:
-        if not self.enabled:
+        A single latch would let the first failure silence every later and
+        different failure, which is exactly when an operator needs to hear
+        about it.
+        """
+        self.last_error = f"{what}: {type(exc).__name__}: {exc}"[:300]
+        key = (what, type(exc).__name__)
+        if key in self._warned:
+            return
+        self._warned.add(key)
+        print(f"!  Audit {what} failed ({exc}); continuing without it")
+
+    def emit(self, event: str, force: bool = False, **fields: Any) -> None:
+        if not self.enabled and not force:
             return
         record: dict[str, Any] = {
             "ts": datetime.now(timezone.utc)
@@ -196,13 +221,17 @@ class AuditLog:
         record.update({k: v for k, v in fields.items() if v is not None})
         try:
             line = json.dumps(record, ensure_ascii=False, default=str)
-            day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
             with self._lock:
+                day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+                if self._day is not None and day < self._day:
+                    day = self._day  # never rotate backwards on a boundary race
                 if self._day != day or self._fh is None:
-                    self._rotate(day)
+                    fh = self._rotate(day)
                     self._day = day
-                self._fh.write(line + "\n")
-                self._fh.flush()
+                else:
+                    fh = self._fh
+                fh.write(line + "\n")
+                fh.flush()
         except Exception as exc:  # noqa: BLE001
             self._warn_once("write", exc)
 
@@ -213,14 +242,14 @@ class AuditLog:
             return
         try:
             self.prompts_dir.mkdir(parents=True, exist_ok=True)
+            with contextlib.suppress(OSError):
+                os.chmod(self.prompts_dir, 0o700)
             path = self.prompts_dir / f"{job_id}.json"
             path.write_text(
                 json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
             )
-            try:
+            with contextlib.suppress(OSError):
                 os.chmod(path, 0o600)
-            except OSError:
-                pass
         except Exception as exc:  # noqa: BLE001
             self._warn_once("sidecar write", exc)
 
@@ -253,14 +282,19 @@ class AuditLog:
         job: str | None = None,
         needle: str | None = None,
     ) -> tuple[list[str], int]:
-        """Return (raw lines newest-first, total matching) for one day."""
+        """Return (raw lines newest-first, total matching) for one day.
+
+        Only the requested page is held in memory: a flooded day file can be
+        enormous, and the audit UI re-reads every few seconds.
+        """
         try:
             fh = (self.dir / f"audit-{day}.jsonl").open(
                 "r", encoding="utf-8", errors="replace"
             )
         except OSError:
             return [], 0
-        lines: list[str] = []
+        window: deque[str] = deque(maxlen=max(1, limit) + max(0, offset))
+        total = 0
         low = needle.lower() if needle else None
         with fh:
             for raw in fh:
@@ -276,15 +310,20 @@ class AuditLog:
                         continue
                     if rec.get("job") != job and rec.get("from_job") != job:
                         continue
-                lines.append(raw)
-        lines.reverse()
-        return lines[offset : offset + limit], len(lines)
+                total += 1
+                window.append(raw)
+        lines = list(window)[::-1]
+        return lines[offset : offset + limit], total
 
     # -- retention -------------------------------------------------------- #
 
     def prune(self) -> list[str]:
-        """Delete day files and sidecars past retain_days. 0 keeps everything."""
-        if self.retain_days <= 0:
+        """Delete day files and sidecars past retain_days. 0 keeps everything.
+
+        Skipped entirely when auditing is off: `--no-audit` means "stop
+        recording", and it must not quietly delete a trail it is not managing.
+        """
+        if not self.enabled or self.retain_days <= 0:
             return []
         cutoff = (
             datetime.now(timezone.utc) - timedelta(days=self.retain_days)
@@ -292,7 +331,9 @@ class AuditLog:
         removed: list[str] = []
         for path in self.dir.glob("audit-*.jsonl"):
             if path.stem[len("audit-") :] < cutoff:
-                removed.append(self._unlink(path))
+                name = self._unlink(path)
+                if name:
+                    removed.append(name)
         for path in self.prompts_dir.glob("*.json"):
             try:
                 stamp = datetime.fromtimestamp(
@@ -301,8 +342,10 @@ class AuditLog:
             except OSError:
                 continue
             if stamp < cutoff:
-                removed.append(self._unlink(path))
-        return [name for name in removed if name]
+                name = self._unlink(path)
+                if name:
+                    removed.append(name)
+        return removed
 
     @staticmethod
     def _unlink(path: Path) -> str | None:
@@ -322,6 +365,9 @@ def request_fields(request: Request) -> dict[str, Any]:
     Behind a tunnel the TCP peer is always localhost, so the address the proxy
     claims (CF-Connecting-IP / X-Forwarded-For) is recorded next to it and
     clearly marked unverified rather than silently trusted.
+
+    Values are truncated: these come from an unauthenticated client and end up
+    in a file on disk.
     """
     direct = request.client.host if request.client else None
     claimed = (request.headers.get("cf-connecting-ip") or "").strip()
@@ -329,12 +375,55 @@ def request_fields(request: Request) -> dict[str, Any]:
         forwarded = request.headers.get("x-forwarded-for") or ""
         claimed = forwarded.split(",")[0].strip()
     return {
-        "client": direct,
-        "client_claimed": claimed if claimed and claimed != direct else None,
-        "host": normalize_host(request.headers.get("host") or "") or None,
-        "method": request.method,
-        "path": request.url.path,
+        "client": (direct or "")[:64] or None,
+        "client_claimed": (
+            claimed[:64] if claimed and claimed != direct else None
+        ),
+        "host": (normalize_host(request.headers.get("host") or "") or None),
+        "method": request.method[:16],
+        "path": request.url.path[:200],
     }
+
+
+# Refusals are written before any credential is checked, so an unauthenticated
+# client could otherwise fill the disk by looping on a bad token. The first few
+# per source per window are logged individually; the rest are summarised once.
+REJECT_LOG_LIMIT = 5
+REJECT_WINDOW = 60.0
+REJECT_MAX_SOURCES = 1000
+_REJECT_STATE: dict[tuple[str, str], tuple[float, int, int]] = {}
+_REJECT_LOCK = threading.Lock()
+
+
+def audit_rejection(event: str, request: Request, **fields: Any) -> None:
+    """Record a refused request, collapsing a burst from one source."""
+    client = (request.client.host if request.client else "-")[:64]
+    key = (event, client)
+    now = time.monotonic()
+    log_now = False
+    suppressed = 0
+    with _REJECT_LOCK:
+        if len(_REJECT_STATE) > REJECT_MAX_SOURCES:
+            _REJECT_STATE.clear()  # bounded memory under a spoofed-source flood
+        window_start, count, logged = _REJECT_STATE.get(key, (now, 0, 0))
+        if now - window_start > REJECT_WINDOW:
+            suppressed = count - logged
+            window_start, count, logged = now, 0, 0
+        count += 1
+        if logged < REJECT_LOG_LIMIT:
+            logged += 1
+            log_now = True
+        _REJECT_STATE[key] = (window_start, count, logged)
+
+    if log_now:
+        audit(event, request, **fields)
+    if suppressed:
+        audit(
+            "security.rejected_summary",
+            request,
+            scope=event,
+            suppressed=suppressed,
+        )
 
 
 def audit(event: str, request: Request | None = None, **fields: Any) -> None:
@@ -343,10 +432,8 @@ def audit(event: str, request: Request | None = None, **fields: Any) -> None:
         return
     if request is not None:
         fields = {**request_fields(request), **fields}
-        try:
-            request.state.audit_handled = True  # middleware need not log it again
-        except AttributeError:
-            pass
+        with contextlib.suppress(AttributeError):
+            request.state.audit_handled = True  # middleware need not log again
     AUDIT.emit(event, **fields)
 
 
@@ -387,12 +474,17 @@ def store_prompt_sidecar(
 
 def new_job(filename: str, path: Path, opts: dict[str, Any]) -> str:
     job_id = uuid.uuid4().hex[:12]
+    try:
+        size = path.stat().st_size
+    except OSError:
+        # A retry can race an eviction that already unlinked the source.
+        size = 0
     with JOBS_LOCK:
         JOBS[job_id] = {
             "id": job_id,
             "filename": filename,
             "path": str(path),
-            "size": path.stat().st_size,
+            "size": size,
             "state": "queued",  # queued | loading | running | done | error | cancelled
             "progress": 0.0,
             "message": "Waiting for the GPU",
@@ -407,11 +499,30 @@ def new_job(filename: str, path: Path, opts: dict[str, Any]) -> str:
     return job_id
 
 
-def patch_job(job_id: str, **fields) -> None:
+def patch_job(job_id: str, **fields: Any) -> bool:
+    """Apply fields to a job, refusing to move a cancelled job anywhere else.
+
+    Returns False when the write was refused, so a worker that was cancelled
+    mid-flight can stop instead of overwriting the user's decision.
+    """
     with JOBS_LOCK:
         job = JOBS.get(job_id)
-        if job:
-            job.update(fields)
+        if job is None:
+            return False
+        if job["state"] == "cancelled" and fields.get("state") not in (
+            None,
+            "cancelled",
+        ):
+            return False
+        job.update(fields)
+        return True
+
+
+def job_cancelled(job_id: str) -> bool:
+    """True when the job was cancelled, or evicted out from under the worker."""
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
+        return job is None or job["state"] == "cancelled"
 
 
 def get_job(job_id: str) -> dict[str, Any]:
@@ -429,19 +540,17 @@ def source_shared(path: str, exclude_id: str) -> bool:
 
 
 def drop_source(job: dict[str, Any]) -> None:
-    if ARGS and ARGS.source_retention == "forever":
+    if ARGS.source_retention == "forever":
         return
     if source_shared(job["path"], job["id"]):
         return
-    try:
+    with contextlib.suppress(OSError):
         Path(job["path"]).unlink(missing_ok=True)
-    except OSError:
-        pass
 
 
 def prune_jobs() -> None:
     """Keep memory bounded: evict the oldest finished jobs past the cap."""
-    cap = ARGS.max_jobs if ARGS else 60
+    cap = ARGS.max_jobs if READY else 60
     evicted: list[dict[str, Any]] = []
     with JOBS_LOCK:
         if len(JOBS) <= cap:
@@ -466,8 +575,26 @@ def prune_jobs() -> None:
         )
 
 
+def public_opts(opts: dict[str, Any]) -> dict[str, Any]:
+    """Job options as a client may see them: knobs verbatim, prompt text never.
+
+    Prompt and hotword text is the one field the audit token is meant to gate,
+    so it is not exposed here even to a holder of the app token. Callers get a
+    flag plus a length, which is all the UI ever used.
+    """
+    out = {k: v for k, v in opts.items() if k not in ("prompt", "hotwords")}
+    out["has_prompt"] = bool(opts["prompt"])
+    out["has_hotwords"] = bool(opts["hotwords"])
+    out["prompt_len"] = len(opts["prompt"])
+    out["hotwords_len"] = len(opts["hotwords"])
+    return out
+
+
 def job_public(job: dict[str, Any], include_segments: bool = True) -> dict[str, Any]:
-    out = {k: v for k, v in job.items() if k not in ("path", "segments")}
+    out = {
+        k: v for k, v in job.items() if k not in ("path", "segments", "opts")
+    }
+    out["opts"] = public_opts(job["opts"])
     now = time.time()
     started = job.get("started")
     finished = job.get("finished")
@@ -488,6 +615,27 @@ def job_public(job: dict[str, Any], include_segments: bool = True) -> dict[str, 
 
 def clamp(value: int, low: int, high: int) -> int:
     return max(low, min(high, value))
+
+
+def as_int(value: Any, default: int) -> int:
+    """Coerce a caller-supplied value to int, falling back to a default.
+
+    FastAPI already coerces declared int params, but build_opts and the audit
+    query are also reachable directly, and a malformed value should clamp to a
+    sane default rather than raise a 500.
+    """
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def as_float(value: Any, default: float) -> float:
+    """Coerce to float, falling back to a default. Never raises."""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
 
 
 def build_opts(
@@ -542,8 +690,8 @@ def build_opts(
         # context forward, so this is off unless asked for.
         "condition": truthy(condition),
         "word_timestamps": truthy(word_timestamps),
-        "min_silence_ms": clamp(int(min_silence_ms or 2000), 100, 10000),
-        "speech_pad_ms": clamp(int(speech_pad_ms or 400), 0, 2000),
+        "min_silence_ms": clamp(as_int(min_silence_ms, 2000), 100, 10000),
+        "speech_pad_ms": clamp(as_int(speech_pad_ms, 400), 0, 2000),
     }
 
 
@@ -565,7 +713,7 @@ def load_model(name: str, device: str, compute_type: str):
         _MODEL_CACHE[key] = model
         audit("model.loaded", model=name, device=device, compute_type=compute_type)
 
-        cap = max(1, ARGS.model_cache if ARGS else 1)
+        cap = max(1, ARGS.model_cache if READY else 1)
         while len(_MODEL_CACHE) > cap:
             old_key, old_model = _MODEL_CACHE.popitem(last=False)
             del old_model
@@ -629,7 +777,19 @@ def run_job(job_id: str) -> None:
         prune_jobs()
         return
 
+    # A cancel during a long model load must not be overwritten by "running".
+    if job_cancelled(job_id):
+        prune_jobs()
+        return
+
     patch_job(job_id, state="running", message="Transcribing")
+    audit(
+        "job.started",
+        job=job_id,
+        file=job["filename"],
+        model=opts["model"],
+        compute_type=opts["compute_type"],
+    )
 
     try:
         kwargs = transcribe_kwargs(opts)
@@ -656,30 +816,41 @@ def run_job(job_id: str) -> None:
                 "end": round(seg.end, 2),
                 "text": seg.text.strip(),
             }
-            if opts["word_timestamps"] and getattr(seg, "words", None):
-                entry["words"] = [
-                    {"start": round(w.start, 2), "end": round(w.end, 2), "word": w.word}
-                    for w in seg.words
-                ]
+            if opts["word_timestamps"]:
+                words = getattr(seg, "words", None)
+                if words:
+                    entry["words"] = [
+                        {
+                            "start": round(w.start, 2),
+                            "end": round(w.end, 2),
+                            "word": w.word,
+                        }
+                        for w in words
+                    ]
             collected.append(entry)
 
             progress = min(seg.end / duration, 1.0) if duration else 0.0
+            stop = False
             with JOBS_LOCK:
                 live = JOBS.get(job_id)
                 if live is None or live["state"] == "cancelled":
-                    if ARGS.source_retention == "run":
-                        drop_source(job)
-                    return
-                live["segments"] = list(collected)
-                live["progress"] = progress
+                    stop = True
+                else:
+                    live["segments"] = list(collected)
+                    live["progress"] = progress
+            if stop:
+                # Outside the lock on purpose: drop_source re-acquires JOBS_LOCK,
+                # and threading.Lock is not reentrant.
+                return
 
-        patch_job(
+        if not patch_job(
             job_id,
             state="done",
             progress=1.0,
             finished=time.time(),
             message=f"{len(collected)} segments",
-        )
+        ):
+            return  # cancelled while finishing; don't claim success
         audit(
             "job.done",
             job=job_id,
@@ -693,21 +864,21 @@ def run_job(job_id: str) -> None:
         )
     except Exception as exc:  # noqa: BLE001
         traceback.print_exc()
-        audit(
-            "job.error",
-            job=job_id,
-            file=job["filename"],
-            stage="transcribe",
-            reason=type(exc).__name__,
-            message=redact(str(exc)),
-            opts=audit_opts(opts),
-        )
-        patch_job(
+        if patch_job(
             job_id,
             state="error",
             finished=time.time(),
             message=f"{type(exc).__name__}: {redact(str(exc))}",
-        )
+        ):
+            audit(
+                "job.error",
+                job=job_id,
+                file=job["filename"],
+                stage="transcribe",
+                reason=type(exc).__name__,
+                message=redact(str(exc)),
+                opts=audit_opts(opts),
+            )
     finally:
         if ARGS.source_retention == "run":
             drop_source(job)
@@ -748,7 +919,7 @@ def worker_loop() -> None:
 
 
 def _stamp(seconds: float, comma: bool = False) -> str:
-    ms = int(round(seconds * 1000))
+    ms = as_int(as_float(seconds, 0.0) * 1000, 0)
     h, ms = divmod(ms, 3_600_000)
     m, ms = divmod(ms, 60_000)
     s, ms = divmod(ms, 1000)
@@ -787,7 +958,9 @@ def render(job: dict[str, Any], fmt: str) -> tuple[str, str]:
             "filename": job["filename"],
             "language": job["language"],
             "duration": job["duration"],
-            "options": job["opts"],
+            # public_opts, not job["opts"]: the export must not carry prompt
+            # or hotword text out to an app-token holder.
+            "options": public_opts(job["opts"]),
             "segments": segs,
         }
         return (
@@ -829,6 +1002,11 @@ def normalize_host(raw: str) -> str:
     return host.rstrip(".").strip()
 
 
+# A well-formed DNS name or IPv4 literal. Anything else (extra colons, control
+# characters, spaces) must not reach suffix matching.
+HOSTNAME_RE = re.compile(r"[a-z0-9]([a-z0-9._-]{0,251}[a-z0-9])?")
+
+
 def host_allowed(header: str | None) -> bool:
     """Reject DNS-rebinding: only hostnames we expect may address this server."""
     if not header:
@@ -838,13 +1016,41 @@ def host_allowed(header: str | None) -> bool:
         return False
     if host in ALLOWED_HOSTS:
         return True
+    # Suffix matching only for well-formed names: a malformed Host such as
+    # "x:1:trycloudflare.com" must not slip through on endswith().
+    if not HOSTNAME_RE.fullmatch(host):
+        return False
     return any(host == s.lstrip(".") or host.endswith(s) for s in ALLOWED_SUFFIXES)
+
+
+SECURITY_HEADERS = {
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+    "Referrer-Policy": "no-referrer",
+    "Content-Security-Policy": (
+        "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; "
+        "connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'"
+    ),
+}
+
+
+T = TypeVar("T", bound=Response)
+
+
+def hardened(response: T) -> T:
+    """Every response carries the hardening headers, refusals included."""
+    response.headers.update(SECURITY_HEADERS)
+    return response
+
+
+def refuse(detail: str, status: int) -> Response:
+    return hardened(JSONResponse({"detail": detail}, status_code=status))
 
 
 @app.middleware("http")
 async def guard(request: Request, call_next):
-    if ARGS is None:
-        return JSONResponse({"detail": "Server not configured"}, status_code=503)
+    if not READY:
+        return refuse("Server not configured", 503)
 
     started = time.perf_counter()
 
@@ -852,13 +1058,13 @@ async def guard(request: Request, call_next):
     if not host_allowed(raw_host):
         seen = (raw_host or "").strip()[:100]
         print(f"!  Rejected Host header {seen!r} (add it with --allow-host)")
-        audit("security.host_rejected", request, reason=seen or "missing", status=421)
-        return JSONResponse(
-            {
-                "detail": f"Unrecognised Host header {seen!r}. "
-                "Restart the server with --allow-host for this name."
-            },
-            status_code=421,
+        audit_rejection(
+            "security.host_rejected", request, reason=seen or "missing", status=421
+        )
+        return refuse(
+            f"Unrecognised Host header {seen!r}. "
+            "Restart the server with --allow-host for this name.",
+            421,
         )
 
     path = request.url.path
@@ -867,52 +1073,71 @@ async def guard(request: Request, call_next):
         # reach these endpoints even with a CORS-safelisted body type.
         site = request.headers.get("sec-fetch-site")
         if site and site not in ("same-origin", "none"):
-            audit("security.cross_site", request, reason=site, status=403)
-            return JSONResponse(
-                {"detail": "Cross-site request refused"}, status_code=403
-            )
+            audit_rejection("security.cross_site", request, reason=site, status=403)
+            return refuse("Cross-site request refused", 403)
 
         if path.startswith("/api/audit"):
             # The audit trail has its own credential, deliberately independent
             # of the app token: one can be handed out without the other.
             if not ARGS.audit_token:
-                return JSONResponse(
-                    {"detail": "Audit API disabled: set --audit-token"},
-                    status_code=404,
-                )
+                return refuse("Audit API disabled: set --audit-token", 404)
             supplied = request.headers.get("x-audit-token") or ""
             if not hmac.compare_digest(supplied.encode(), ARGS.audit_token.encode()):
-                audit(
+                audit_rejection(
                     "security.auth_failed",
                     request,
                     scope="audit",
                     reason="bad-token" if supplied else "missing-token",
                     status=401,
                 )
-                return JSONResponse(
-                    {"detail": "Bad or missing audit token"}, status_code=401
-                )
+                return refuse("Bad or missing audit token", 401)
         elif ARGS.token:
             supplied = request.headers.get("x-token") or ""
             if not hmac.compare_digest(supplied.encode(), ARGS.token.encode()):
-                audit(
+                audit_rejection(
                     "security.auth_failed",
                     request,
                     scope="app",
                     reason="bad-token" if supplied else "missing-token",
                     status=401,
                 )
-                return JSONResponse({"detail": "Bad or missing token"}, status_code=401)
+                return refuse("Bad or missing token", 401)
 
-    response = await call_next(request)
+        # Refuse an over-sized body from Content-Length, before Starlette spools
+        # the whole multipart payload to a temp file. The endpoint still
+        # enforces the exact per-file limit while streaming.
+        if request.method == "POST" and path == "/api/jobs":
+            declared = request.headers.get("content-length") or ""
+            if declared.isdigit():
+                # 1 MB of slack for multipart framing and the other form fields.
+                cap = ARGS.max_upload_mb * 1024 * 1024 + 1024 * 1024
+                declared_bytes = as_int(declared, 0)
+                if declared_bytes > cap:
+                    audit_rejection(
+                        "job.rejected",
+                        request,
+                        bytes=declared_bytes,
+                        reason="body-too-large",
+                        status=413,
+                    )
+                    return refuse(
+                        f"Upload exceeds the {ARGS.max_upload_mb} MB limit", 413
+                    )
+
+    try:
+        response = await call_next(request)
+    except Exception:
+        # An unhandled 500 used to leave no trace at all.
+        audit(
+            "request.failed",
+            request,
+            status=500,
+            ms=round((time.perf_counter() - started) * 1000, 1),
+        )
+        raise
+
     elapsed = round((time.perf_counter() - started) * 1000, 1)
-    response.headers["X-Content-Type-Options"] = "nosniff"
-    response.headers["X-Frame-Options"] = "DENY"
-    response.headers["Referrer-Policy"] = "no-referrer"
-    response.headers["Content-Security-Policy"] = (
-        "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; "
-        "connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'"
-    )
+    hardened(response)
 
     # Polling endpoints are chatty, so reads are opt-in. Everything that
     # changes state or moves a transcript out logs itself at the source.
@@ -925,11 +1150,14 @@ async def guard(request: Request, call_next):
                     status=response.status_code,
                     ms=elapsed,
                 )
-        elif ARGS.audit_reads and request.method == "GET":
+        elif (
+            ARGS.audit_reads
+            and request.method == "GET"
             # Endpoints that already logged something specific (an export, say)
             # set audit_handled; don't repeat them as a generic read.
-            if not getattr(request.state, "audit_handled", False):
-                audit("api.read", request, status=response.status_code, ms=elapsed)
+            and not getattr(request.state, "audit_handled", False)
+        ):
+            audit("api.read", request, status=response.status_code, ms=elapsed)
     return response
 
 
@@ -947,21 +1175,18 @@ def audit_ui() -> str:
 @app.get("/api/status")
 def status() -> dict[str, Any]:
     gpu = None
-    try:
+    with contextlib.suppress(Exception):
         import ctranslate2
 
         count = ctranslate2.get_cuda_device_count()
         gpu = f"{count} CUDA device(s)" if count else None
-    except Exception:  # noqa: BLE001
-        pass
 
-    try:
-        import torch  # optional, only for the pretty device name
+    with contextlib.suppress(Exception):
+        # Optional: only for the pretty device name in the status strip.
+        import torch  # pyright: ignore[reportMissingImports]
 
         if torch.cuda.is_available():
             gpu = torch.cuda.get_device_name(0)
-    except Exception:  # noqa: BLE001
-        pass
 
     with JOBS_LOCK:
         active = sum(
@@ -990,6 +1215,41 @@ def status() -> dict[str, Any]:
         "prompt_limit": PROMPT_LIMIT,
         "hotwords_limit": HOTWORDS_LIMIT,
     }
+
+
+class UploadTooLarge(Exception):
+    """Raised by save_upload when a stream exceeds the configured ceiling."""
+
+    def __init__(self, written: int) -> None:
+        super().__init__(f"upload exceeded the limit at {written} bytes")
+        self.written = written
+
+
+def save_upload(source: Any, dest: Path, limit: int) -> int:
+    """Stream an upload to disk, enforcing the ceiling as it goes.
+
+    Deliberately synchronous: callers run it in a threadpool, because a
+    multi-gigabyte copy on the event loop would stall every other request.
+    """
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    with contextlib.suppress(OSError):
+        os.chmod(dest.parent, 0o700)  # source audio is not for other local users
+    written = 0
+    with dest.open("wb") as fh:
+        while chunk := source.read(1024 * 1024):
+            written += len(chunk)
+            if written > limit:
+                raise UploadTooLarge(written)
+            fh.write(chunk)
+    with contextlib.suppress(OSError):
+        os.chmod(dest, 0o600)
+    return written
+
+
+def discard_file(path: Path) -> None:
+    """Remove a partial upload. Safe to call when it is already gone."""
+    with contextlib.suppress(OSError):
+        path.unlink(missing_ok=True)
 
 
 @app.post("/api/jobs")
@@ -1029,38 +1289,36 @@ async def create_job(
             1 for j in JOBS.values() if j["state"] in ("queued", "loading", "running")
         )
     if pending >= ARGS.max_queue:
-        audit("job.rejected", request, reason="queue-full", status=429)
+        audit_rejection("job.rejected", request, reason="queue-full", status=429)
         raise HTTPException(
             status_code=429, detail=f"Queue is full ({ARGS.max_queue} jobs)"
         )
 
     raw_name = Path(file.filename or "audio").name
     safe = "".join(c for c in raw_name if c.isalnum() or c in " ._-").strip()
-    dest = UPLOAD_DIR / f"{uuid.uuid4().hex[:8]}_{safe or 'audio'}"
-    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    # Capped well under NAME_MAX: a long or non-ASCII name would otherwise
+    # raise OSError and surface as an opaque 500.
+    dest = UPLOAD_DIR / f"{uuid.uuid4().hex[:8]}_{safe[:100] or 'audio'}"
 
     limit = ARGS.max_upload_mb * 1024 * 1024
-    written = 0
     try:
-        with dest.open("wb") as fh:
-            while chunk := await file.read(1024 * 1024):
-                written += len(chunk)
-                if written > limit:
-                    audit(
-                        "job.rejected",
-                        request,
-                        file=raw_name[:200],
-                        bytes=written,
-                        reason="upload-too-large",
-                        status=413,
-                    )
-                    raise HTTPException(
-                        status_code=413,
-                        detail=f"File exceeds the {ARGS.max_upload_mb} MB limit",
-                    )
-                fh.write(chunk)
+        written = await run_in_threadpool(save_upload, file.file, dest, limit)
+    except UploadTooLarge as exc:
+        await run_in_threadpool(discard_file, dest)
+        audit_rejection(
+            "job.rejected",
+            request,
+            file=raw_name[:200],
+            bytes=exc.written,
+            reason="upload-too-large",
+            status=413,
+        )
+        raise HTTPException(
+            status_code=413,
+            detail=f"File exceeds the {ARGS.max_upload_mb} MB limit",
+        ) from None
     except BaseException:
-        dest.unlink(missing_ok=True)
+        await run_in_threadpool(discard_file, dest)
         raise
 
     job_id = new_job(filename=raw_name[:200], path=dest, opts=opts)
@@ -1078,7 +1336,7 @@ async def create_job(
 
 
 @app.post("/api/jobs/{job_id}/retry")
-async def retry_job(
+def retry_job(
     job_id: str,
     request: Request,
     model: str = Form(None),
@@ -1098,7 +1356,7 @@ async def retry_job(
     old = get_job(job_id)
     source = Path(old["path"])
     if not source.exists():
-        audit("job.retry_rejected", request, job=job_id, reason="source-gone", status=409)
+        audit_rejection("job.retry_rejected", request, job=job_id, reason="source-gone", status=409)
         raise HTTPException(
             status_code=409,
             detail="The source audio is no longer on disk; re-upload it",
@@ -1124,7 +1382,7 @@ async def retry_job(
             1 for j in JOBS.values() if j["state"] in ("queued", "loading", "running")
         )
     if pending >= ARGS.max_queue:
-        audit("job.retry_rejected", request, job=job_id, reason="queue-full", status=429)
+        audit_rejection("job.retry_rejected", request, job=job_id, reason="queue-full", status=429)
         raise HTTPException(
             status_code=429, detail=f"Queue is full ({ARGS.max_queue} jobs)"
         )
@@ -1228,8 +1486,8 @@ def audit_query(
     if AUDIT is None:
         raise HTTPException(status_code=503, detail="Audit trail unavailable")
 
-    limit = clamp(int(limit or 200), 1, 1000)
-    offset = max(0, int(offset or 0))
+    limit = clamp(as_int(limit, 200), 1, 1000)
+    offset = max(0, as_int(offset, 0))
     days = AUDIT.dates()
     day = (date or "").strip() or (
         days[0] if days else datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -1264,7 +1522,10 @@ def audit_query(
         date=day,
         returned=len(events),
         matched=total,
-        search=needle,
+        # Never the search string itself: an audit reader could otherwise copy
+        # prompt text (or anything else) into the authoritative record.
+        search_len=len(needle) if needle else 0,
+        search_sha256=digest(needle or ""),
         job=job or None,
         include_prompts=bool(include_prompts),
     )
@@ -1837,7 +2098,7 @@ function jobTags(job){
   if(o.translate) bits.push("translated");
   if(o.condition) bits.push("context on");
   if(o.word_timestamps) bits.push("word times");
-  if(o.hotwords) bits.push("terms");
+  if(o.has_hotwords) bits.push("terms");
   if(job.duration) bits.push(fmtTime(job.duration));
   return bits.join(" \u00b7 ");
 }
@@ -2183,7 +2444,8 @@ function row(rec){
   const time = String(rec.ts || "").slice(11, 19);
   const where = [];
   if(rec.method) where.push(rec.method + " " + (rec.path || ""));
-  if(rec.client_claimed) where.push("via " + rec.client_claimed);
+  // client_claimed is whatever the proxy said; the TCP peer is the fact.
+  if(rec.client_claimed) where.push("unverified via " + rec.client_claimed);
   if(rec.client) where.push(rec.client);
   if(rec.host) where.push(rec.host);
   if(rec.status) where.push("HTTP " + rec.status);
@@ -2337,16 +2599,14 @@ def local_names(bind_host: str, extra: list[str]) -> tuple[set[str], set[str]]:
     "*." or "." becomes a suffix match, so --allow-host .trycloudflare.com
     covers the random hostnames `cloudflared tunnel --url` hands out.
     """
-    names = {"localhost", "127.0.0.1", "::1", "0.0.0.0"}
+    names = {"localhost", "127.0.0.1", "::1", ANY_INTERFACE}
     suffixes: set[str] = set()
-    try:
+    with contextlib.suppress(OSError):
         hostname = socket.gethostname()
         names.add(hostname.lower())
         for info in socket.getaddrinfo(hostname, None):
             names.add(str(info[4][0]).lower())
-    except OSError:
-        pass
-    if bind_host not in ("0.0.0.0", "::"):
+    if bind_host not in (ANY_INTERFACE, "::"):
         names.add(bind_host.lower())
     for entry in extra:
         e = entry.strip().lower()
@@ -2375,7 +2635,7 @@ def local_names(bind_host: str, extra: list[str]) -> tuple[set[str], set[str]]:
 DEFAULTS: dict[str, Any] = {
     "config": None,
     "work_dir": None,
-    "host": "0.0.0.0",
+    "host": ANY_INTERFACE,
     "port": 8765,
     "token": "",
     "no_auth": False,
@@ -2452,14 +2712,19 @@ def as_list(value: Any) -> list[str]:
 CONVERTERS = {"str": str, "int": int, "bool": as_bool, "list": as_list}
 
 
-def config_path(explicit: str | None) -> tuple[Path, bool]:
-    """Return (path, required). Only an explicit path must exist."""
+def config_path(explicit: str | None, work_dir: str | None = None) -> tuple[Path, bool]:
+    """Return (path, required). Only an explicit path must exist.
+
+    Resolution order for the *default* location: an explicit --config, then
+    TRANSCRIBE_CONFIG, then the resolved work dir (--work-dir, then
+    TRANSCRIBE_WORK_DIR), then ~/.transcribe-server.
+    """
     if explicit:
         return Path(explicit).expanduser(), True
     env = os.environ.get("TRANSCRIBE_CONFIG")
     if env:
         return Path(env).expanduser(), True
-    base = os.environ.get("TRANSCRIBE_WORK_DIR")
+    base = work_dir or os.environ.get("TRANSCRIBE_WORK_DIR")
     root = Path(base).expanduser() if base else Path.home() / ".transcribe-server"
     return root / "config.toml", False
 
@@ -2697,12 +2962,17 @@ def resolve_args(argv: list[str] | None = None) -> tuple[argparse.Namespace, Pat
     """Layer defaults, config file, flags and environment, in that order."""
     cli = vars(build_parser().parse_args(argv))
 
-    path, required = config_path(cli.get("config"))
+    # --work-dir moves the default config location too, not just the state dir.
+    path, required = config_path(cli.get("config"), cli.get("work_dir"))
+    file_values = load_config_file(path, required)
+
     merged: dict[str, Any] = dict(DEFAULTS)
-    merged.update(load_config_file(path, required))
+    merged.update(file_values)
     merged.update(cli)
 
     for env_name, (name, kind) in ENV_OPTIONS.items():
+        if name == "allow_host":
+            continue  # additive, handled below
         raw = os.environ.get(env_name)
         if raw is None or raw == "":
             continue
@@ -2712,6 +2982,14 @@ def resolve_args(argv: list[str] | None = None) -> tuple[argparse.Namespace, Pat
             raise SystemExit(
                 f"!  {env_name}={raw!r} is not a valid {kind}"
             ) from None
+
+    # --allow-host is repeatable, so it accumulates across every layer instead
+    # of a flag silently replacing the configured tunnel hostname.
+    hosts: list[str] = []
+    hosts += as_list(file_values.get("allow_host") or [])
+    hosts += as_list(cli.get("allow_host") or [])
+    hosts += as_list(os.environ.get("TRANSCRIBE_ALLOW_HOST") or [])
+    merged["allow_host"] = hosts
 
     # TOML is typed already, but a quoted "8765" should still work.
     for name, default in DEFAULTS.items():
@@ -2738,13 +3016,10 @@ def resolve_args(argv: list[str] | None = None) -> tuple[argparse.Namespace, Pat
 
     if not 0 < merged["port"] < 65536:
         raise SystemExit(f"!  port must be 1-65535, got {merged['port']}")
-    for name in (
-        "model_cache",
-        "max_upload_mb",
-        "max_queue",
-        "max_jobs",
-        "audit_retain_days",
-    ):
+    for name in ("max_upload_mb", "max_queue"):
+        if merged[name] < 1:
+            raise SystemExit(f"!  {name} must be at least 1, got {merged[name]}")
+    for name in ("model_cache", "max_jobs", "audit_retain_days"):
         if merged[name] < 0:
             raise SystemExit(f"!  {name} cannot be negative, got {merged[name]}")
 
@@ -2780,8 +3055,31 @@ def startup_snapshot(args: argparse.Namespace, cfg: Path | None) -> dict[str, An
     }
 
 
+def sweep_uploads() -> tuple[int, int]:
+    """Delete uploads left behind by a previous run. Returns (count, bytes)."""
+    count = 0
+    total = 0
+    try:
+        entries = list(UPLOAD_DIR.iterdir())
+    except OSError:
+        return 0, 0
+    with JOBS_LOCK:
+        referenced = {j["path"] for j in JOBS.values()}
+    for path in entries:
+        if not path.is_file() or str(path) in referenced:
+            continue
+        try:
+            size = path.stat().st_size
+            path.unlink()
+        except OSError:
+            continue
+        count += 1
+        total += size
+    return count, total
+
+
 def main() -> None:
-    global ARGS, ALLOWED_HOSTS, ALLOWED_SUFFIXES, AUDIT, WORK_DIR, UPLOAD_DIR
+    global ARGS, ALLOWED_HOSTS, ALLOWED_SUFFIXES, AUDIT, WORK_DIR, UPLOAD_DIR, READY
     args, cfg_path, cfg_required = resolve_args()
 
     if args.no_auth:
@@ -2810,9 +3108,20 @@ def main() -> None:
 
     args.model_cache = max(1, args.model_cache)
     ARGS = args
+    READY = True
     ALLOWED_HOSTS, ALLOWED_SUFFIXES = local_names(args.host, args.allow_host)
 
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    with contextlib.suppress(OSError):
+        os.chmod(UPLOAD_DIR, 0o700)
+
+    # Job state is in memory only, so after a restart every file in uploads/ is
+    # unreferenced by definition. Without this sweep they accumulate forever,
+    # including under --source-retention run.
+    swept, swept_bytes = sweep_uploads()
+
+    # prune() is a no-op while auditing is off: --no-audit must not delete a
+    # trail it is not managing.
     pruned = AUDIT.prune()
 
     if not shutil.which("ffmpeg"):
@@ -2881,10 +3190,26 @@ def main() -> None:
     else:
         print("\nAudit      disabled (--no-audit)")
 
+    if swept:
+        print(
+            f"Uploads    swept {swept} orphaned file(s) from a previous run "
+            f"({swept_bytes / 1024 / 1024:.1f} MB)"
+        )
+
     print(f"\nAccepting Host: {', '.join(sorted(ALLOWED_HOSTS | ALLOWED_SUFFIXES))}")
     print("(add more with --allow-host)\n")
 
-    audit("server.started", **startup_snapshot(args, cfg_path if cfg_path.exists() else None))
+    snapshot = startup_snapshot(args, cfg_path if cfg_path.exists() else None)
+    if args.audit:
+        audit("server.started", **snapshot)
+    else:
+        # One unconditional line even with auditing off: a trail that simply
+        # stops is otherwise indistinguishable from a server that was down.
+        AUDIT.emit("server.started", force=True, **snapshot)
+    if pruned:
+        audit("audit.pruned", removed=len(pruned), files=pruned[:50])
+    if swept:
+        audit("uploads.swept", files=swept, bytes=swept_bytes)
 
     uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
 

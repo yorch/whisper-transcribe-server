@@ -1,0 +1,9 @@
+{
+  "venvPath": ".",
+  "venv": ".venv",
+  "pythonVersion": "3.12",
+  "include": ["transcribe_server.py", "tests"],
+  "exclude": [".venv", "**/__pycache__"],
+  "reportMissingImports": "error",
+  "reportMissingTypeStubs": "none"
+}

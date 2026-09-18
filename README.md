@@ -72,7 +72,7 @@ Useful flags:
 | `--model medium`              | default model in the dropdown (`large-v3`, `large-v3-turbo`, `medium`, `small`, `base`)                                     |
 | `--port 8765`                 | listen port                                                                                                                 |
 | `--preload`                   | load the model at startup so the first job doesn't stall                                                                    |
-| `--token secret123`           | require `?token=secret123` on every API call                                                                                |
+| `--token secret123`           | require the `x-token` header on every API call (`?token=` bootstraps the page, then moves to `sessionStorage`)              |
 | `--device cpu`                | fall back to CPU                                                                                                            |
 | `--compute-type int8_float16` | lower VRAM use                                                                                                              |
 | `--quality fast`              | default beam size: `fast`=1, `balanced`=5, `thorough`=8                                                                     |
@@ -80,7 +80,7 @@ Useful flags:
 | `--pin-model`                 | force every job to `--model`, disable the UI selector                                                                       |
 | `--allow-precision-choice`    | expose the precision selector (hidden by default)                                                                           |
 | `--no-auth`                   | serve without a token                                                                                                       |
-| `--allow-host name`           | accept an extra `Host` header value (repeatable; prefix with `.` for a suffix match, e.g. `.trycloudflare.com`)              |
+| `--allow-host name`           | accept an extra `Host` header value (repeatable; prefix with `.` for a suffix match, e.g. `.trycloudflare.com`)             |
 | `--max-upload-mb 2048`        | per-file upload ceiling                                                                                                     |
 | `--max-queue 20`              | max jobs pending before uploads are refused                                                                                 |
 | `--max-jobs 60`               | finished job records retained before eviction                                                                               |
@@ -196,8 +196,27 @@ Both need `x-audit-token`, which is checked separately from the app token —
 you can hand out one without the other. With no audit token configured the
 whole audit API returns `404`, so it is off unless you ask for it.
 
-Files older than `audit_retain_days` (30 by default) are deleted at startup,
-sidecars included; `0` keeps everything.
+Files older than `audit_retain_days` (30 by default) are deleted at startup
+**and** on each daily rollover, sidecars included; `0` keeps everything. With
+`--no-audit` nothing is pruned at all, so turning auditing off can never delete
+a trail it is not managing.
+
+Two details worth knowing:
+
+- **Prompt sidecars outlive the job.** Removing a job deletes its audio but
+  keeps `prompts/<job_id>.json` until retention expires. Deleting it with the
+  job would let anyone erase the evidence that a prompt was used, which is
+  exactly what the trail exists to prevent. If you would rather the text never
+  be stored, use `--no-audit-prompts`.
+- **A disabled trail still writes one line.** With `--no-audit`, startup emits a
+  single `server.started` record so that a gap in the trail can be told apart
+  from the server simply having been down.
+
+Refused requests are logged **before** any credential is checked, so a burst
+from one source is collapsed: the first five per source per minute are recorded
+individually and the rest are summarised in one `security.rejected_summary`
+record. Without that, an unauthenticated client could fill the disk by looping
+on a bad token.
 
 ### Origin attribution behind a tunnel
 
@@ -352,7 +371,15 @@ What's enforced:
 - Response headers set `nosniff`, `DENY` framing, `no-referrer`, and a CSP.
 - **The audit trail has its own token**, so read access to "who did what" is
   separable from the ability to transcribe. Job ids are validated before they
-  reach a filename, and audit files are written `0600`.
+  reach a filename, and audit files are written `0600` (best effort: on Windows
+  `chmod` does not set ACLs, so treat the claim as POSIX-only).
+- **Prompt and hotword text is never returned to an app-token holder** — not in
+  the job list, not in the job detail, not in the JSON export. Only the audit
+  token can read it. The trail itself carries a length and a SHA-256.
+- **Uploads and audit directories are created `0700`**, and uploaded audio
+  `0600`, so other local accounts cannot read meeting audio.
+- **Every response carries the hardening headers**, including `421`/`403`/`401`
+  refusals, which previously returned before the headers were attached.
 
 What it still doesn't do, by design:
 
@@ -381,4 +408,40 @@ What it still doesn't do, by design:
   save what you want to keep. The audit trail does not change that: it records
   that an export happened, never the text.
 - Finished jobs are evicted past `--max-jobs` (60) to keep memory bounded.
-- Job state resets on restart. This is a workstation tool, not a service.
+- Job state resets on restart. This is a workstation tool, not a service. Because
+  of that, every file in `uploads/` is unreferenced after a restart, so the
+  server sweeps that directory at startup and logs `uploads.swept`. Use
+  `--source-retention forever` if you want the audio kept regardless.
+- **The two HTML pages duplicate ~1,000 lines** of CSS/JS (escaping helper, token
+  bootstrap, gate, polling). Extracting them into `static/` is the highest-value
+  refactor and has not been done; until then, a change to `esc()` must be made in
+  both pages.
+- `create_job` streams the upload through a threadpool, but a very large upload
+  still occupies the threadpool for its duration.
+
+## Tests
+
+The suite covers the audit trail, config layering, host allowlist, job state
+machine and the HTTP surface, including regressions for the two most serious
+bugs found in review (a self-deadlock on cancel, and prompt text leaking to an
+app-token holder).
+
+It needs the runtime dependencies plus `pytest` and `httpx`, which is what the
+`.venv` is for:
+
+```bash
+uv venv .venv --python 3.12
+uv pip install --python .venv/bin/python \
+  fastapi "uvicorn[standard]" python-multipart faster-whisper pytest httpx
+.venv/bin/pytest -q
+```
+
+`ruff.toml` and `pyrightconfig.json` point the linters at that same venv:
+
+```bash
+uvx ruff check .
+uvx pyright --project pyrightconfig.json
+```
+
+Tests never start the worker thread, so they queue uploads without loading a
+model or touching a GPU.
