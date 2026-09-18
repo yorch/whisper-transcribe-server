@@ -238,6 +238,46 @@ def test_a_failed_write_is_attested_and_does_not_gap_the_chain(tmp_path):
     assert log.lost == 0, "a landed record clears the pending gap"
 
 
+def test_a_write_that_cannot_be_rolled_back_keeps_the_next_record_readable(tmp_path):
+    """A torn line plus a failed rollback must not swallow the next record.
+
+    The chain stays consistent either way, because _append commits after the
+    write. But the `lost` attestation rides the next record, and concatenating
+    onto the damage would bury it inside an unparsable line.
+    """
+    log = fresh(tmp_path)
+    log.emit("a")
+    real = log._fh
+    assert real is not None
+
+    class TornNoTruncate:
+        """Die mid-record, and refuse to be cut back."""
+
+        def write(self, text: str) -> None:
+            real.write(text[: len(text) // 2])
+            raise OSError("disk full")
+
+        def flush(self) -> None:
+            real.flush()
+
+        def truncate(self, size: int) -> None:
+            raise OSError("cannot truncate")
+
+    log._fh = TornNoTruncate()  # pyright: ignore[reportAttributeAccessIssue]
+    log.emit("b")
+    log._fh = real
+    log.emit("c")
+
+    lines = [x for x in day_file(log).read_text(encoding="utf-8").splitlines() if x]
+    assert len(lines) == 3, "the damage must stay on its own line"
+    with pytest.raises(ValueError):
+        json.loads(lines[1])  # the torn half, honestly unreadable
+    good = json.loads(lines[2])
+    assert good["event"] == "c"
+    assert good["seq"] == 2, "the torn write must not advance the chain"
+    assert good["lost"] == 1, "the attestation must survive the damage"
+
+
 # --------------------------------------------------------------------------- #
 # The byte cap
 # --------------------------------------------------------------------------- #

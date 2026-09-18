@@ -971,6 +971,9 @@ class AuditLog:
         # broken sink. The next record that does land attests to the gap.
         self.lost = 0
         self.lost_total = 0
+        # False while the file may end mid-line, after a write died and the
+        # rollback could not cut it back. The next append closes the line first.
+        self._clean = True
         # Set by the byte cap (see emit): the day file hit its ceiling and is
         # deliberately no longer taking events.
         self.full = False
@@ -1049,6 +1052,7 @@ class AuditLog:
         self._chain_reset = False
         if tail is not None:
             self._seq, self._chain = tail
+            self._clean = True
             return
         self._seq = 0
         self._chain = None
@@ -1056,6 +1060,11 @@ class AuditLog:
             existing = path.stat().st_size > 0
         except OSError:
             existing = False
+        # A non-empty file whose tail did not parse may end mid-record (a crash,
+        # or a rollback that failed). The next append must not concatenate onto
+        # it, or the new record becomes unreadable too -- including the `lost`
+        # count it carries.
+        self._clean = not existing
         if existing:
             self._chain_reset = True
         else:
@@ -1133,12 +1142,17 @@ class AuditLog:
             record["chain_reset"] = True
         record["chain"] = self._chain_hash(record)
         line = json.dumps(record, ensure_ascii=False, default=str)
-        fh.write(line + "\n")
+        # Terminate a line the previous write left open, so the damage stays on
+        # its own line and this record -- with whatever `lost` it attests -- is
+        # still readable. Usually `_clean` is true and this is nothing.
+        blob = ("" if self._clean else "\n") + line + "\n"
+        fh.write(blob)
         fh.flush()
         self._seq = seq
         self._chain = record["chain"]
         self._chain_reset = False
-        self._bytes += len(line.encode("utf-8")) + 1
+        self._clean = True
+        self._bytes += len(blob.encode("utf-8"))
 
     def _rollback(self) -> None:
         """Drop a torn record left by a failed write.
@@ -1150,12 +1164,19 @@ class AuditLog:
         """
         fh = self._fh
         if fh is None:
+            self._clean = False
             return
         # A closed or stub handle raises ValueError/AttributeError, and a full
         # disk raises OSError: none of them may escape a best-effort write path.
-        with contextlib.suppress(OSError, ValueError, AttributeError):
+        try:
             fh.truncate(self._bytes)
             fh.flush()
+        except (OSError, ValueError, AttributeError):
+            # The torn record is still there; _append closes the line off first
+            # so the next record does not inherit its damage.
+            self._clean = False
+        else:
+            self._clean = True
 
     def _warn_once(self, what: str, exc: BaseException) -> None:
         """Warn once per (path, exception type), not once per process.
