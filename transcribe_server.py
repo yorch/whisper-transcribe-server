@@ -1348,7 +1348,7 @@ DIARIZE_MODELS: dict[str, dict[str, Any]] = {
 # line, each prefixed with a marker handed to it as argv[1] -- passing it rather
 # than repeating the literal means the two sides cannot drift apart. The prefix
 # is what stops anything ONNX Runtime decides to log being read as a result.
-DIARIZE_WORKER = r'''
+DIARIZE_WORKER = r"""
 import json, sys
 
 import sherpa_onnx
@@ -1425,7 +1425,7 @@ def main():
 
 
 sys.exit(main())
-'''
+"""
 
 
 def diarize_model_dir() -> Path:
@@ -2204,7 +2204,11 @@ def render(job: dict[str, Any], fmt: str) -> tuple[str, str]:
         blocks = ["WEBVTT\n"]
         for s in segs:
             speaker = segment_speaker(s)
-            text = s["text"] if speaker is None else f"<v {speaker_label(speaker)}>{s['text']}"
+            text = (
+                s["text"]
+                if speaker is None
+                else f"<v {speaker_label(speaker)}>{s['text']}"
+            )
             blocks.append(f"{_stamp(s['start'])} --> {_stamp(s['end'])}\n{text}\n")
         return "\n".join(blocks), "text/vtt; charset=utf-8"
 
@@ -4354,6 +4358,14 @@ CONFIG_TEMPLATE = """\
 # machine, not the recording, so this is off by default.
 # allow_precision_choice = false
 
+[diarization]
+# Offer speaker identification ("Identify speakers") per job. Labels are
+# anonymous and per-recording: Speaker 1 here is not Speaker 1 in the next
+# file. Off means the control is hidden and its ~42 MB of models are never
+# fetched. A diarized job is slower and needs word-level timings, which the
+# server switches on for it.
+# allow_diarize = true
+
 [limits]
 # max_upload_mb = 2048
 # max_queue = 20
@@ -4995,9 +5007,7 @@ def main() -> None:
         )
     print(f"Device     {args.device}{detail}")
     print(f"VRAM cache {args.model_cache} model(s)")
-    print(
-        f"Speakers   {'available (identify)' if args.allow_diarize else 'disabled'}"
-    )
+    print(f"Speakers   {'available (identify)' if args.allow_diarize else 'disabled'}")
     print(
         f"Sources    retention={args.source_retention}"
         f"{'  retry enabled' if args.source_retention != 'run' else '  retry disabled'}"

@@ -177,9 +177,7 @@ def test_cancelling_stops_the_pass_and_returns_nothing(monkeypatch):
     threading.Timer(0.3, cancelled.set).start()
 
     started = time.perf_counter()
-    result = s.run_diarizer(
-        "meeting.wav", 0, FAKE_MODELS, cancelled=cancelled.is_set
-    )
+    result = s.run_diarizer("meeting.wav", 0, FAKE_MODELS, cancelled=cancelled.is_set)
     assert result is None
     assert time.perf_counter() - started < 5, "cancel did not stop the child"
 
@@ -233,9 +231,9 @@ def sherpa_present(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         s.importlib.util,
         "find_spec",
-        lambda name, *a, **k: object()
-        if name == "sherpa_onnx"
-        else real(name, *a, **k),
+        lambda name, *a, **k: (
+            object() if name == "sherpa_onnx" else real(name, *a, **k)
+        ),
     )
 
 
@@ -268,8 +266,11 @@ def test_a_segment_spanning_two_speakers_is_split_at_the_change():
             4.0,
             "Hello there how are you",
             words=words(
-                (0.0, 0.5, " Hello"), (0.5, 1.0, " there"),
-                (2.0, 2.5, " how"), (2.5, 3.0, " are"), (3.0, 3.5, " you"),
+                (0.0, 0.5, " Hello"),
+                (0.5, 1.0, " there"),
+                (2.0, 2.5, " how"),
+                (2.5, 3.0, " are"),
+                (3.0, 3.5, " you"),
             ),
         )
     ]
@@ -374,20 +375,41 @@ def test_speaker_summary_totals_time_per_speaker():
 # --------------------------------------------------------------------------- #
 
 
+def job_opts(**overrides: Any) -> dict[str, Any]:
+    """build_opts with the uninteresting arguments named once.
+
+    Keyword arguments rather than fourteen positional ones: the formatter turns
+    a positional call of that length into one argument per line, which is
+    correct and unreadable, so the intent gets lost in the noise.
+    """
+    args: dict[str, Any] = {
+        "model": "base",
+        "compute_type": "int8",
+        "language": "",
+        "vad": "true",
+        "quality": "balanced",
+        "prompt": "",
+        "hotwords": "",
+        "translate": "false",
+        "condition": "false",
+        "word_timestamps": "false",
+        "min_silence_ms": 2000,
+        "speech_pad_ms": 400,
+        "diarize": "false",
+        "speakers": 0,
+    }
+    args.update(overrides)
+    return s.build_opts(**args)
+
+
 def test_asking_for_speakers_turns_on_word_timings(configured):
-    opts = s.build_opts(
-        None, None, "", "true", "balanced", "", "", "false", "false", "false",
-        2000, 400, "true", 0,
-    )
+    opts = job_opts(diarize="true", speakers=0)
     assert opts["diarize"] is True
     assert opts["word_timestamps"] is True
 
 
 def test_word_timings_are_left_alone_when_speakers_are_not_wanted(configured):
-    opts = s.build_opts(
-        None, None, "", "true", "balanced", "", "", "false", "false", "false",
-        2000, 400, "false", 3,
-    )
+    opts = job_opts(speakers=3)
     assert opts["diarize"] is False
     assert opts["word_timestamps"] is False
     # Nobody asked, so no stale speaker count is carried into the export.
@@ -395,33 +417,19 @@ def test_word_timings_are_left_alone_when_speakers_are_not_wanted(configured):
 
 
 def test_the_speaker_count_is_clamped(configured):
-    high = s.build_opts(
-        None, None, "", "true", "balanced", "", "", "false", "false", "false",
-        2000, 400, "true", 9000,
-    )
-    low = s.build_opts(
-        None, None, "", "true", "balanced", "", "", "false", "false", "false",
-        2000, 400, "true", -5,
-    )
+    high = job_opts(diarize="true", speakers=9000)
+    low = job_opts(diarize="true", speakers=-5)
     assert high["speakers"] == s.DIARIZE_MAX_SPEAKERS
     assert low["speakers"] == 0
 
 
 def test_no_diarize_pins_the_feature_off(configured, monkeypatch):
-    monkeypatch.setattr(configured_args(), "allow_diarize", False)
-    opts = s.build_opts(
-        None, None, "", "true", "balanced", "", "", "false", "false", "true",
-        2000, 400, "true", 4,
-    )
+    monkeypatch.setattr(s.ARGS, "allow_diarize", False)
+    opts = job_opts(word_timestamps="true", diarize="true", speakers=4)
     assert opts["diarize"] is False
     assert opts["speakers"] == 0
     # The operator pinned the feature off, not word timings.
     assert opts["word_timestamps"] is True
-
-
-def configured_args() -> Any:
-    """The module's live ARGS, so a test can flip one field on it."""
-    return s.ARGS
 
 
 # --------------------------------------------------------------------------- #
@@ -439,10 +447,7 @@ def labeled_job(**opts: Any) -> dict[str, Any]:
         "filename": "standup.m4a",
         "language": "en",
         "duration": 5.0,
-        "opts": {**s.build_opts(
-            "base", "int8", "", "true", "balanced", "", "", "false", "false",
-            "true", 2000, 400, "true", 0,
-        ), **opts},
+        "opts": {**job_opts(word_timestamps="true", diarize="true"), **opts},
         "segments": [
             {"start": 0.0, "end": 2.0, "text": "morning", "speaker": 1},
             {"start": 2.0, "end": 3.5, "text": "morning", "speaker": 2},
@@ -456,10 +461,7 @@ def plain_job() -> dict[str, Any]:
         "filename": "standup.m4a",
         "language": "en",
         "duration": 3.0,
-        "opts": s.build_opts(
-            "base", "int8", "", "true", "balanced", "", "", "false", "false",
-            "false", 2000, 400,
-        ),
+        "opts": job_opts(),
         "segments": [
             {"start": 0.0, "end": 1.5, "text": "plain one"},
             {"start": 1.5, "end": 3.0, "text": "plain two"},
@@ -594,9 +596,7 @@ def sherpa_absent(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
 
-def test_a_missing_sherpa_onnx_is_reported_in_plain_words(
-    configured, monkeypatch
-):
+def test_a_missing_sherpa_onnx_is_reported_in_plain_words(configured, monkeypatch):
     """Not the child's ModuleNotFoundError several frames deep: the fix is a
     different command, not a different file.
 

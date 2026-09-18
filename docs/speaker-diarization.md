@@ -144,10 +144,17 @@ The Python surface is:
 config = sherpa_onnx.OfflineSpeakerDiarizationConfig(
     segmentation=sherpa_onnx.OfflineSpeakerSegmentationModelConfig(
         pyannote=sherpa_onnx.OfflineSpeakerSegmentationPyannoteModelConfig(
-            model=".../model.int8.onnx", window_shift_ratio=0.1)),
+            model=".../model.int8.onnx", window_shift_ratio=0.1
+        )
+    ),
     embedding=sherpa_onnx.SpeakerEmbeddingExtractorConfig(model=".../titanet.onnx"),
-    clustering=sherpa_onnx.FastClusteringConfig(num_clusters=-1, threshold=0.5),
-    min_duration_on=0.3, min_duration_off=0.5)
+    # num_clusters=-1 means "decide from the audio", which is what makes the
+    # threshold matter. 0.8 and not the 0.5 the upstream examples show: see the
+    # calibration in section 5.
+    clustering=sherpa_onnx.FastClusteringConfig(num_clusters=-1, threshold=0.8),
+    min_duration_on=0.3,
+    min_duration_off=0.5,
+)
 result = sherpa_onnx.OfflineSpeakerDiarization(config).process(audio_f32_16k)
 for r in result.sort_by_start_time():
     ...  # r.start, r.end, r.speaker
