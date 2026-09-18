@@ -281,6 +281,131 @@ def test_the_lock_is_applied_after_status_not_at_load():
 
 
 # --------------------------------------------------------------------------- #
+# The device readout
+# --------------------------------------------------------------------------- #
+
+
+def device_probe(body: str):
+    """Run `body` against the real readout functions. They are pure, so this
+    needs no DOM at all."""
+    program = (
+        "\n".join(
+            function_source(name)
+            for name in ("gb", "fmtGb", "deviceLabel", "deviceTooltip")
+        )
+        + "\nprocess.stdout.write(JSON.stringify((() => {"
+        + body
+        + "})()));"
+    )
+    return json.loads(run_node(program))
+
+
+@needs_node
+def test_the_device_cell_shows_the_card_and_how_much_of_it_is_in_use():
+    labels = device_probe(
+        """
+        return [
+          {device: "cuda", gpu: "1 CUDA device(s)",
+           device_info: {name: "NVIDIA GeForce RTX 3060",
+                         vram_total_mb: 12288, vram_used_mb: 1712}},
+          // A card we could not name: the count is still better than nothing.
+          {device: "cuda", gpu: "1 CUDA device(s)", device_info: {}},
+          // No GPU anywhere.
+          {device: "cpu", device_info: {python: "3.12.2", platform: "Linux"}},
+        ].map(deviceLabel);
+        """
+    )
+    assert labels == [
+        "NVIDIA GeForce RTX 3060 \u00b7 1.7/12.0 GB",
+        "1 CUDA device(s)",
+        "cpu",
+    ]
+
+
+@needs_node
+def test_a_named_card_without_memory_figures_still_reads_cleanly():
+    """A driver that will not report memory must not produce "\u00b7 null/null"."""
+    labels = device_probe(
+        """
+        return [
+          {device: "cuda", device_info: {name: "Some Card", vram_total_mb: null}},
+          {device: "cuda", device_info: {name: "Some Card", vram_total_mb: 8192}},
+        ].map(deviceLabel);
+        """
+    )
+    assert labels == ["Some Card", "Some Card"]
+
+
+@needs_node
+def test_the_tooltip_leads_with_why_the_gpu_is_not_being_used():
+    lines = device_probe(
+        """
+        return deviceTooltip({
+          device: "cpu", compute_type: "int8",
+          cuda: {usable: false, reason: "cublas64_12.dll could not be loaded"},
+          device_info: {name: "NVIDIA GeForce RTX 3060", vram_total_mb: 12288,
+                        vram_used_mb: 1713, process_mb: 512, driver: "610.88",
+                        compute_cap: "8.6", count: 1, python: "3.12.2",
+                        platform: "Linux"},
+        }).split("\\n");
+        """
+    )
+    assert lines[0] == "cublas64_12.dll could not be loaded"
+    assert "NVIDIA GeForce RTX 3060" in lines
+    assert "VRAM 1.7 GB used of 12.0 GB" in lines
+    assert "this server holds 0.5 GB" in lines
+    assert "driver 610.88" in lines
+    assert "compute capability 8.6" in lines
+    assert "1 CUDA device(s)" in lines
+    assert "running on cpu at int8" in lines
+    assert "Python 3.12.2 on Linux" in lines
+
+
+@needs_node
+def test_pre_pascal_compute_capability_comes_with_the_fp16_warning():
+    """Compute capability is the reason float16 is or is not a good idea, so the
+    tooltip says which rather than leaving the number to be looked up."""
+    lines = device_probe(
+        """
+        return deviceTooltip({device: "cuda", compute_type: "float16", cuda: null,
+          device_info: {name: "GTX 1050 Ti", compute_cap: "6.1"}}).split("\\n");
+        """
+    )
+    assert any("compute capability 6.1" in line and "int8" in line for line in lines)
+
+    modern = device_probe(
+        """
+        return deviceTooltip({device: "cuda", compute_type: "float16", cuda: null,
+          device_info: {name: "RTX 3060", compute_cap: "8.6"}}).split("\\n");
+        """
+    )
+    assert "compute capability 8.6" in modern, "no warning where none is needed"
+
+
+@needs_node
+def test_the_tooltip_says_so_when_the_card_could_not_be_named():
+    lines = device_probe(
+        """
+        return deviceTooltip({device: "cuda", compute_type: "float16",
+          cuda: {usable: true}, device_info: {count: 1, python: "3.12.2"}
+        }).split("\\n");
+        """
+    )
+    assert any("nvidia-smi" in line for line in lines)
+
+
+@needs_node
+def test_the_tooltip_is_harmless_on_a_machine_with_no_gpu():
+    lines = device_probe(
+        """
+        return deviceTooltip({device: "cpu", compute_type: "int8", cuda: null,
+          device_info: {python: "3.12.2", platform: "Linux"}}).split("\\n");
+        """
+    )
+    assert lines == ["running on cpu at int8", "Python 3.12.2 on Linux"]
+
+
+# --------------------------------------------------------------------------- #
 # The script parses, and the clock is right
 # --------------------------------------------------------------------------- #
 

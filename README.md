@@ -51,12 +51,11 @@ other entry point.
 exits with an explanation if it cannot. A green "Model ready." means a job will
 genuinely run.
 
-Optionally, installing PyTorch gives the status strip a proper GPU name
-("NVIDIA GeForce RTX 3080") instead of a device count. Not required:
-
-```powershell
-uv run --with torch transcribe_server.py
-```
+The status strip names the card and shows how much of it is in use, and hovering
+it gives the driver version, compute capability, how much VRAM this server is
+holding, and the interpreter. That comes from `nvidia-smi`, which ships with the
+driver. PyTorch is **not** needed for any of it — an earlier version asked you to
+install it just to learn the card's name.
 
 ffmpeg is required for decoding anything that isn't plain WAV (the tray app
 bundles it):

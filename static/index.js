@@ -34,6 +34,51 @@ async function submitToken(){
 }
 
 /* ---------- status strip ---------- */
+/* Which card, and how much of it is in use. Everything else the server knows
+   lives in the tooltip: a five-cell strip that tries to show eight things shows
+   nothing. Both functions are pure so the composition can be tested without a
+   browser. */
+function gb(mb){
+  return (mb / 1024).toFixed(1);
+}
+
+function fmtGb(mb){
+  return gb(mb) + " GB";
+}
+
+function deviceLabel(s){
+  const d = s.device_info || {};
+  const base = d.name || s.gpu || s.device;
+  // "1.7/12.0 GB" rather than "1.7 GB/12.0 GB": the unit belongs to the pair.
+  if(d.vram_total_mb && d.vram_used_mb != null)
+    return base + " \u00b7 " + gb(d.vram_used_mb) + "/" + fmtGb(d.vram_total_mb);
+  return base;
+}
+
+function deviceTooltip(s){
+  const d = s.device_info || {};
+  const cuda = s.cuda || null;
+  const lines = [];
+  // Why it is not using the GPU is the first thing anyone hovers for.
+  if(cuda && !cuda.usable) lines.push(cuda.reason || "CUDA unavailable");
+  if(d.name) lines.push(d.name);
+  if(d.vram_total_mb)
+    lines.push("VRAM " + (d.vram_used_mb != null ? fmtGb(d.vram_used_mb) + " used of " : "")
+               + fmtGb(d.vram_total_mb));
+  // Distinct from the total: this is what the server itself is holding, which
+  // is what the model cache and a running job account for.
+  if(d.process_mb != null) lines.push("this server holds " + fmtGb(d.process_mb));
+  if(d.driver) lines.push("driver " + d.driver);
+  if(d.compute_cap) lines.push("compute capability " + d.compute_cap
+    + (parseFloat(d.compute_cap) < 7 ? " \u2014 no fast fp16, use int8" : ""));
+  if(d.count) lines.push(d.count + " CUDA device(s)");
+  lines.push("running on " + s.device + " at " + s.compute_type);
+  if(d.python) lines.push("Python " + d.python + " on " + d.platform);
+  if(!d.name && cuda && cuda.usable)
+    lines.push("nvidia-smi not found, so the card is unnamed");
+  return lines.join("\n");
+}
+
 async function refreshStatus(){
   try{
     const s = await (await api("/api/status")).json();
@@ -41,10 +86,9 @@ async function refreshStatus(){
     el("main").classList.remove("locked");
     el("gate").classList.add("locked");
 
-    const cuda = s.cuda || null;
     el("lamp").className = "lamp " + (s.device === "cuda" ? "on" : "bad");
-    el("r-device").textContent = s.gpu || s.device;
-    el("r-device").title = cuda && !cuda.usable ? (cuda.reason || "CUDA unavailable") : "";
+    el("r-device").textContent = deviceLabel(s);
+    el("r-device").title = deviceTooltip(s);
     el("r-precision").textContent = s.compute_type;
     el("r-ffmpeg").textContent = s.ffmpeg ? "found" : "missing";
     el("r-ffmpeg").classList.toggle("bad", !s.ffmpeg);

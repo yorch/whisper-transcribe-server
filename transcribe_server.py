@@ -623,6 +623,215 @@ def cuda_report(
     }
 
 
+# --------------------------------------------------------------------------- #
+# Device details for the readout
+# --------------------------------------------------------------------------- #
+#
+# nvidia-smi is the only route to a readable GPU name. CTranslate2 exposes a
+# device count and the compute types it supports, and nothing else; the pretty
+# name used to come from torch, which is the dependency this project does not
+# have. nvidia-smi ships with the driver, so it is present wherever CUDA really
+# works, but it is not always on PATH -- WSL keeps it in /usr/lib/wsl/lib, which
+# is where this was noticed -- hence the candidates.
+
+GPU_QUERY = "index,name,memory.total,memory.used,driver_version,compute_cap"
+APPS_QUERY = "pid,used_memory"
+
+NVIDIA_SMI_CANDIDATES = (
+    "/usr/lib/wsl/lib/nvidia-smi",
+    "/usr/bin/nvidia-smi",
+    "/usr/local/nvidia/bin/nvidia-smi",
+    "C:\\Windows\\System32\\nvidia-smi.exe",
+    "C:\\Program Files\\NVIDIA Corporation\\NVSMI\\nvidia-smi.exe",
+)
+
+# platform_family() normalises to posix/darwin/win32, which is right for
+# branching on and reads badly in a tooltip. "Python 3.12.2 on Linux" is the
+# sentence this is for.
+PLATFORM_LABELS = {"win32": "Windows", "darwin": "macOS", "linux": "Linux"}
+
+# Refreshing the memory numbers means spawning a process (~50 ms) and the UI
+# polls status every ~1.2 s, so it is rate-limited to this. A machine with no
+# nvidia-smi never spawns anything at all.
+DEVICE_REFRESH_SECONDS = 10
+
+# Public fields only. The path to nvidia-smi lives in its own global so that it
+# cannot leak into a response by being in here.
+DEVICE_INFO: dict[str, Any] = {}
+_NVIDIA_SMI: str | None = None
+_DEVICE_LOCK = threading.Lock()
+_DEVICE_AT = 0.0
+
+
+def find_nvidia_smi() -> str | None:
+    found = shutil.which("nvidia-smi")
+    if found:
+        return found
+    for candidate in NVIDIA_SMI_CANDIDATES:
+        with contextlib.suppress(OSError):
+            if Path(candidate).is_file():
+                return candidate
+    return None
+
+
+def nvidia_smi_rows(exe: str, domain: str, fields: str) -> list[list[str]] | None:
+    """One `nvidia-smi --query-*`, split into CSV rows.
+
+    Every failure returns None rather than raising: no driver, an nvidia-smi too
+    old to know a field, a wedged driver. None of that is worth failing a status
+    poll over, and the caller already has a degraded view to fall back on.
+    """
+    try:
+        result = subprocess.run(  # noqa: S603 - literal argv, path from our own list
+            [exe, f"--query-{domain}={fields}", "--format=csv,noheader,nounits"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    return [
+        line.split(",") for line in result.stdout.strip().splitlines() if line.strip()
+    ]
+
+
+def leading_int(value: str) -> int | None:
+    """The number at the front of an nvidia-smi cell, or None for "N/A"."""
+    match = re.match(r"\s*(\d+)", value or "")
+    return int(match.group(1)) if match else None
+
+
+def parse_gpu_rows(rows: list[list[str]]) -> dict[str, Any]:
+    """Device 0's name, memory and driver, from nvidia-smi CSV.
+
+    Pure, so it can be tested against canned output -- including the parts that
+    differ between driver versions: "N/A" for a field the driver declines to
+    report, and whitespace around the commas.
+
+    Device 0 on purpose: CTranslate2 always takes device 0, so the first card is
+    the only one whose memory means anything here.
+    """
+    for row in rows:
+        if len(row) < 6 or row[0].strip() not in ("0", ""):
+            continue
+        total = leading_int(row[2])
+        used = leading_int(row[3])
+        info: dict[str, Any] = {
+            "name": row[1].strip() or None,
+            "driver": row[4].strip() or None,
+            "compute_cap": row[5].strip() or None,
+            "vram_total_mb": total,
+            "vram_used_mb": used,
+        }
+        if total is not None and used is not None:
+            info["vram_free_mb"] = total - used
+        return info
+    return {}
+
+
+def parse_app_rows(rows: list[list[str]], pid: int) -> int | None:
+    """How much VRAM `pid` holds, or None when the driver will not say.
+
+    Used memory reads "N/A" on some drivers even when the process is listed,
+    which is why this is None rather than 0: zero would be the claim "this
+    server is using no VRAM", which is a different and wrong statement.
+    """
+    for row in rows:
+        if len(row) < 2 or leading_int(row[0]) != pid:
+            continue
+        return leading_int(row[1])
+    return None
+
+
+def probe_device_details() -> dict[str, Any]:
+    """The interpreter, plus whatever the driver will say about device 0."""
+    global _NVIDIA_SMI
+    info: dict[str, Any] = {
+        "python": (
+            f"{sys.version_info.major}.{sys.version_info.minor}"
+            f".{sys.version_info.micro}"
+        ),
+        "platform": PLATFORM_LABELS.get(sys.platform, sys.platform),
+    }
+    _NVIDIA_SMI = find_nvidia_smi()
+    if not _NVIDIA_SMI:
+        return info
+    rows = nvidia_smi_rows(_NVIDIA_SMI, "gpu", GPU_QUERY)
+    if rows:
+        info["count"] = len(rows)
+        info.update(parse_gpu_rows(rows))
+    apps = nvidia_smi_rows(_NVIDIA_SMI, "compute-apps", APPS_QUERY)
+    if apps is not None:
+        info["process_mb"] = parse_app_rows(apps, os.getpid())
+    return info
+
+
+def refresh_device_memory() -> None:
+    """Re-read the numbers that move, leaving the rest of DEVICE_INFO alone."""
+    if not _NVIDIA_SMI:
+        return
+    rows = nvidia_smi_rows(_NVIDIA_SMI, "gpu", GPU_QUERY)
+    if rows:
+        DEVICE_INFO.update(parse_gpu_rows(rows))
+        DEVICE_INFO["count"] = len(rows)
+    apps = nvidia_smi_rows(_NVIDIA_SMI, "compute-apps", APPS_QUERY)
+    if apps is not None:
+        DEVICE_INFO["process_mb"] = parse_app_rows(apps, os.getpid())
+
+
+def device_details(refresh_after: float = DEVICE_REFRESH_SECONDS) -> dict[str, Any]:
+    """DEVICE_INFO, with the memory fields re-read at most every `refresh_after`.
+
+    Rate-limited because a refresh spawns a process: doing it per poll would be
+    ~50 ms of work every 1.2 s to redraw a number that barely moves. The first
+    call does the whole probe, so the startup banner and the first status poll
+    share one answer.
+    """
+    global _DEVICE_AT
+    if DEVICE_INFO and time.time() - _DEVICE_AT < refresh_after:
+        return DEVICE_INFO
+    with _DEVICE_LOCK:
+        # Re-check inside the lock: concurrent polls must not each spawn a
+        # process because they all saw a stale timestamp.
+        if DEVICE_INFO and time.time() - _DEVICE_AT < refresh_after:
+            return DEVICE_INFO
+        if DEVICE_INFO:
+            refresh_device_memory()
+        else:
+            DEVICE_INFO.update(probe_device_details())
+        _DEVICE_AT = time.time()
+    return DEVICE_INFO
+
+
+def gpu_cell(info: dict[str, Any]) -> str | None:
+    """What the Device cell shows: a name if we have one, else a count."""
+    if info.get("name"):
+        return str(info["name"])
+    count = info.get("count")
+    if count is None and CUDA:
+        count = CUDA.get("device_count")
+    return f"{count} CUDA device(s)" if count else None
+
+
+def device_banner(info: dict[str, Any]) -> str | None:
+    """The console's one-line version, or None when there is nothing to add."""
+    if not info.get("name"):
+        return None
+    parts = [str(info["name"])]
+    if info.get("vram_total_mb"):
+        parts.append(f"{info['vram_total_mb'] / 1024:.1f} GB")
+    if info.get("vram_used_mb") is not None:
+        parts.append(f"{info['vram_used_mb'] / 1024:.1f} GB used")
+    if info.get("driver"):
+        parts.append(f"driver {info['driver']}")
+    if info.get("compute_cap"):
+        parts.append(f"compute {info['compute_cap']}")
+    return ", ".join(parts)
+
+
 def cuda_diagnosis(report: dict[str, Any], wired: dict[str, Any]) -> list[str]:
     """Console-only explanation of an unusable GPU, with real paths."""
     lines = ["!  CUDA is not usable on this machine.", f"   {report['reason']}."]
@@ -2519,19 +2728,11 @@ def audit_ui() -> str:
 
 @app.get("/api/status")
 def status() -> dict[str, Any]:
-    gpu = None
-    with contextlib.suppress(Exception):
-        import ctranslate2
-
-        count = ctranslate2.get_cuda_device_count()
-        gpu = f"{count} CUDA device(s)" if count else None
-
-    with contextlib.suppress(Exception):
-        # Optional: only for the pretty device name in the status strip.
-        import torch  # pyright: ignore[reportMissingImports]
-
-        if torch.cuda.is_available():
-            gpu = torch.cuda.get_device_name(0)
+    # Served from the cached probe rather than re-queried per poll. This used to
+    # call CTranslate2 and attempt `import torch` on every request -- and a
+    # *failed* import is not cached in sys.modules, so that was a fresh sys.path
+    # scan every 1.2 s, forever, on a machine that will never have torch.
+    info = device_details()
 
     with JOBS_LOCK:
         active = sum(
@@ -2542,8 +2743,9 @@ def status() -> dict[str, Any]:
 
     return {
         "device": ARGS.device,
-        "gpu": gpu,
+        "gpu": gpu_cell(info),
         "cuda": CUDA,
+        "device_info": dict(info),
         "compute_type": ARGS.compute_type,
         "default_model": ARGS.model,
         "default_quality": ARGS.quality,
@@ -3845,6 +4047,11 @@ def main() -> None:
             else "  CPU fallback"
         )
     print(f"Device     {args.device}{detail}")
+    # The one line a bug report is going to want. device_details() probes here so
+    # the banner and the first status poll share a single answer.
+    hardware = device_banner(device_details())
+    if hardware:
+        print(f"GPU        {hardware}")
     print(f"VRAM cache {args.model_cache} model(s)")
     print(f"Speakers   {'available (identify)' if args.allow_diarize else 'disabled'}")
     print(
