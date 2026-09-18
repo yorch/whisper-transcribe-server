@@ -691,14 +691,25 @@ async function tick(){
         since = 0;
       }
       const url = "/api/jobs/" + encodeURIComponent(summary.id);
-      let full = await (await api(url + "?since=" + since)).json();
+      const detail = await api(url + "?since=" + since);
+      /* A job can vanish between the list and this read (evicted from memory, or
+         a blip answered with an error body). Rendering the body as a job would
+         key a card on undefined, which the sweep below — walking real ids —
+         could then never remove: a phantom that survives until the page is
+         reloaded. Skip the tick; the next poll no longer lists the job anyway. */
+      if(!detail.ok) continue;
+      let full = await detail.json();
+      if(!full || full.id !== summary.id) continue;
       /* Labels arrive in one batch when diarization finishes, and the tail
          cannot carry them: refetch the whole transcript once when the shape
          changes, so rows drawn without labels are rebuilt with them. */
       if(view && full.speaker_labels !== view.labeled && view.shown > 0){
         view.transcript.textContent = "";
         view.shown = 0;
-        full = await (await api(url + "?since=0")).json();
+        const again = await api(url + "?since=0");
+        if(!again.ok) continue;
+        full = await again.json();
+        if(!full || full.id !== summary.id) continue;
       }
       render(full);
     }

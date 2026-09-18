@@ -237,10 +237,10 @@ const server = {listed: true, segments: [], state: "running", progress: 0,
 async function api(path){
   polls.push(path);
   if(path === "/api/jobs")
-    return {json: async () => ({jobs: server.listed ? [{id: "abc", state: server.state,
+    return {ok: true, status: 200, json: async () => ({jobs: server.listed ? [{id: "abc", state: server.state,
       progress: server.progress, segment_count: server.segments.length}] : []})};
   const since = Number(/since=(\\d+)/.exec(path)[1]);
-  return {json: async () => ({id: "abc", filename: "a.wav", state: server.state,
+  return {ok: true, status: 200, json: async () => ({id: "abc", filename: "a.wav", state: server.state,
     progress: server.progress, opts: {model: "small"}, elapsed: 4, duration: 20,
     language: "en", segment_start: since, segment_count: server.segments.length,
     speaker_labels: server.labeled, segments: server.segments.slice(since)})};
@@ -280,6 +280,57 @@ def poll_probe(body: str) -> dict:
 
 
 @needs_node
+@needs_node
+def test_a_detail_read_that_is_not_the_listed_job_leaves_no_card():
+    """A job can vanish between the list and the detail read, and a blip can
+    answer with an error body that still parses. Rendering either as a job keys
+    a card on undefined — which the sweep, walking real ids, could never remove:
+    a phantom that survives until the page is reloaded, once per failed tick."""
+    probe = poll_probe(
+        """
+        const first = api;
+        // One good poll, so a card exists for the job that will then vanish.
+        server.segments.push({start: 0, text: "one"});
+        await tick();
+        const good = {cards: jobsBox.children.length};
+        // The job is evicted between the list and the detail read: the list
+        // still names it, the detail answers the 404 body instead.
+        api = async (path) => {
+          if(path.includes("/api/jobs/abc")) return {ok: false, json: async () => ({detail: "No such job"})};
+          return first(path);
+        };
+        await tick();
+        const refused = {cards: jobsBox.children.length,
+                         ids: jobsBox.children.map(n => n.id)};
+        // The other shape: a 200 whose body is not a job at all.
+        api = async (path) => {
+          if(path.includes("/api/jobs/abc"))
+            return {ok: true, json: async () => ({detail: "not a job"})};
+          return first(path);
+        };
+        await tick();
+        const shapeless = {cards: jobsBox.children.length,
+                           ids: jobsBox.children.map(n => n.id)};
+        // And back to health: the card is still exactly one, and still grows.
+        api = first;
+        server.segments.push({start: 3, text: "two"});
+        await tick();
+        return {good, refused, shapeless, healed: {cards: jobsBox.children.length,
+                rows: views.get(viewKey("abc")).transcript.children.length}};
+        """
+    )
+    assert probe["good"] == {"cards": 1}
+    assert probe["refused"] == {"cards": 1, "ids": ["job-abc"]}, (
+        "a 404 body must not become a card keyed on undefined"
+    )
+    assert probe["shapeless"] == {"cards": 1, "ids": ["job-abc"]}, (
+        "a body without the listed id must not become a card"
+    )
+    assert probe["healed"] == {"cards": 1, "rows": 2}, (
+        "the guard must be a skipped tick, not a dropped job"
+    )
+
+
 def test_several_jobs_at_once_each_keep_one_card():
     """The multi-file case: three jobs in different states, ten polls, and one
     card per job — with each card's transcript grown from its own tail."""
@@ -299,7 +350,7 @@ def test_several_jobs_at_once_each_keep_one_card():
         api = async (path) => {
           polls.push(path);
           if(path === "/api/jobs")
-            return {json: async () => ({jobs: [
+            return {ok: true, status: 200, json: async () => ({jobs: [
               {id: "abc", state: server.state, progress: server.progress,
                segment_count: server.segments.length},
               ...others.map(j => ({id: j.id, state: j.state, progress: j.progress,
@@ -310,7 +361,7 @@ def test_several_jobs_at_once_each_keep_one_card():
             ? {id: "abc", filename: "a.wav", state: server.state,
                progress: server.progress, segments: server.segments, labeled: server.labeled}
             : others.find(o => o.id === box);
-          return {json: async () => Object.assign(jobJson(j),
+          return {ok: true, status: 200, json: async () => Object.assign(jobJson(j),
             {segment_start: since, segments: j.segments.slice(since)})};
         };
         const counts = [];
