@@ -26,3 +26,6 @@ transcripts/
 # packaging/build-windows.ps1, not committed (uv.exe ~30 MB, ffmpeg.exe ~80 MB)
 packaging/vendor/
 packaging/output/
+
+# local scratch (dev servers, test audio)
+tmp/

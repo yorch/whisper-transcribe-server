@@ -453,3 +453,12 @@ def test_the_pages_use_different_storage_keys():
     """An app token and an audit token must not overwrite each other."""
     assert 'tokenStore("tk")' in asset("index.js")
     assert 'tokenStore("atk")' in asset("audit.js")
+
+
+def test_every_at_rule_is_one_a_browser_can_parse():
+    """`@media @media (...)` is not an error anyone sees: the browser drops the
+    whole block, and the reduced-motion rule quietly never applied."""
+    for name in ("app.css", "index.css", "audit.css"):
+        css = asset(name)
+        assert re.search(r"@(\w+)\s+@", css) is None, f"a doubled at-rule in {name}"
+    assert "@media (prefers-reduced-motion:reduce)" in asset("app.css")

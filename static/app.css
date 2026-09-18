@@ -15,7 +15,7 @@
     --display:"Bahnschrift","DIN Alternate","Roboto Condensed",system-ui,sans-serif;
     --body:"Segoe UI Variable Text","Segoe UI",system-ui,-apple-system,sans-serif;
   }
-@media @media (prefers-reduced-motion:reduce){*{transition:none!important}}
+@media (prefers-reduced-motion:reduce){*{transition:none!important}}
 
   html,body{margin:0}
 
