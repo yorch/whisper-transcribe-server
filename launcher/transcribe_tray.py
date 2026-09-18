@@ -39,7 +39,7 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 APP_NAME = "Transcription Server"
 UV_RELEASES = "https://github.com/astral-sh/uv/releases/latest/download"
@@ -87,6 +87,9 @@ def _stable_token(path: Path) -> str:
 
     Generated once with 192 bits of entropy and stored 0600. The server compares
     it with hmac.compare_digest; this only has to be unguessable and stable.
+
+    0600 is a POSIX claim: on Windows chmod only sets the read-only flag, so the
+    file there is protected by the ACL it inherits from %LOCALAPPDATA% instead.
     """
     with contextlib.suppress(OSError, ValueError):
         existing = path.read_text(encoding="utf-8").strip()
@@ -115,6 +118,24 @@ def ensure_audit_token() -> str:
     the server binds every interface by default.
     """
     return _stable_token(audit_token_path())
+
+
+# Mode bits are a POSIX idea. On Windows os.chmod only sets the file's read-only
+# attribute and st_mode reports 0666 for any writable file, so a mode-bit check
+# there fails on a machine with no problem -- and Windows is the platform the
+# launcher ships to. Such a check is reported as skipped, never as passing: a
+# PASS would claim evidence this platform cannot provide.
+POSIX_MODE_BITS = sys.platform != "win32"
+
+
+def mode_bit_skip() -> str:
+    """Why a mode-bit check cannot be made here, or "" when it can."""
+    if POSIX_MODE_BITS:
+        return ""
+    return (
+        "Windows has no mode bits (chmod sets only the read-only flag); "
+        f"verify the ACL on {launcher_dir()} with icacls"
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -589,6 +610,25 @@ def run_headless(supervisor: Supervisor) -> int:
     return 0
 
 
+# The three outcomes a self-test line can have. "skip" is first class: see
+# report_check().
+Check = Literal["skip", "pass", "fail"]
+
+
+def report_check(name: str, ok: bool, detail: str = "", skip: str = "") -> Check:
+    """Print one self-test line, and say which kind it was.
+
+    A skipped check is neither a pass nor a failure: PASS would claim evidence
+    the platform cannot provide, and FAIL would report a problem that is not
+    there. Saying so is the only honest option, and the summary counts them.
+    """
+    if skip:
+        print(f"  SKIP  {name}  {skip}")
+        return "skip"
+    print(f"  {'PASS' if ok else 'FAIL'}  {name}{'  ' + detail if detail else ''}")
+    return "pass" if ok else "fail"
+
+
 def self_test(with_server: bool = False) -> int:
     """Exercise the logic that can be checked without a display.
 
@@ -597,10 +637,13 @@ def self_test(with_server: bool = False) -> int:
     probe and the audit credential match what the server actually serves.
     """
     failures: list[str] = []
+    skipped: list[str] = []
 
-    def check(name: str, ok: bool, detail: str = "") -> None:
-        print(f"  {'PASS' if ok else 'FAIL'}  {name}{'  ' + detail if detail else ''}")
-        if not ok:
+    def check(name: str, ok: bool, detail: str = "", skip: str = "") -> None:
+        outcome = report_check(name, ok, detail, skip)
+        if outcome == "skip":
+            skipped.append(name)
+        elif outcome == "fail":
             failures.append(name)
 
     print("launcher self-test")
@@ -610,7 +653,11 @@ def self_test(with_server: bool = False) -> int:
     token = ensure_token()
     check("token is stable", ensure_token() == token)
     check("token is long enough", len(token) >= 16, f"{len(token)} chars")
-    check("token is not world readable", not (token_path().stat().st_mode & 0o077))
+    check(
+        "token is not world readable",
+        not (token_path().stat().st_mode & 0o077),
+        skip=mode_bit_skip(),
+    )
 
     audit_token = ensure_audit_token()
     check("audit token is stable", ensure_audit_token() == audit_token)
@@ -622,6 +669,7 @@ def self_test(with_server: bool = False) -> int:
     check(
         "audit token is not world readable",
         not (audit_token_path().stat().st_mode & 0o077),
+        skip=mode_bit_skip(),
     )
     check("the two tokens are distinct", audit_token != token)
     check(
@@ -658,9 +706,11 @@ def self_test(with_server: bool = False) -> int:
         check("readiness probe against a real server", ready)
         check("audit API accepts the launcher's token", audit_ready)
 
-    print(
-        f"\n{'all checks passed' if not failures else 'FAILURES: ' + ', '.join(failures)}"
-    )
+    # A skip is part of the answer, not noise: it names what went unverified.
+    summary = "FAILURES: " + ", ".join(failures) if failures else "all checks passed"
+    if skipped:
+        summary += f" ({len(skipped)} skipped: {', '.join(skipped)})"
+    print(f"\n{summary}")
     return 1 if failures else 0
 
 

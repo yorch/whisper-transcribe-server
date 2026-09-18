@@ -53,10 +53,12 @@ is a nasty surprise.
 
 The launcher never parses console output. It:
 
-1. generates a stable token (`%LOCALAPPDATA%\TranscriptionServer\token`, `0600`)
+1. generates a stable token (`%LOCALAPPDATA%\TranscriptionServer\token`)
    and a second one for the audit trail (`...\audit-token`), because the server
    would otherwise mint a fresh audit token per run and print it to a log file
-   the tray user never opens, leaving `/audit` unreachable
+   the tray user never opens, leaving `/audit` unreachable. Both are created
+   `0600`, which on POSIX is what keeps them private; Windows has no mode bits,
+   so there the files rely on the ACL they inherit from `%LOCALAPPDATA%`
 2. picks the documented port, or any free one if 8765 is taken
 3. starts `uv run --no-project transcribe_server.py --port N` with
    `TRANSCRIBE_TOKEN` and `TRANSCRIBE_AUDIT_TOKEN` set, and prepends the
