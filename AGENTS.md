@@ -45,6 +45,14 @@ with no `.venv` and no CUDA wheels; the two `tests/test_gpu.py` tests that need
 the real wheels skip there. Use it for a quick check, and the `.venv` when you
 want the wheel-dependent tests to actually execute.
 
+**That throwaway env has no `sherpa-onnx` either, and the suite must still
+pass there.** The `.venv` does have it, so a test that quietly depends on it is
+green locally and red in the clean env — which has happened twice. If a test
+exercises anything past the diarization preflight — `fetch_diarize_models_or_explain`,
+and therefore `diarize_job` and `probe_diarization` — it has to say so with the
+`sherpa_present` helper in `tests/test_diarization.py`, rather than inheriting
+whatever happens to be installed.
+
 `tests/test_ui_preview.py` covers the transcript preview. Most of it needs
 `node` (the embedded page script is parsed and its preview functions are run
 against a stub DOM) and skips without it; a browser is still the only way to
