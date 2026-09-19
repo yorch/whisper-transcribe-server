@@ -143,7 +143,8 @@ async function load(more){
     el("meta").textContent = data.total + " event(s) on " + data.date
       + " UTC \u00b7 showing " + Math.min(offset, data.total)
       + " \u00b7 retention " + (data.retain_days ? data.retain_days + " days" : "unlimited")
-      + (data.prompts_available ? "" : " \u00b7 prompts not stored");
+      + (data.prompts_available ? "" : " \u00b7 prompts not stored")
+      + (data.scan_mode === "full" ? " \u00b7 filtered (whole-file scan)" : "");
     // A sink that is failing still serves reads, so the page can -- and must --
     // say the trail it is showing has holes in it.
     const warn = el("degraded");

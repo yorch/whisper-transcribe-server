@@ -66,7 +66,7 @@ import urllib.request
 import uuid
 import wave
 from collections import OrderedDict, deque
-from collections.abc import Callable, MutableMapping
+from collections.abc import Callable, Iterator, MutableMapping
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, NamedTuple, TypeVar
@@ -952,6 +952,21 @@ class AuditPage(NamedTuple):
     has_more: bool
 
 
+class _DayLines(NamedTuple):
+    """Identity, size, mtime and non-empty line count of one day file.
+
+    Identity, size and mtime are what make a cached count safe to trust: a
+    replaced, truncated, externally grown or rewritten-in-place file no longer
+    matches and is recounted rather than served stale.
+    """
+
+    dev: int
+    ino: int
+    size: int
+    mtime_ns: int
+    lines: int
+
+
 class AuditLog:
     """Append-only JSONL trail, one file per UTC day, newest events last.
 
@@ -1018,6 +1033,10 @@ class AuditLog:
         # still text silently dropped, so it must set `degraded` too.
         self.sidecar_lost = 0
         self.sidecar_lost_total = 0
+        # Non-empty line counts per day, so an unfiltered page is a tail read
+        # rather than a full scan. The writer keeps the open day's entry in step
+        # with _bytes, so the UI's 5 s poll is always a cache hit.
+        self._day_lines: dict[str, _DayLines] = {}
 
     def degraded(self) -> bool:
         """True while the trail is not keeping up: day-file events are being
@@ -1027,6 +1046,15 @@ class AuditLog:
         return bool(self.lost) or self.full or bool(self.sidecar_lost)
 
     # -- writing ---------------------------------------------------------- #
+
+    # Bytes per backwards read. Bounds memory for ordinary records; a single
+    # record longer than this is held whole in `carry`, so the real bound is a
+    # chunk plus the largest record.
+    REVERSE_CHUNK = 64 * 1024
+    # Day files whose line count is remembered. Entries are tiny and one day is
+    # added per day, but `retain_days = 0` never prunes the files, so this map
+    # must not grow with them.
+    MAX_DAY_CACHE = 256
 
     @staticmethod
     def _chain_hash(record: dict[str, Any]) -> str:
@@ -1199,6 +1227,25 @@ class AuditLog:
         self._chain_reset = False
         self._clean = True
         self._bytes += len(blob.encode("utf-8"))
+        # Keep the open day's line count in step, so a read never rescans it.
+        # Only after the write returns, like every other commit here.
+        if self._day is not None:
+            entry = self._day_lines.get(self._day)
+            if entry is not None:
+                # Refresh from the handle: our own append moved the mtime, and a
+                # stale mtime would make the next read recount the whole day.
+                try:
+                    st = os.fstat(fh.fileno())
+                except OSError:
+                    self._day_lines.pop(self._day, None)  # cannot vouch for it
+                else:
+                    self._day_lines[self._day] = _DayLines(
+                        st.st_dev,
+                        st.st_ino,
+                        st.st_size,
+                        st.st_mtime_ns,
+                        entry.lines + 1,
+                    )
 
     def _rollback(self) -> None:
         """Cut a failed append back to the last good length.
@@ -1532,25 +1579,24 @@ class AuditLog:
             out["carry_ok"] = False  # a readable earlier day exists but was not carried
         return out
 
-    def read_page(
+    def _scan_page(
         self,
-        day: str,
+        path: Path,
         limit: int = 200,
         offset: int = 0,
         job: str | None = None,
         needle: str | None = None,
         before_line: int | None = None,
     ) -> AuditPage:
-        """One page of a day, newest first, plus a cursor for the next one.
+        """Forward scan of the whole file.
 
-        Only the requested page is held in memory: a flooded day file can be
-        enormous, and the audit UI re-reads every few seconds. `before_line`
+        The only correct reader for a filtered query -- a `needle` substring
+        cannot be answered from an index without indexing every substring -- and
+        the fallback when the file moves under the tail reader. `before_line`
         takes precedence over `offset`.
         """
         try:
-            fh = (self.dir / f"audit-{day}.jsonl").open(
-                "r", encoding="utf-8", errors="replace"
-            )
+            fh = path.open("r", encoding="utf-8", errors="replace")
         except OSError:
             return AuditPage([], 0, None, False)
         span = (
@@ -1567,8 +1613,6 @@ class AuditLog:
                 if not raw:
                     continue
                 line_no += 1
-                if before_line is not None and line_no >= before_line:
-                    continue
                 if low and low not in raw.lower():
                     continue
                 if job:
@@ -1578,7 +1622,12 @@ class AuditLog:
                         continue
                     if rec.get("job") != job and rec.get("from_job") != job:
                         continue
+                # `total` is the whole day's matching count, not this page's and
+                # not the cursor's: the tail reader answers from a line count and
+                # the two have to agree. Only collection respects before_line.
                 total += 1
+                if before_line is not None and line_no >= before_line:
+                    continue
                 if window.maxlen is not None and len(window) == window.maxlen:
                     dropped += 1  # a match older than this page
                 window.append((line_no, raw))
@@ -1589,6 +1638,218 @@ class AuditLog:
             pairs = pairs[: max(1, limit)]
         cursor = pairs[-1][0] if pairs else None
         return AuditPage([raw for _, raw in pairs], total, cursor, dropped > 0)
+
+    @staticmethod
+    def _normalize(raw: bytes) -> str:
+        """One raw line as the text reader hands it over: decoded, stripped.
+
+        The forward reader strips a *str*, which also drops the `\r` of a CRLF
+        line and Unicode spaces like NBSP. Stripping the bytes keeps both, and
+        then the two readers disagree about the same record -- and about how
+        many records there are, which is the line numbering and `total`.
+        """
+        return raw.decode("utf-8", errors="replace").strip()
+
+    def _count_lines(self, path: Path, size: int) -> int:
+        """Non-empty raw lines that start before byte `size`.
+
+        A line starting inside the snapshot counts even if it ends past it, so
+        a count taken mid-write numbers the lines the way the forward reader
+        does -- including a torn final fragment. Blankness is judged the way
+        `_normalize` judges it, or a whitespace-only line shifts every number
+        after it.
+        """
+        count = 0
+        seen = 0
+        with path.open("rb") as fh:
+            for raw in fh:
+                if seen >= size:
+                    break
+                seen += len(raw)
+                if self._normalize(raw):
+                    count += 1
+        return count
+
+    def _day_line_count(self, day: str, path: Path, st: os.stat_result) -> int:
+        """Non-empty lines in a day file, without rescanning on every poll.
+
+        Identity, size and mtime all come from the one `stat` the caller took,
+        so a cached count can never describe a different state from the one the
+        page is about to be read at.
+        """
+        size = st.st_size
+        cached = self._day_lines.get(day)
+        if (
+            cached is not None
+            and cached.size == size
+            and cached.mtime_ns == st.st_mtime_ns
+            and (cached.dev, cached.ino) == (st.st_dev, st.st_ino)
+        ):
+            return cached.lines
+        count = self._count_lines(path, size)
+        self._day_lines[day] = _DayLines(
+            st.st_dev, st.st_ino, size, st.st_mtime_ns, count
+        )
+        while len(self._day_lines) > self.MAX_DAY_CACHE:
+            victim = next((d for d in self._day_lines if d != self._day), None)
+            if victim is None:
+                break
+            self._day_lines.pop(victim)
+        return count
+
+    def _reverse_lines(self, path: Path, size: int) -> Iterator[str]:
+        """Non-empty lines of the first `size` bytes, newest first, normalized.
+
+        Splits on bytes and only decodes whole assembled lines, so a chunk
+        boundary cannot cut a character in half, and every line comes back
+        exactly as the forward reader would hand it over.
+        """
+        carry = b""
+        end = size
+        with path.open("rb") as fh:
+            while end > 0:
+                start = max(0, end - self.REVERSE_CHUNK)
+                fh.seek(start)
+                block = fh.read(end - start)
+                if len(block) != end - start:
+                    raise OSError("audit file shrank while it was being read")
+                parts = block.split(b"\n")
+                if len(parts) == 1:
+                    # No newline in this chunk: all of it is a fragment of one
+                    # line that continues to the left, so it cannot be emitted
+                    # yet -- it joins the carry and is finished by an older
+                    # chunk (or is the file's first line, at byte 0).
+                    carry = block + carry
+                    if start == 0:
+                        line = self._normalize(carry)
+                        if line:
+                            yield line
+                        carry = b""
+                    end = start
+                    continue
+                # There is a newline: parts[-1] completes the carried fragment.
+                joined = self._normalize(parts[-1] + carry)
+                if joined:
+                    yield joined
+                for part in reversed(parts[1:-1]):
+                    line = self._normalize(part)
+                    if line:
+                        yield line
+                if start > 0:
+                    carry = parts[0]
+                else:
+                    # No older chunk to finish it, so the file's first line is
+                    # whole: yielding it here is what stops it being emitted
+                    # twice, once as `carry` after the loop.
+                    first = self._normalize(parts[0])
+                    if first:
+                        yield first
+                    carry = b""
+                end = start
+
+    def _tail_page(
+        self,
+        path: Path,
+        total: int,
+        size: int,
+        limit: int,
+        offset: int,
+        before_line: int | None,
+    ) -> AuditPage:
+        """The newest page, read from the tail: O(page), not O(file)."""
+        want = max(1, limit)
+        skipped = 0 if before_line is not None else max(0, offset)
+        collected: list[tuple[int, str]] = []
+        line_no = total
+        for raw in self._reverse_lines(path, size):
+            if line_no < 1:
+                break
+            if before_line is not None and line_no >= before_line:
+                line_no -= 1
+                continue
+            if skipped > 0:
+                skipped -= 1
+                line_no -= 1
+                continue
+            collected.append((line_no, raw))
+            line_no -= 1
+            if len(collected) >= want:
+                break
+        cursor = collected[-1][0] if collected else None
+        # Unfiltered, every non-empty line matches and the oldest line in the
+        # day is number 1, so "more" is exactly "the page does not reach it".
+        return AuditPage(
+            [raw for _, raw in collected],
+            total,
+            cursor,
+            cursor is not None and cursor > 1,
+        )
+
+    @staticmethod
+    def _snapshot_held(path: Path, before: os.stat_result) -> bool:
+        """Whether the bytes read at the snapshot size are still that file.
+
+        An append is fine -- the snapshot prefix is immutable, so the page is
+        still a true prefix of the file. A different inode, a shorter file, or a
+        same-size file whose mtime moved means the bytes that were read may not
+        be the bytes that were counted.
+        """
+        try:
+            after = path.stat()
+        except OSError:
+            return False
+        if (after.st_dev, after.st_ino) != (before.st_dev, before.st_ino):
+            return False
+        if after.st_size < before.st_size:
+            return False
+        return not (
+            after.st_size == before.st_size and after.st_mtime_ns != before.st_mtime_ns
+        )
+
+    def read_page_mode(
+        self,
+        day: str,
+        limit: int = 200,
+        offset: int = 0,
+        job: str | None = None,
+        needle: str | None = None,
+        before_line: int | None = None,
+    ) -> tuple[AuditPage, str]:
+        """(page, which reader answered: "indexed" or "full").
+
+        The mode is returned rather than inferred by the caller, because the
+        tail reader can fail and fall back -- and reporting "indexed" after a
+        scan would be the one thing worse than being slow.
+        """
+        path = self.dir / f"audit-{day}.jsonl"
+        if job is None and needle is None:
+            # A deleted, shrunk or replaced file falls through to the scan:
+            # slower, but always right, and the mode says so.
+            with contextlib.suppress(OSError):
+                st = path.stat()
+                total = self._day_line_count(day, path, st)
+                page = self._tail_page(
+                    path, total, st.st_size, limit, offset, before_line
+                )
+                if self._snapshot_held(path, st):
+                    return page, "indexed"
+        return self._scan_page(path, limit, offset, job, needle, before_line), "full"
+
+    def read_page(
+        self,
+        day: str,
+        limit: int = 200,
+        offset: int = 0,
+        job: str | None = None,
+        needle: str | None = None,
+        before_line: int | None = None,
+    ) -> AuditPage:
+        """One page of a day, newest first, plus a cursor for the next one.
+
+        Unfiltered -- the UI's poll -- is served from the tail, so its cost is
+        the page rather than the file. A `job` or `needle` query still scans.
+        """
+        return self.read_page_mode(day, limit, offset, job, needle, before_line)[0]
 
     def read(
         self,
@@ -1644,6 +1905,11 @@ class AuditLog:
                 continue
             if age > timedelta(days=1):
                 self._unlink(path)
+        # Drop counts for day files that retention just removed, so the cache
+        # cannot outlive the files it describes.
+        for old in removed:
+            if old.startswith("audit-") and old.endswith(".jsonl"):
+                self._day_lines.pop(old[len("audit-") : -len(".jsonl")], None)
         return removed
 
     @staticmethod
@@ -4157,7 +4423,7 @@ def audit_query(
         raise HTTPException(status_code=400, detail="Malformed job id")
 
     needle = q.strip() or None
-    page = AUDIT.read_page(
+    page, scan_mode = AUDIT.read_page_mode(
         day,
         limit=limit,
         offset=offset,
@@ -4217,6 +4483,10 @@ def audit_query(
         # page without the drift an offset has as records land.
         "next_before_line": page.cursor,
         "has_more": page.has_more,
+        # Which reader answered: the tail (indexed) or a whole-file scan. A
+        # filter forces the scan, and so can the file moving under the tail
+        # reader, so this comes from the reader rather than from the filters.
+        "scan_mode": scan_mode,
         "retain_days": AUDIT.retain_days,
         "prompts_available": AUDIT.store_prompts,
         "last_error": AUDIT.last_error,

@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import os
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -801,6 +802,319 @@ def test_the_audit_api_hands_back_a_usable_cursor(client, configured):
     }
     assert not seen, "the two pages must not overlap"
     assert second["has_more"] is False
+
+
+# --------------------------------------------------------------------------- #
+# The tail reader (unfiltered pages must not scan the file)
+# --------------------------------------------------------------------------- #
+
+
+def test_the_tail_reader_agrees_with_the_forward_scan(tmp_path):
+    """Two readers, one contract: any drift here is a wrong transcript of events."""
+    log = fresh(tmp_path)
+    for i in range(40):
+        log.emit("e", n=i)
+    path = day_file(log)
+    day = day_of(path)
+
+    for limit in (1, 3, 10, 100):
+        for offset in (0, 1, 7, 39):
+            fast = log.read_page(day, limit=limit, offset=offset)
+            slow = log._scan_page(path, limit=limit, offset=offset)
+            assert fast == slow, (limit, offset, fast, slow)
+    for cursor in (1, 2, 20, 41):
+        fast = log.read_page(day, limit=5, before_line=cursor)
+        slow = log._scan_page(path, limit=5, before_line=cursor)
+        assert fast == slow, cursor
+
+
+def install_read_counter(monkeypatch) -> dict[str, int]:
+    """Count bytes read through Path.open, iteration included.
+
+    Iteration is the point: the forward scan reads with `for line in fh`, which
+    never goes through read(). A counter that only wrapped read() would report
+    zero for a reverted full scan and the guard would pass on the bug it exists
+    to catch. `__iter__` must be defined on the class, not left to __getattr__:
+    Python looks up special methods on the type, not the instance.
+    """
+    read_bytes = {"n": 0}
+    real_open = Path.open
+
+    class Counting:
+        def __init__(self, handle):
+            self._handle = handle
+
+        def read(self, n=-1):
+            data = self._handle.read(n)
+            read_bytes["n"] += len(data)
+            return data
+
+        def __iter__(self):
+            for line in self._handle:
+                read_bytes["n"] += len(line.encode() if isinstance(line, str) else line)
+                yield line
+
+        def seek(self, *args):
+            return self._handle.seek(*args)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            self._handle.close()
+            return False
+
+        def __getattr__(self, name):
+            return getattr(self._handle, name)
+
+    monkeypatch.setattr(
+        Path, "open", lambda self, *a, **k: Counting(real_open(self, *a, **k))
+    )
+    return read_bytes
+
+
+def test_an_unfiltered_page_does_not_read_the_whole_file(tmp_path, monkeypatch):
+    """The regression guard: revert read_page to a full scan and this fails."""
+    log = fresh(tmp_path)
+    for i in range(2000):
+        log.emit("e", n=i, pad="x" * 200)
+    path = day_file(log)
+    day = day_of(path)
+    size = path.stat().st_size
+    assert size > 4 * log.REVERSE_CHUNK, "the fixture must dwarf one chunk"
+
+    log.read_page(day, limit=5)  # warm the count, so this measures the page only
+
+    read_bytes = install_read_counter(monkeypatch)
+    page = log.read_page(day, limit=5)
+
+    assert len(page.lines) == 5 and page.total == 2000
+    assert read_bytes["n"] <= 2 * log.REVERSE_CHUNK, (
+        f"read {read_bytes['n']} bytes of a {size} byte file for one page"
+    )
+
+
+def test_the_read_counter_can_see_a_full_scan(tmp_path, monkeypatch):
+    """Validate the guard: prove it measures iteration, so it can fail."""
+    log = fresh(tmp_path)
+    for i in range(300):
+        log.emit("e", n=i, pad="x" * 200)
+    path = day_file(log)
+    size = path.stat().st_size
+
+    read_bytes = install_read_counter(monkeypatch)
+    log._scan_page(path, limit=5)
+
+    assert read_bytes["n"] >= size // 2, (
+        "a full scan must be visible to the counter, or the guard above is inert"
+    )
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        b'{"e":1}\r\n{"e":2}\r\n',  # CRLF
+        b'  {"e":1}  \n{"e":2}\n',  # padded
+        b'{"e":1}   \n',  # trailing spaces
+        b'\xc2\xa0\n{"e":1}\n',  # a line that is only NBSP
+        b'\t\n{"e":1}\n',  # a line that is only a tab
+        b'\r\n  \n{"e":1}\r\n {"e":2} \n',
+    ],
+)
+def test_the_readers_agree_on_awkward_whitespace(tmp_path, content):
+    """The scan strips a str; the tail reader must not strip bytes.
+
+    A `\r` or a Unicode space survives a bytes-strip, so the two readers would
+    disagree about the page contents and about the line count -- and the count
+    is the line numbering.
+    """
+    log = fresh(tmp_path)
+    log.dir.mkdir(parents=True, exist_ok=True)
+    path = log.dir / "audit-2026-01-01.jsonl"
+    path.write_bytes(content)
+    size = path.stat().st_size
+
+    scan = log._scan_page(path, limit=50)
+    tail = log._tail_page(path, log._count_lines(path, size), size, 50, 0, None)
+    assert tail == scan
+
+
+def test_an_in_place_same_size_rewrite_is_recounted(tmp_path):
+    """Identity alone misses an overwrite of the same inode at the same length."""
+    log = fresh(tmp_path)
+    log.dir.mkdir(parents=True, exist_ok=True)
+    path = log.dir / "audit-2026-01-01.jsonl"
+    path.write_text('{"e":0}\n{"e":1}\n')
+    assert log.read_page("2026-01-01", limit=1).total == 2
+
+    before = path.stat()
+    time.sleep(0.01)  # so a coarse-granularity clock still moves
+    with path.open("w", encoding="utf-8") as fh:
+        fh.write('{"e":"aaaaaaa"}\n')  # same inode, same bytes, one line
+    after = path.stat()
+    if after.st_mtime_ns == before.st_mtime_ns:
+        pytest.skip("filesystem mtime granularity is too coarse for this test")
+    assert after.st_size == before.st_size and after.st_ino == before.st_ino
+
+    assert log.read_page("2026-01-01", limit=1).total == 1, (
+        "a same-size in-place rewrite must not be served from the cache"
+    )
+
+
+def test_a_day_deleted_under_the_reader_returns_a_page_not_an_error(
+    tmp_path, monkeypatch
+):
+    """A concurrently pruned day must not raise out of the endpoint."""
+    log = fresh(tmp_path)
+    log.dir.mkdir(parents=True, exist_ok=True)
+    path = log.dir / "audit-2026-01-01.jsonl"
+    path.write_text('{"e":0}\n')
+    log.read_page("2026-01-01", limit=1)  # cache the count
+
+    real_stat = Path.stat
+    fired = {"done": False}
+
+    def vanishing(self, *args, **kwargs):
+        st = real_stat(self, *args, **kwargs)
+        if not fired["done"] and str(self).endswith("audit-2026-01-01.jsonl"):
+            fired["done"] = True
+            path.unlink()  # disappears between the stat and the count
+        return st
+
+    monkeypatch.setattr(Path, "stat", vanishing)
+    page, mode = log.read_page_mode("2026-01-01", limit=1)
+    assert page.lines == [] and page.total == 0
+    assert mode == "full", "a fallback must be labelled, not called indexed"
+
+
+def test_scan_mode_reports_the_reader_that_actually_answered(tmp_path, monkeypatch):
+    """The mode must come from the reader, not from whether a filter was set."""
+    log = fresh(tmp_path)
+    for i in range(3):
+        log.emit("e", n=i)
+    day = day_of(day_file(log))
+
+    page, mode = log.read_page_mode(day, limit=1)
+    assert mode == "indexed" and len(page.lines) == 1
+
+    # Pretend the snapshot went stale: the tail reader must stand down and say
+    # so, rather than answering "indexed" for a scan.
+    monkeypatch.setattr(
+        s.AuditLog, "_snapshot_held", staticmethod(lambda path, before: False)
+    )
+    page, mode = log.read_page_mode(day, limit=1)
+    assert mode == "full" and len(page.lines) == 1
+
+
+def test_the_day_count_cache_is_bounded(tmp_path, monkeypatch):
+    """retain_days = 0 never prunes the files, so the map must not grow with them."""
+    monkeypatch.setattr(s.AuditLog, "MAX_DAY_CACHE", 4)
+    log = fresh(tmp_path)
+    log.dir.mkdir(parents=True, exist_ok=True)
+    for i in range(12):
+        day = f"2026-01-{i + 1:02d}"
+        (log.dir / f"audit-{day}.jsonl").write_text('{"e":0}\n')
+        log.read_page(day, limit=1)
+    assert len(log._day_lines) <= 4
+
+
+def test_a_chunk_boundary_cannot_split_a_character(tmp_path, monkeypatch):
+    """Splitting bytes then decoding whole lines is the whole trick."""
+    log = fresh(tmp_path)
+    monkeypatch.setattr(s.AuditLog, "REVERSE_CHUNK", 7)  # split mid-character
+    text = "héllo—日本" * 3
+    for i in range(50):
+        log.emit("e", n=i, text=text)
+
+    page = log.read_page(day_of(day_file(log)), limit=50)
+    assert len(page.lines) == 50
+    for i, raw in enumerate(page.lines):
+        rec = json.loads(raw)  # would raise if a character were cut in half
+        assert rec["n"] == 49 - i
+        assert rec["text"] == text
+
+
+def test_a_torn_tail_does_not_break_the_tail_reader(tmp_path):
+    log = fresh(tmp_path)
+    for i in range(5):
+        log.emit("e", n=i)
+    path = day_file(log)
+    path.write_text(path.read_text(encoding="utf-8")[:-9])  # crash mid-record
+
+    page = log.read_page(day_of(path), limit=10)
+    assert page.total == 5, "the torn fragment is still a non-empty line"
+    assert len(page.lines) == 5
+    with pytest.raises(ValueError):
+        json.loads(page.lines[0])  # newest is the fragment; it stays raw
+    assert [json.loads(x)["n"] for x in page.lines[1:]] == [3, 2, 1, 0]
+
+
+def test_an_append_updates_the_count_without_a_rescan(tmp_path, monkeypatch):
+    """The 5 s poll must never recount: that is the point of the cache."""
+    log = fresh(tmp_path)
+    for i in range(3):
+        log.emit("e", n=i)
+    day = day_of(day_file(log))
+    assert log.read_page(day, limit=1).total == 3  # seeds the count
+
+    def boom(*args: Any, **kwargs: Any) -> int:
+        raise AssertionError("the count was recomputed after an append")
+
+    monkeypatch.setattr(s.AuditLog, "_count_lines", staticmethod(boom))
+    log.emit("e", n=3)
+    assert log.read_page(day, limit=1).total == 4
+
+
+def test_a_grown_file_is_recounted_not_served_stale(tmp_path):
+    """A second writer (or tampering) must not leave the cached count lying."""
+    log = fresh(tmp_path)
+    log.dir.mkdir(parents=True, exist_ok=True)
+    path = log.dir / "audit-2026-09-18.jsonl"
+    path.write_text('{"e":0}\n')
+    assert log.read_page("2026-09-18", limit=1).total == 1
+
+    with path.open("a", encoding="utf-8") as fh:  # not through emit()
+        fh.write('{"e":1}\n{"e":2}\n')
+    assert log.read_page("2026-09-18", limit=1).total == 3
+
+
+def test_a_same_size_replacement_is_caught_by_file_identity(tmp_path):
+    """Size alone is not enough: a replaced file can have the same length."""
+    log = fresh(tmp_path)
+    log.dir.mkdir(parents=True, exist_ok=True)
+    path = log.dir / "audit-2026-09-18.jsonl"
+    path.write_text('{"e":0}\n{"e":1}\n{"e":2}\n{"e":3}\n')
+    assert log.read_page("2026-09-18", limit=1).total == 4
+
+    other = tmp_path / "other.jsonl"
+    other.write_text('{"e":"aaaaaaa"}\n{"e":"bbbbbbb"}\n')
+    assert other.stat().st_size == path.stat().st_size, "the test proves identity"
+    os.replace(other, path)
+
+    assert log.read_page("2026-09-18", limit=1).total == 2
+
+
+def test_the_api_says_which_reader_answered(client, configured):
+    """A filter forces a scan; saying so beats looking fast and lying."""
+    configured.audit.emit("job.created", job=JOB)
+    headers = audit_headers(configured)
+    assert client.get("/api/audit", headers=headers).json()["scan_mode"] == "indexed"
+    for params in ({"q": "created"}, {"job": JOB}):
+        body = client.get("/api/audit", params=params, headers=headers).json()
+        assert body["scan_mode"] == "full"
+
+
+def test_totals_stay_exact_on_both_paths(client, configured):
+    for i in range(5):
+        configured.audit.emit("job.created", job=JOB, n=i)
+    configured.audit.emit("other")
+    headers = audit_headers(configured)
+
+    assert client.get("/api/audit", headers=headers).json()["total"] == 6
+    job_body = client.get("/api/audit", params={"job": JOB}, headers=headers).json()
+    assert job_body["total"] == 5
+    needle_body = client.get("/api/audit", params={"q": "other"}, headers=headers)
+    assert needle_body.json()["total"] == 1
 
 
 # --------------------------------------------------------------------------- #

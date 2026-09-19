@@ -301,6 +301,15 @@ Pages carry `next_before_line` and `has_more`. Hand `next_before_line` back as
 so it does not shift when new records land the way an `offset` into a
 newest-first window does. The UI's **Load more** uses it; `offset` still works.
 
+An unfiltered page is read from the *tail* of the day file, so its cost is the
+page rather than the file — the difference between a fraction of a millisecond
+and most of a second once a day file is near `audit_max_mb`. `job` and `q`
+cannot be answered from an index (a substring needs the bytes), so those still
+read the whole file; the response says which happened in `scan_mode`, and the
+page shows "filtered (whole-file scan)" so a slow query is visible rather than
+merely slow. `total` is exact either way. The first read of a day also counts
+its lines once, which is what makes the later ones cheap.
+
 Both need `x-audit-token`, which is checked separately from the app token —
 you can hand out one without the other. Leave it unset and the server mints one
 for the run and prints it, so the endpoint works with no configuration at all;

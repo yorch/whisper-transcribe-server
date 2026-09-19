@@ -211,6 +211,29 @@ launcher/transcribe_tray.py --self-test --with-server   # also probes a real ser
 - **Paging uses `before_line`, a front-anchored line number.** An `offset` into a
   newest-first window shifts when records land and duplicates or skips rows.
   `read()` keeps its old 2-tuple shape; new callers want `read_page()`.
+- **An unfiltered page is read from the tail, and that must not regress to a
+  scan.** `read_page` serves `job is None and needle is None` with
+  `_reverse_lines` (bounded chunks) plus `_day_line_count`, and only a filter or
+  a file that moves under the reader falls through to `_scan_page`. The UI polls
+  every 5 s, so a scan here is a full-file read every 5 s at the 1 GB cap.
+  `tests/test_audit_chain.py::test_an_unfiltered_page_does_not_read_the_whole_file`
+  fails if it comes back, and `test_the_tail_reader_agrees_with_the_forward_scan`
+  makes the two readers prove they agree rather than trusting the fast one.
+- **The reverse reader splits bytes and decodes whole lines.** `_reverse_lines`
+  must never decode a chunk (a chunk boundary lands mid-character once records
+  hold non-ASCII) and must not defer `parts[0]` as `carry` once `start == 0`,
+  which emits the file's first line twice. Both were real bugs found by the
+  tests; the chunk-size sweep in
+  `test_a_chunk_boundary_cannot_split_a_character` is the guard.
+- **`total` is day-absolute on both readers.** `_scan_page` counts every matching
+  line regardless of `before_line`, so the scan and the tail reader cannot report
+  different totals for the same day. Only *collection* respects the cursor, and
+  `has_more` for an unfiltered page is exactly `cursor > 1`.
+- **The line-count cache is keyed by identity, not just size.** `_day_lines`
+  holds `(st_dev, st_ino, size, lines)`; dropping the identity would let a
+  same-size replacement serve a stale count. `_append` bumps the open day's entry
+  only after a successful write, and `prune` drops entries for the files it
+  deletes.
 - **Never return an audit token, and never let the app token reach the trail's
   detail.** `audit_degraded` on `/api/status` is a boolean on purpose: the
   `last_error` text and the audit dir stay behind the audit credential.
