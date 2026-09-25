@@ -243,6 +243,27 @@ launcher/transcribe_tray.py --self-test --with-server   # also probes a real ser
 - **`audit_max_mb` is a storage bound, not a rate limit.** Hitting it writes one
   `audit.full` marker and then stops recording for that day, which is only
   acceptable because `degraded`/`full` surface it. Do not make the stop silent.
+- **`audit_gated()` is the one predicate for the audit credential.** Three sites
+  in the middleware consult it: the token gate, the generic read/rejection
+  logging and the `Cache-Control` tuple. Extending one and not the others is how
+  `/stats` would log its own polls as `api.read` -- into the numbers it is
+  displaying. `tests/test_stats.py` pins the predicate and the no-`api.read`
+  behaviour.
+- **Statistics are `fold`ed, never re-derived.** The `fold()` in the Statistics
+  section is the single definition of what a record means, used both for the
+  live session counters and for a day read back from the trail. A second
+  definition is how the two views start disagreeing.
+- **`job.done` must stay self-describing** (`relabel_of`/`retry_of`). A relabel
+  reuses the original job's `duration` without transcribing anything, so a fold
+  of `duration` that cannot tell the passes apart double-counts relabelled
+  audio; a retry re-transcribes, so it is a pass but not another recording.
+- **`/api/stats` is `def`, not `async def`.** Folding a day is file work; on the
+  event loop it would stall every poll, the same failure the diarization
+  subprocess exists to avoid.
+- **The stored aggregate is derived data.** `stats-<day>.json` is read back only
+  when it matches its day file's identity, size, mtime and schema, and it holds
+  no text. The trail is the only source of truth; never let the summary become
+  one, and never trust a field it did not have.
 - **Refusals are logged before authentication**, so anything logged on that path
   goes through `audit_rejection` (burst-collapsed), never `audit` directly.
 - `--preload` must *prove* the device can encode, not merely load a model. A

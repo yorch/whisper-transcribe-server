@@ -967,6 +967,22 @@ class _DayLines(NamedTuple):
     lines: int
 
 
+class _DayStats:
+    """A folded aggregate for one day, and how far into the file it reaches.
+
+    Mutable because the current day grows: `size` is the offset just past the
+    last complete line folded, so the next request reads only what was appended.
+    """
+
+    __slots__ = ("dev", "ino", "size", "stats")
+
+    def __init__(self, dev: int, ino: int, size: int, stats: dict[str, Any]) -> None:
+        self.dev = dev
+        self.ino = ino
+        self.size = size
+        self.stats = stats
+
+
 class AuditLog:
     """Append-only JSONL trail, one file per UTC day, newest events last.
 
@@ -1033,10 +1049,17 @@ class AuditLog:
         # still text silently dropped, so it must set `degraded` too.
         self.sidecar_lost = 0
         self.sidecar_lost_total = 0
+        # This run's totals, folded as events are emitted. See Stats.
+        self.session = Stats()
         # Non-empty line counts per day, so an unfiltered page is a tail read
         # rather than a full scan. The writer keeps the open day's entry in step
         # with _bytes, so the UI's 5 s poll is always a cache hit.
         self._day_lines: dict[str, _DayLines] = {}
+        # Folded aggregates per day. A past day is also written beside the trail
+        # (stats-<day>.json) so it is folded once ever rather than once per
+        # restart; today never is, because it changes with every append.
+        self._day_stats: dict[str, _DayStats] = {}
+        self._stats_lock = threading.Lock()
 
     def degraded(self) -> bool:
         """True while the trail is not keeping up: day-file events are being
@@ -1288,6 +1311,9 @@ class AuditLog:
         print(f"!  Audit {what} failed ({exc}); continuing without it")
 
     def emit(self, event: str, force: bool = False, **fields: Any) -> None:
+        # Before the `enabled` check on purpose: the session view counts what
+        # this process did, which under --no-audit is the only record there is.
+        self.session.record(event, fields)
         if not self.enabled and not force:
             return
         record: dict[str, Any] = {
@@ -1336,6 +1362,13 @@ class AuditLog:
                         if self.lost:
                             marker["lost"] = self.lost
                         self._append(fh, marker)
+                        # The marker is written through _append, not emit, so it
+                        # is folded here; `lost` is left out because the event
+                        # above already carried it.
+                        self.session.record(
+                            "audit.full",
+                            {"max_mb": self.max_mb, "bytes": marker["bytes"]},
+                        )
                         self.suppressed += 1
                         self.lost = 0
                         return
@@ -1864,6 +1897,148 @@ class AuditLog:
         page = self.read_page(day, limit=limit, offset=offset, job=job, needle=needle)
         return page.lines, page.total
 
+    # -- stats ------------------------------------------------------------ #
+
+    def summary_path(self, day: str) -> Path:
+        """Where a day's folded aggregate is kept, beside the trail itself."""
+        return self.dir / f"stats-{day}.json"
+
+    @staticmethod
+    def _fold_bytes(fh: Any, agg: dict[str, Any], start: int, end: int) -> int:
+        """Fold whole records in [start, end); return the offset of the next one.
+
+        Stops at the last newline, so a record still being written is left for
+        the next call rather than folded half-formed. Unparsable lines are
+        skipped: the trail already tolerates a torn line, and a summary must not
+        be the thing that raises because of one.
+        """
+        fh.seek(start)
+        block = fh.read(end - start)
+        cut = block.rfind(b"\n")
+        if cut < 0:
+            return start
+        for raw in block[:cut].split(b"\n"):
+            raw = raw.strip()
+            if not raw:
+                continue
+            try:
+                rec = json.loads(raw)
+            except ValueError:
+                continue
+            if isinstance(rec, dict):
+                name = rec.get("event")
+                if isinstance(name, str):
+                    fold(agg, name, rec)
+        return start + cut + 1
+
+    def _load_summary(self, day: str, st: os.stat_result) -> dict[str, Any] | None:
+        """A stored summary for exactly this file, or None to refold."""
+        try:
+            payload = json.loads(self.summary_path(day).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        if not isinstance(payload, dict) or payload.get("schema") != STATS_SCHEMA:
+            return None
+        if (
+            payload.get("dev"),
+            payload.get("ino"),
+            payload.get("size"),
+            payload.get("mtime_ns"),
+        ) != (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns):
+            return None
+        return coerce_stats(payload.get("stats"))
+
+    def _save_summary(self, day: str, st: os.stat_result, agg: dict[str, Any]) -> None:
+        """Write a day's aggregate atomically, stamped to the file it describes."""
+        tmp: Path | None = None
+        try:
+            self.dir.mkdir(parents=True, exist_ok=True)
+            target = self.summary_path(day)
+            tmp = target.with_name(f".{target.name}.tmp")
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(
+                    {
+                        "schema": STATS_SCHEMA,
+                        "day": day,
+                        "dev": st.st_dev,
+                        "ino": st.st_ino,
+                        "size": st.st_size,
+                        "mtime_ns": st.st_mtime_ns,
+                        "stats": agg,
+                    },
+                    fh,
+                )
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, target)
+            tmp = None
+        except Exception as exc:  # noqa: BLE001
+            self._warn_once("summary write", exc)
+            if tmp is not None:
+                with contextlib.suppress(OSError):
+                    tmp.unlink()
+
+    def day_summary(self, day: str) -> dict[str, Any]:
+        """Fold one day, from a stored summary or from the trail.
+
+        The trail stays the only source of truth: anything that does not parse,
+        does not match the day file's identity/size/mtime, or was written by an
+        older schema is discarded and refolded. Today is folded from an in-memory
+        running total and never stored, because it changes with every append.
+        """
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", day):
+            # The day reaches a filename below, so it is checked here too rather
+            # than trusting every caller (and every future one) to have done it.
+            return blank_stats()
+        path = self.dir / f"audit-{day}.jsonl"
+        try:
+            st = path.stat()
+        except OSError:
+            return blank_stats()
+        current = day == datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        with self._stats_lock:
+            cached = self._day_stats.get(day)
+            if cached is not None and (cached.dev, cached.ino) == (
+                st.st_dev,
+                st.st_ino,
+            ):
+                if cached.size <= st.st_size:
+                    # Appended since last time: fold only the new bytes. A read
+                    # that fails leaves the running total where it was, which is
+                    # stale but honest, and never raises into the endpoint.
+                    with contextlib.suppress(OSError):
+                        with path.open("rb") as fh:
+                            cached.size = self._fold_bytes(
+                                fh, cached.stats, cached.size, st.st_size
+                            )
+                    if not current:
+                        self._save_summary(day, st, cached.stats)
+                    return cached.stats
+                # The file is shorter than what we folded: refold from scratch.
+            stored = None if current else self._load_summary(day, st)
+            if stored is not None:
+                self._day_stats[day] = _DayStats(
+                    st.st_dev, st.st_ino, st.st_size, stored
+                )
+            else:
+                agg = blank_stats()
+                try:
+                    with path.open("rb") as fh:
+                        end = self._fold_bytes(fh, agg, 0, st.st_size)
+                except OSError:
+                    return agg
+                self._day_stats[day] = _DayStats(st.st_dev, st.st_ino, end, agg)
+                stored = agg
+                if not current:
+                    self._save_summary(day, st, agg)
+            while len(self._day_stats) > self.MAX_DAY_CACHE:
+                victim = next(iter(self._day_stats))
+                if victim == day:
+                    break
+                self._day_stats.pop(victim)
+            return stored
+
     # -- retention -------------------------------------------------------- #
 
     def prune(self) -> list[str]:
@@ -1909,7 +2084,13 @@ class AuditLog:
         # cannot outlive the files it describes.
         for old in removed:
             if old.startswith("audit-") and old.endswith(".jsonl"):
-                self._day_lines.pop(old[len("audit-") : -len(".jsonl")], None)
+                day_name = old[len("audit-") : -len(".jsonl")]
+                self._day_lines.pop(day_name, None)
+                self._day_stats.pop(day_name, None)
+                # The summary is derived, so it goes when its day does.
+                self._unlink(self.summary_path(day_name))
+        for path in self.dir.glob(".stats-*.json.tmp"):
+            self._unlink(path)
         return removed
 
     @staticmethod
@@ -2106,6 +2287,178 @@ def store_speaker_names(job_id: str, filename: str, names: dict[str, str]) -> No
             .replace("+00:00", "Z"),
         },
     )
+
+
+# --------------------------------------------------------------------------- #
+# Statistics
+# --------------------------------------------------------------------------- #
+
+# Bumped when the aggregate's shape changes, so a summary persisted by an older
+# build is refolded rather than misread.
+STATS_SCHEMA = 1
+
+
+def blank_stats() -> dict[str, Any]:
+    """One empty aggregate.
+
+    Counts, durations and byte totals only -- no filenames, no prompt text, no
+    speaker names -- so a summary can never become a second place that text
+    lives.
+    """
+    return {
+        "events": 0,
+        "recordings": 0,  # job.done, first pass: a recording we were asked to do
+        "passes": 0,  # job.done that transcribed, first pass or retry
+        "relabels": 0,  # job.done for a speaker pass over a stored transcript
+        "failed": 0,
+        "diarize_failed": 0,
+        "cancelled": 0,
+        "rejected": 0,
+        "exports": 0,
+        "diarized": 0,
+        "audio_seconds": 0.0,  # duration over every pass that transcribed
+        "recording_seconds": 0.0,  # duration over first passes only
+        "processing_seconds": 0.0,  # elapsed over passes that transcribed
+        "uploaded_bytes": 0,
+        "segments": 0,
+        "lost": 0,  # events the trail itself dropped
+        "cap_hits": 0,
+        "sidecars_pruned": 0,
+        "suppressed": 0,  # refusals and repeats collapsed into a summary
+        "models": {},
+        "languages": {},
+        "security": {},
+    }
+
+
+def fold(agg: dict[str, Any], event: str, record: dict[str, Any]) -> None:
+    """Fold one audit record into an aggregate, in place.
+
+    One function for both views -- the live session counters and a day read back
+    from the trail -- so the two can never disagree about what a record means.
+    Deliberately tolerant: an unknown event still counts, and a malformed field
+    falls back rather than raising, because this also runs on the write path.
+    """
+    agg["events"] += 1
+    if event == "job.created":
+        agg["uploaded_bytes"] += as_int(record.get("bytes"), 0)
+    elif event == "job.done":
+        # A relabel replays a stored transcript through the speaker pass: it
+        # transcribes nothing, so its duration must never be added to an audio
+        # total. A retry does transcribe, so it is a pass but not a new
+        # recording. Both marks ride the record (relabel_of/retry_of); without
+        # them this one fold would count relabelled audio twice.
+        relabel = bool(record.get("relabel_of"))
+        retry = bool(record.get("retry_of"))
+        seconds = as_float(record.get("duration"), 0.0)
+        agg["segments"] += as_int(record.get("segments"), 0)
+        if relabel:
+            agg["relabels"] += 1
+            return
+        agg["passes"] += 1
+        agg["audio_seconds"] += seconds
+        agg["processing_seconds"] += as_float(record.get("elapsed"), 0.0)
+        if not retry:
+            agg["recordings"] += 1
+            agg["recording_seconds"] += seconds
+        model = record.get("model")
+        if isinstance(model, str) and model:
+            agg["models"][model] = agg["models"].get(model, 0) + 1
+        language = record.get("language")
+        if isinstance(language, str) and language:
+            agg["languages"][language] = agg["languages"].get(language, 0) + 1
+    elif event == "job.error":
+        agg["failed"] += 1
+    elif event == "job.diarize_failed":
+        agg["diarize_failed"] += 1
+    elif event == "job.cancelled":
+        agg["cancelled"] += 1
+    elif event in ("job.rejected", "job.retry_rejected", "job.relabel_rejected"):
+        agg["rejected"] += 1
+    elif event == "transcript.exported":
+        agg["exports"] += 1
+    elif event == "job.diarized":
+        agg["diarized"] += 1
+    elif event == "audit.full":
+        agg["cap_hits"] += 1
+    elif event == "audit.sidecars_pruned":
+        agg["sidecars_pruned"] += as_int(record.get("removed"), 0)
+    elif event.startswith("security."):
+        agg["security"][event] = agg["security"].get(event, 0) + 1
+        agg["suppressed"] += as_int(record.get("suppressed"), 0)
+    if record.get("lost"):
+        agg["lost"] += as_int(record["lost"], 0)
+
+
+def coerce_stats(raw: Any) -> dict[str, Any]:
+    """A validated aggregate built from an untrusted dict (a stored summary).
+
+    The persisted summary is derived data on a disk anyone can edit, so nothing
+    in it is trusted: an unknown or wrongly-typed key falls back to the blank
+    value, and a size mismatch upstream means it is refolded from the trail
+    anyway. Worst case a bad file misreports until the next fold; it can never
+    raise, and it can never add a key the aggregate does not have.
+    """
+    out = blank_stats()
+    if not isinstance(raw, dict):
+        return out
+    for key, blank in out.items():
+        value = raw.get(key)
+        if isinstance(blank, float):
+            out[key] = as_float(value, 0.0)
+        elif isinstance(blank, int):
+            out[key] = as_int(value, 0)
+        elif isinstance(blank, dict) and isinstance(value, dict):
+            out[key] = {
+                str(k): as_int(v, 0)
+                for k, v in value.items()
+                if isinstance(v, (int, float))
+            }
+    return out
+
+
+def merge_stats(into: dict[str, Any], other: dict[str, Any]) -> dict[str, Any]:
+    """Add one aggregate into another, in place.
+
+    Type-guarded on both sides, so a key of the wrong shape can neither raise
+    nor invent a field the aggregate does not have.
+    """
+    for key, value in other.items():
+        target = into.get(key)
+        if isinstance(target, dict) and isinstance(value, dict):
+            for name, count in value.items():
+                target[name] = target.get(name, 0) + count
+        elif isinstance(target, (int, float)) and isinstance(value, (int, float)):
+            into[key] = target + value
+    return into
+
+
+class Stats:
+    """Aggregate for one process run, fed from AuditLog.emit.
+
+    The fold runs before emit's `enabled` check, so it counts what the process
+    did even under --no-audit, where nothing reaches a file. That is what makes
+    "this session" and "the retained days" genuinely different views rather
+    than two readings of the same file.
+    """
+
+    def __init__(self) -> None:
+        self.since = time.time()
+        self.total = blank_stats()
+        self._lock = threading.Lock()
+
+    def record(self, event: str, fields: dict[str, Any]) -> None:
+        """Fold one event. Never raises: the write path must not fail here."""
+        with contextlib.suppress(Exception):
+            with self._lock:
+                fold(self.total, event, fields)
+
+    def snapshot(self) -> dict[str, Any]:
+        with self._lock:
+            out = dict(self.total)
+            for key in ("models", "languages", "security"):
+                out[key] = dict(out[key])
+            return out
 
 
 def new_job(filename: str, path: Path, opts: dict[str, Any]) -> str:
@@ -3256,6 +3609,12 @@ def label_and_finish(
         duration=round(duration, 2),
         segments=len(collected),
         elapsed=round(time.time() - (job.get("started") or time.time()), 1),
+        # Self-describing pass: a relabel reuses the original duration but does
+        # not transcribe, and a retry transcribes the same source again. Without
+        # these the record cannot be classified on its own, and any aggregate of
+        # `duration` counts relabelled audio twice.
+        relabel_of=job.get("relabel_of"),
+        retry_of=job.get("retry_of"),
     )
 
 
@@ -3690,12 +4049,26 @@ def refuse(detail: str, status: int) -> Response:
     return hardened(JSONResponse({"detail": detail}, status_code=status))
 
 
+# Paths served behind the audit credential. One list, because three places in
+# the middleware have to agree about it -- the token gate, the generic
+# read/rejection logging, and the Cache-Control header. Extending one and not
+# the others is how a page ends up logging its own polls as `api.read`, straight
+# into the numbers it is displaying.
+AUDIT_PATHS = ("/api/audit", "/api/stats")
+
+
+def audit_gated(path: str) -> bool:
+    """Whether a request path is served behind the audit credential."""
+    return path.startswith(AUDIT_PATHS)
+
+
 def audit_api_mode(args: argparse.Namespace) -> str:
     """How the audit API is reachable: 'open', 'token' or 'off'.
 
-    One rule, three consumers: the middleware gate, the mode the page renders
-    server-side, and the startup record. 'off' is only reachable when ARGS was
-    built by hand -- main() always leaves either a token or an explicit opt-out.
+    One rule, four consumers: the middleware gate, the two pages that render
+    their own mode, and the startup record. 'off' is only reachable when ARGS
+    was built by hand -- main() always leaves either a token or an explicit
+    opt-out.
     """
     if args.audit_open:
         return "open"
@@ -3731,7 +4104,7 @@ async def guard(request: Request, call_next):
             audit_rejection("security.cross_site", request, reason=site, status=403)
             return refuse("Cross-site request refused", 403)
 
-        if path.startswith("/api/audit"):
+        if audit_gated(path):
             # The audit trail has its own credential, deliberately independent
             # of the app token: one can be handed out without the other.
             # --audit-open is the only way past that gate, and it stays
@@ -3807,12 +4180,12 @@ async def guard(request: Request, call_next):
     # *old* script: a Transcribe button that did nothing, and a bug fixed in
     # the script still happening, with nothing on screen to say which version
     # was running. no-cache (not no-store) keeps the 304 revalidation cheap.
-    if path in ("/", "/audit") or path.startswith("/static/"):
+    if path in ("/", "/audit", "/stats") or path.startswith("/static/"):
         response.headers["Cache-Control"] = "no-cache"
 
     # Polling endpoints are chatty, so reads are opt-in. Everything that
     # changes state or moves a transcript out logs itself at the source.
-    if path.startswith("/api/") and not path.startswith("/api/audit"):
+    if path.startswith("/api/") and not audit_gated(path):
         if response.status_code >= 400:
             if not getattr(request.state, "audit_handled", False):
                 audit(
@@ -3837,22 +4210,34 @@ def index() -> str:
     return static_asset("index.html")
 
 
-@app.get("/audit", response_class=HTMLResponse)
-def audit_ui() -> str:
-    """The page is public like `/`; the data behind it needs the audit token,
-    unless the operator opened it with --audit-open. The mode is rendered
-    server-side so a switched-off API cannot look like a rejected token."""
+def page_with_mode(name: str) -> str:
+    """Render a page whose data is behind the audit credential.
+
+    One place for the mode substitution, because both pages must agree: the gate
+    ships visible in token mode so it works with no script at all, and every
+    other mode starts hidden -- the alternative is a visible prompt for a token
+    that does not exist, which is the bug /audit used to have. relock() takes
+    over from there, for a server restarted mid-session.
+    """
     mode = audit_api_mode(ARGS)
-    # The gate ships visible, so token mode works with no script at all. Every
-    # other mode starts with it hidden: the alternative is a visible prompt for
-    # a token that does not exist, which is the bug this page used to have.
-    # relock() takes over from there, for a server that restarts mid-session.
     return (
-        static_asset("audit.html")
+        static_asset(name)
         .replace("__MODE__", mode)
         .replace("__GATE_CLASS__", "gate" if mode == "token" else "gate locked")
         .replace("__OFF_CLASS__", "gate" if mode == "off" else "gate locked")
     )
+
+
+@app.get("/audit", response_class=HTMLResponse)
+def audit_ui() -> str:
+    """The page is public like `/`; the data behind it needs the audit token."""
+    return page_with_mode("audit.html")
+
+
+@app.get("/stats", response_class=HTMLResponse)
+def stats_ui() -> str:
+    """Public shell, like /audit; the totals behind it need the audit token."""
+    return page_with_mode("stats.html")
 
 
 @app.get("/api/status")
@@ -4090,6 +4475,9 @@ def retry_job(
         )
 
     new_id = new_job(filename=old["filename"], path=source, opts=opts)
+    # Provenance on the job, so its job.done can say it re-transcribed this
+    # source rather than being the first pass at it.
+    patch_job(new_id, retry_of=job_id)
     JOB_QUEUE.put(new_id)
     audit(
         "job.retried",
@@ -4569,6 +4957,59 @@ def audit_prompt(job_id: str, request: Request) -> dict[str, Any]:
         raise HTTPException(status_code=404, detail="No stored prompt for that job")
     audit("audit.prompt_read", request, job=job_id)
     return side
+
+
+def stats_public(agg: dict[str, Any]) -> dict[str, Any]:
+    """An aggregate as the page consumes it: floats rounded, nothing added."""
+    out = dict(agg)
+    for key, value in out.items():
+        if isinstance(value, float):
+            out[key] = round(value, 2)
+    return out
+
+
+@app.get("/api/stats")
+def stats(request: Request) -> dict[str, Any]:
+    """Totals over this run, and over every retained day.
+
+    Behind the audit credential, like the trail it is derived from. Counts,
+    durations and byte totals only -- no filenames, no prompt text, no speaker
+    names -- so it can never become a way around the two-token split.
+
+    Sync on purpose: folding a day is file work, and an `async def` here would
+    run it in the event loop and stall every poll, exactly like the diarization
+    deadlock this project already guards against.
+    """
+    if AUDIT is None:
+        raise HTTPException(status_code=503, detail="Audit trail unavailable")
+    days = AUDIT.dates()  # newest first
+    # Logged before answering: reading the trail leaves a trace, and that trace
+    # lands in today's numbers -- so today's row moves when this is called, and
+    # the page must not present it as settled.
+    audit("audit.stats_read", request, days=len(days), recording=AUDIT.enabled)
+    rows: list[dict[str, Any]] = []
+    retained = blank_stats()
+    for day in days:
+        agg = AUDIT.day_summary(day)
+        merge_stats(retained, agg)
+        rows.append({"date": day, **stats_public(agg)})
+    rows.reverse()  # oldest first: a table or a chart reads left to right
+    return {
+        "session": stats_public(AUDIT.session.snapshot()),
+        "session_since": AUDIT.session.since,
+        "days": rows,
+        "retained": stats_public(retained),
+        # False under --no-audit: the session above still counts what this
+        # process did, but there are no files, so there is no history at all.
+        "recording": AUDIT.enabled,
+        "retain_days": AUDIT.retain_days,
+        "max_mb": AUDIT.max_mb,
+        "max_sidecars": AUDIT.max_sidecars,
+        "lost_total": AUDIT.lost_total,
+        "sidecar_lost_total": AUDIT.sidecar_lost_total,
+        "degraded": AUDIT.degraded(),
+        "full": AUDIT.full,
+    }
 
 
 # --------------------------------------------------------------------------- #
