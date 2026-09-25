@@ -291,10 +291,20 @@ def test_a_failed_stats_call_does_not_double_log(client, configured, monkeypatch
 
 
 def test_stats_says_so_when_recording_is_off(client, configured):
+    """--no-audit still writes one forced marker.
+
+    So the retained view is not empty: it holds exactly that marker, and the
+    response has to say recording is off rather than let one row imply history.
+    """
     configured.audit.enabled = False
+    configured.audit.emit("server.started", force=True, audit=False)
+
     body = client.get("/api/stats", headers=audit_headers(configured)).json()
+
     assert body["recording"] is False
-    assert body["days"] == []
+    assert len(body["days"]) == 1
+    assert body["days"][0]["recordings"] == 0, "a marker is not a recording"
+    assert body["retained"]["events"] == 1
 
 
 def test_the_stats_page_renders_the_mode_the_server_runs(client, configured):
