@@ -411,8 +411,11 @@ two-token split.
 
 Two views, deliberately distinguishable:
 
-- **This run** is counted in process, from the moment the server started. It is
-the only view that exists under `--no-audit`, where nothing reaches a file.
+- **This run** is counted in process, from the moment the server started, so it
+is the only view that can show anything under `--no-audit`. There, the sole
+file is the one `server.started` marker that keeps a disabled trail
+distinguishable from a server that was simply down, so the retained view shows
+that one row and nothing else.
 - **Retained days** is folded from the trail, so it survives restarts and covers
 exactly the retention window — nothing older, because nothing older is kept.
 

@@ -4960,11 +4960,20 @@ def audit_prompt(job_id: str, request: Request) -> dict[str, Any]:
 
 
 def stats_public(agg: dict[str, Any]) -> dict[str, Any]:
-    """An aggregate as the page consumes it: floats rounded, nothing added."""
-    out = dict(agg)
-    for key, value in out.items():
+    """An aggregate as the page consumes it: floats rounded, nothing added.
+
+    Deep enough for the nested maps: the caller may be serialising this while
+    another request folds the same cached aggregate, and a shared inner dict
+    would let the response change under the encoder.
+    """
+    out: dict[str, Any] = {}
+    for key, value in agg.items():
         if isinstance(value, float):
             out[key] = round(value, 2)
+        elif isinstance(value, dict):
+            out[key] = dict(value)
+        else:
+            out[key] = value
     return out
 
 
