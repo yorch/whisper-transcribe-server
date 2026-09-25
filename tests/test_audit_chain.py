@@ -944,13 +944,15 @@ def test_an_in_place_same_size_rewrite_is_recounted(tmp_path):
     log = fresh(tmp_path)
     log.dir.mkdir(parents=True, exist_ok=True)
     path = log.dir / "audit-2026-01-01.jsonl"
-    path.write_text('{"e":0}\n{"e":1}\n')
+    # Bytes, not text: write_text translates \n to \r\n on Windows, which would
+    # make the two fixtures different lengths and the test pointless.
+    path.write_bytes(b'{"e":0}\n{"e":1}\n')
     assert log.read_page("2026-01-01", limit=1).total == 2
 
     before = path.stat()
     time.sleep(0.01)  # so a coarse-granularity clock still moves
-    with path.open("w", encoding="utf-8") as fh:
-        fh.write('{"e":"aaaaaaa"}\n')  # same inode, same bytes, one line
+    with path.open("wb") as fh:
+        fh.write(b'{"e":"aaaaaaa"}\n')  # same inode, same bytes, one line
     after = path.stat()
     if after.st_mtime_ns == before.st_mtime_ns:
         pytest.skip("filesystem mtime granularity is too coarse for this test")
@@ -1083,11 +1085,12 @@ def test_a_same_size_replacement_is_caught_by_file_identity(tmp_path):
     log = fresh(tmp_path)
     log.dir.mkdir(parents=True, exist_ok=True)
     path = log.dir / "audit-2026-09-18.jsonl"
-    path.write_text('{"e":0}\n{"e":1}\n{"e":2}\n{"e":3}\n')
+    # Bytes again: the whole point is that both files are the same length.
+    path.write_bytes(b'{"e":0}\n{"e":1}\n{"e":2}\n{"e":3}\n')
     assert log.read_page("2026-09-18", limit=1).total == 4
 
     other = tmp_path / "other.jsonl"
-    other.write_text('{"e":"aaaaaaa"}\n{"e":"bbbbbbb"}\n')
+    other.write_bytes(b'{"e":"aaaaaaa"}\n{"e":"bbbbbbb"}\n')
     assert other.stat().st_size == path.stat().st_size, "the test proves identity"
     os.replace(other, path)
 

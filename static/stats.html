@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>Statistics</title>
+<link rel="stylesheet" href="/static/app.css">
+<link rel="stylesheet" href="/static/stats.css">
+</head>
+<body data-mode="__MODE__">
+<div class="wrap">
+  <div class="topbar">
+    <h1>Statistics</h1>
+    <a class="back" href="/">&larr; Transcription</a>
+    <a class="back" href="/audit">Audit trail &rarr;</a>
+  </div>
+  <p class="sub">What this server has transcribed, and what the trail around it
+  has been doing. Totals only &mdash; no filenames, no prompt text, no speaker
+  names. The trail is the source, so the history below covers the retained
+  window and nothing older.</p>
+
+  <div class="__GATE_CLASS__" id="gate">
+    <p>Paste the audit token &mdash; the same one the audit trail uses. The
+    server prints it at startup.</p>
+    <div class="row">
+      <input type="password" id="gate-token" autocomplete="off" spellcheck="false"
+             placeholder="Audit token" aria-label="Audit token">
+      <button id="gate-go">Unlock</button>
+    </div>
+    <p class="gate-err locked" id="gate-err">That token was rejected.</p>
+  </div>
+
+  <div class="__OFF_CLASS__" id="off">
+    <p>The audit API is switched off, so there is nothing to total up. Restart
+    with <code>--audit-token</code> (or <code>TRANSCRIBE_AUDIT_TOKEN</code>) to
+    turn it on.</p>
+  </div>
+
+  <div id="main" class="locked">
+    <p class="meta" id="meta">&nbsp;</p>
+
+    <h2>This run</h2>
+    <div class="cards" id="session"></div>
+
+    <h2>Retained days</h2>
+    <div class="scroll">
+      <table id="days">
+        <thead><tr>
+          <th>Day</th><th>Recordings</th><th>Audio</th><th>Processed</th>
+          <th>Relabels</th><th>Failed</th><th>Exports</th><th>Refusals</th>
+        </tr></thead>
+        <tbody id="day-rows"></tbody>
+      </table>
+    </div>
+    <p class="empty locked" id="empty">No retained days.</p>
+
+    <h2>Operator</h2>
+    <div class="cards" id="operator"></div>
+
+    <h2>Integrity</h2>
+    <div class="cards" id="integrity"></div>
+    <button id="reload">Reload</button>
+    <button class="ghost" id="verify">Verify every retained day</button>
+    <p class="meta" id="verify-out">&nbsp;</p>
+  </div>
+</div>
+
+<script src="/static/common.js"></script>
+<script src="/static/stats.js"></script>
+</body>
+</html>
