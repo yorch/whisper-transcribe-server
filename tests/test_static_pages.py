@@ -273,7 +273,7 @@ def test_every_asset_is_present(name):
 
 @pytest.mark.parametrize(
     "path,needle",
-    [("/", 'id="intake"'), ("/audit", "Audit trail")],
+    [("/", 'id="intake"'), ("/audit", "Audit trail"), ("/stats", "Statistics")],
 )
 def test_the_pages_are_served(client, path, needle):
     response = client.get(path)
@@ -299,12 +299,15 @@ def test_static_assets_are_served_with_a_usable_type(client, name, mime):
     [
         "/",
         "/audit",
+        "/stats",
         "/static/index.js",
         "/static/common.js",
         "/static/audit.js",
+        "/static/stats.js",
         "/static/app.css",
         "/static/index.css",
         "/static/audit.css",
+        "/static/stats.css",
     ],
 )
 def test_the_page_and_its_assets_are_revalidated(client, path):
@@ -368,7 +371,7 @@ def test_the_shared_rules_exist_once_not_twice():
     """The duplication this refactor removed must not creep back."""
     shared = selectors(asset("app.css"))
     assert shared, "app.css should carry the shared design system"
-    for page_css in ("index.css", "audit.css"):
+    for page_css in ("index.css", "audit.css", "stats.css"):
         overlap = shared & selectors(asset(page_css))
         assert not overlap, f"{page_css} re-declares shared rules: {sorted(overlap)}"
 
@@ -408,6 +411,7 @@ def test_locked_wins_against_the_rule_it_is_hiding():
     [
         ("index.html", ("app.css", "index.css")),
         ("audit.html", ("app.css", "audit.css")),
+        ("stats.html", ("app.css", "stats.css")),
     ],
 )
 def test_every_class_used_is_defined(html, css):
@@ -435,7 +439,7 @@ def test_the_csp_allows_no_inline_script_or_style(client):
     assert "unsafe-eval" not in csp
 
 
-@pytest.mark.parametrize("page", ["index.html", "audit.html"])
+@pytest.mark.parametrize("page", ["index.html", "audit.html", "stats.html"])
 def test_the_markup_carries_no_inline_code(page):
     html = asset(page)
 
@@ -445,7 +449,7 @@ def test_the_markup_carries_no_inline_code(page):
     assert not re.search(r"\sstyle=", html), "no inline style attributes"
 
 
-@pytest.mark.parametrize("page", ["index.html", "audit.html"])
+@pytest.mark.parametrize("page", ["index.html", "audit.html", "stats.html"])
 def test_the_pages_load_the_shared_helpers_first(page):
     html = asset(page)
 
@@ -464,7 +468,7 @@ def test_esc_is_defined_only_in_common_js():
     """It is the only thing between a filename and stored XSS; one copy only."""
     definers = [
         name
-        for name in ("common.js", "index.js", "audit.js")
+        for name in ("common.js", "index.js", "audit.js", "stats.js")
         if re.search(r"const esc\s*=", asset(name))
     ]
     assert definers == ["common.js"], f"esc is defined in {definers}"
@@ -476,22 +480,27 @@ def test_neither_page_script_handles_token_storage():
     The Follow switch keeps its own sessionStorage entry, which is fine and is
     why this checks the token keys rather than the storage API.
     """
-    for name, key in (("index.js", "tk"), ("audit.js", "atk")):
+    for name, key in (("index.js", "tk"), ("audit.js", "atk"), ("stats.js", "atk")):
         script = asset(name)
         assert f'sessionStorage.setItem("{key}"' not in script
         assert f'sessionStorage.getItem("{key}"' not in script
 
 
 def test_the_pages_use_different_storage_keys():
-    """An app token and an audit token must not overwrite each other."""
+    """An app token and an audit token must not overwrite each other.
+
+    /stats shares the audit key on purpose: there is one audit credential, and
+    unlocking one of its pages should unlock the other.
+    """
     assert 'tokenStore("tk")' in asset("index.js")
     assert 'tokenStore("atk")' in asset("audit.js")
+    assert 'tokenStore("atk")' in asset("stats.js")
 
 
 def test_every_at_rule_is_one_a_browser_can_parse():
     """`@media @media (...)` is not an error anyone sees: the browser drops the
     whole block, and the reduced-motion rule quietly never applied."""
-    for name in ("app.css", "index.css", "audit.css"):
+    for name in ("app.css", "index.css", "audit.css", "stats.css"):
         css = asset(name)
         assert re.search(r"@(\w+)\s+@", css) is None, f"a doubled at-rule in {name}"
     assert "@media (prefers-reduced-motion:reduce)" in asset("app.css")
