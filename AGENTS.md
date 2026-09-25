@@ -243,12 +243,15 @@ launcher/transcribe_tray.py --self-test --with-server   # also probes a real ser
 - **`audit_max_mb` is a storage bound, not a rate limit.** Hitting it writes one
   `audit.full` marker and then stops recording for that day, which is only
   acceptable because `degraded`/`full` surface it. Do not make the stop silent.
-- **`audit_gated()` is the one predicate for the audit credential.** Three sites
-  in the middleware consult it: the token gate, the generic read/rejection
-  logging and the `Cache-Control` tuple. Extending one and not the others is how
-  `/stats` would log its own polls as `api.read` -- into the numbers it is
-  displaying. `tests/test_stats.py` pins the predicate and the no-`api.read`
-  behaviour.
+- **`audit_gated()` guards the audit API paths, and the page lists must be kept
+  in step with it.** Two middleware sites consult the predicate -- the token gate
+  and the generic read/rejection logging -- while the `Cache-Control` check uses
+  its own page-path tuple (`/`, `/audit`, `/stats`). Missing either is how
+  `/stats` would log its own polls as `api.read`, into the numbers it is
+  displaying, or ship without `no-cache`, which is the new-page/old-script bug
+  that header exists to prevent. `tests/test_stats.py` pins the predicate, the
+  no-`api.read` behaviour and the fail-closed miss on an unknown subpath;
+  `tests/test_static_pages.py` parametrizes the `no-cache` paths.
 - **Statistics are `fold`ed, never re-derived.** The `fold()` in the Statistics
   section is the single definition of what a record means, used both for the
   live session counters and for a day read back from the trail. A second
@@ -261,9 +264,18 @@ launcher/transcribe_tray.py --self-test --with-server   # also probes a real ser
   event loop it would stall every poll, the same failure the diarization
   subprocess exists to avoid.
 - **The stored aggregate is derived data.** `stats-<day>.json` is read back only
-  when it matches its day file's identity, size, mtime and schema, and it holds
-  no text. The trail is the only source of truth; never let the summary become
-  one, and never trust a field it did not have.
+  when it matches its day file's identity, size, mtime and schema, and only when
+  it coerces to itself; it holds no text. The trail is the only source of truth --
+  but note the summary is trusted exactly as far as those fields, so an edit that
+  keeps them consistent is beyond what this can detect. `verify` covers the day
+  files, not the summaries.
+- **The day-summary cache never evicts today, and only writes on progress.**
+  Today's summary is the one thing never persisted, so evicting it means
+  refolding the whole day on the next request; `_remember` re-inserts on use so
+  the victim is the least recently *used*, and skips today. A past day is saved
+  only when the fold actually advanced, or a poll would rewrite every settled
+  day's file on every request. The saved `covered` offset is the fold position,
+  not the file size: a day with a torn tail must resume there, not skip it.
 - **Refusals are logged before authentication**, so anything logged on that path
   goes through `audit_rejection` (burst-collapsed), never `audit` directly.
 - `--preload` must *prove* the device can encode, not merely load a model. A

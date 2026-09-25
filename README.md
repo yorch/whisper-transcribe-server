@@ -435,10 +435,14 @@ separately instead.
 Folding a day is file work, so totals are cached by the day file's identity,
 size and mtime, and a day that is no longer current is written to
 `stats-<day>.json` beside the trail and deleted with it. That file is derived
-data on a disk anyone can edit, so nothing in it is trusted: anything that does
-not parse, does not match its day file, or was written by an older schema is
-recomputed from the trail, which stays the only source of truth. Reading the
-page is itself an audit event, so today's row moves as it is read.
+data on a disk anyone can edit, so it is trusted exactly as far as a matching
+stat of the day file it names — identity, size, mtime and schema — and no
+further: anything that does not parse, does not match, coerces to something
+other than itself, or was written by an older schema is recomputed from the
+trail, which stays the only source of truth. An edit that keeps those fields
+consistent is beyond what any of this detects; `verify` covers the day files,
+not the summaries. Reading the page is itself an audit event, so today's row
+moves as it is read.
 
 ### Origin attribution behind a tunnel
 

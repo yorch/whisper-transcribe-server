@@ -15,6 +15,7 @@ never trusted further than its provenance.
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -192,17 +193,273 @@ def test_coerce_stats_ignores_junk_and_never_invents_a_key():
         }
     )
 
-    assert out["events"] == 0
-    assert out["audio_seconds"] == 3.5
+    assert out["events"] == 0, "a string is not a count"
+    assert out["audio_seconds"] == 0.0, "nor a number"
     assert out["models"] == {"base": 2}
     assert "nonsense" not in out
     assert set(out) == set(s.blank_stats())
+
+
+def test_coerce_stats_refuses_non_finite_numbers():
+    """json.loads accepts Infinity and NaN, and the page would render them."""
+    out = s.coerce_stats(
+        {
+            "audio_seconds": float("inf"),
+            "recording_seconds": float("nan"),
+            "processing_seconds": 1e308 * 10,
+            "events": True,
+        }
+    )
+
+    assert out["audio_seconds"] == 0.0
+    assert out["recording_seconds"] == 0.0
+    assert out["processing_seconds"] == 0.0
+    assert out["events"] == 0, "a bool is not a count"
+
+
+def test_a_summary_that_does_not_round_trip_is_refolded(tmp_path):
+    """Coercing to zeros would under-report silently; refold instead."""
+    log = fresh(tmp_path)
+    day = "2026-01-01"
+    write_day(log, day, {"event": "job.done", "job": "a", "duration": 3600.0})
+    log.day_summary(day)
+
+    payload = json.loads(log.summary_path(day).read_text(encoding="utf-8"))
+    payload["stats"]["audio_seconds"] = "Infinity"
+    log.summary_path(day).write_text(json.dumps(payload))
+
+    assert fresh(tmp_path).day_summary(day)["audio_seconds"] == 3600.0
 
 
 def test_a_malformed_day_is_refused_before_it_reaches_a_filename(tmp_path):
     log = fresh(tmp_path)
     assert log.day_summary("../../etc/passwd") == s.blank_stats()
     assert log.day_summary("") == s.blank_stats()
+
+
+# --------------------------------------------------------------------------- #
+# The marks have to be EMITTED, not just folded
+# --------------------------------------------------------------------------- #
+
+
+def test_a_relabel_records_its_provenance_on_the_job_done(client, configured):
+    """Folding is tested above; emitting is a separate step.
+
+    Deleting `relabel_of=job.get("relabel_of")` from label_and_finish would
+    leave every other test green while production double counted every relabel.
+    """
+    job_id = configured.make_job(diarize="false")
+    s.patch_job(job_id, relabel_of="origjob1234", state="running")
+
+    s.label_and_finish(job_id, s.JOBS[job_id], s.JOBS[job_id]["opts"], [], "en", 12.0)
+
+    done = [e for e in configured.events() if e["event"] == "job.done"]
+    assert done, "label_and_finish should finish the job"
+    assert done[-1]["relabel_of"] == "origjob1234"
+
+
+def test_a_first_pass_carries_neither_mark(client, configured):
+    job_id = configured.make_job(diarize="false")
+    s.patch_job(job_id, state="running")
+
+    s.label_and_finish(job_id, s.JOBS[job_id], s.JOBS[job_id]["opts"], [], "en", 12.0)
+
+    done = [e for e in configured.events() if e["event"] == "job.done"]
+    assert "relabel_of" not in done[-1] and "retry_of" not in done[-1]
+
+
+def test_a_retry_marks_the_new_job_with_its_predecessor(client, configured):
+    job_id = configured.make_job()
+    s.patch_job(job_id, state="done", duration=5.0, segments=[])
+
+    response = client.post(
+        f"/api/jobs/{job_id}/retry", data={"model": "base", "quality": "fast"}
+    )
+
+    assert response.status_code == 200, response.text
+    assert s.JOBS[response.json()["id"]]["retry_of"] == job_id
+
+
+def test_a_lost_attestation_riding_a_relabel_is_counted(tmp_path):
+    """The relabel branch must not return before the `lost` tail.
+
+    A caller cannot pass `lost` -- it is reserved, so an event cannot forge an
+    attestation -- which means the only way a record carries one is a write that
+    failed just before it.
+    """
+    log = fresh(tmp_path)
+    log.emit("a")
+    real = log._fh
+    assert real is not None
+
+    class Boom:
+        def write(self, text: str) -> None:
+            raise OSError("disk full")
+
+        def flush(self) -> None:
+            pass
+
+        def truncate(self, size: int) -> None:
+            pass
+
+    log._fh = Boom()  # pyright: ignore[reportAttributeAccessIssue]
+    log.emit("b")
+    assert log.lost == 1
+
+    log._fh = real
+    log.emit("job.done", job="r", duration=60.0, relabel_of="orig")
+
+    agg = log.day_summary(only_day(log))
+
+    assert agg["relabels"] == 1
+    assert agg["audio_seconds"] == 0.0
+    assert agg["lost"] == 1, "the relabel record carried the attestation"
+
+
+# --------------------------------------------------------------------------- #
+# The delta cache
+# --------------------------------------------------------------------------- #
+
+
+def test_a_second_read_folds_only_the_appended_bytes(tmp_path, monkeypatch):
+    log = fresh(tmp_path)
+    log.emit("job.done", job="a", duration=60.0, model="base")
+    day = only_day(log)
+    path = log.dir / f"audit-{day}.jsonl"
+    assert log.day_summary(day)["recordings"] == 1
+
+    starts: list[tuple[int, int]] = []
+    real = s.AuditLog._fold_bytes
+
+    def spy(fh: Any, agg: Any, start: int, end: int) -> int:
+        starts.append((start, end))
+        return real(fh, agg, start, end)
+
+    monkeypatch.setattr(s.AuditLog, "_fold_bytes", staticmethod(spy))
+    size_before = path.stat().st_size
+    log.emit("job.done", job="b", duration=60.0, model="base")
+
+    assert log.day_summary(day)["recordings"] == 2
+    assert starts == [(size_before, path.stat().st_size)], (
+        "the second read must resume where the first stopped"
+    )
+
+
+def test_a_record_split_across_the_read_boundary_is_folded_once(tmp_path):
+    """A half-written record must not be folded, and must not be lost either."""
+    log = fresh(tmp_path)
+    day = "2026-01-01"
+    log.dir.mkdir(parents=True, exist_ok=True)
+    path = log.dir / f"audit-{day}.jsonl"
+    record = json.dumps({"ts": "x", "event": "job.done", "job": "a", "duration": 60.0})
+
+    path.write_text(record[: len(record) // 2])
+    assert log.day_summary(day)["recordings"] == 0, "a torn line is not a record"
+
+    path.write_text(record + "\n")
+    assert log.day_summary(day)["recordings"] == 1, "and it is not skipped once whole"
+
+
+def test_a_summary_that_covered_part_of_the_file_resumes_from_its_offset(tmp_path):
+    """A torn tail must not be remembered as covered, or it is skipped forever."""
+    log = fresh(tmp_path)
+    day = "2026-01-01"
+    log.dir.mkdir(parents=True, exist_ok=True)
+    path = log.dir / f"audit-{day}.jsonl"
+    whole = json.dumps({"ts": "x", "event": "job.done", "job": "a", "duration": 60.0})
+    path.write_text(whole + "\n" + whole[: len(whole) // 2])
+
+    assert log.day_summary(day)["recordings"] == 1
+    # A fresh process reads the stored summary, which covers one record, and
+    # must resume at that offset rather than at the file's size.
+    assert fresh(tmp_path).day_summary(day)["recordings"] == 1
+
+    path.write_text(whole + "\n" + whole + "\n")
+    assert fresh(tmp_path).day_summary(day)["recordings"] == 2
+
+
+def test_a_shrunk_day_file_is_refolded(tmp_path):
+    log = fresh(tmp_path)
+    day = "2026-01-01"
+    path = write_day(
+        log,
+        day,
+        {"event": "job.done", "job": "a", "duration": 60.0},
+        {"event": "job.done", "job": "b", "duration": 60.0},
+    )
+    assert log.day_summary(day)["recordings"] == 2
+
+    path.write_text(
+        json.dumps({"ts": "x", "event": "job.done", "duration": 60.0}) + "\n"
+    )
+
+    assert log.day_summary(day)["recordings"] == 1, "a shorter file is not a prefix"
+
+
+# --------------------------------------------------------------------------- #
+# Housekeeping
+# --------------------------------------------------------------------------- #
+
+
+def test_prune_removes_a_days_summary_and_sweeps_orphans(tmp_path):
+    log = s.AuditLog(tmp_path / "audit", retain_days=1)
+    log.dir.mkdir(parents=True, exist_ok=True)
+    (log.dir / "audit-2000-01-01.jsonl").write_text(
+        json.dumps({"ts": "x", "event": "job.done", "duration": 1.0}) + "\n"
+    )
+    (log.dir / "stats-2000-01-01.json").write_text("{}")
+    (log.dir / "stats-1999-12-31.json").write_text("{}")  # day file already gone
+    (log.dir / ".stats-2000-01-01.json.tmp").write_text("{}")
+
+    removed = log.prune()
+
+    assert "audit-2000-01-01.jsonl" in removed
+    assert not (log.dir / "stats-2000-01-01.json").exists()
+    assert not (log.dir / "stats-1999-12-31.json").exists(), (
+        "an orphan summary is unreachable and nothing else would ever sweep it"
+    )
+    assert not (log.dir / ".stats-2000-01-01.json.tmp").exists()
+
+
+def test_a_settled_day_is_not_rewritten_on_every_poll(tmp_path, monkeypatch):
+    """Saving unconditionally means N temp+fsync+replace cycles per request."""
+    log = fresh(tmp_path)
+    day = "2026-01-01"
+    write_day(log, day, {"event": "job.done", "job": "a", "duration": 60.0})
+    log.day_summary(day)  # the first pass writes it
+
+    saves = {"n": 0}
+    real = s.AuditLog._save_summary
+
+    def counting(self: Any, *args: Any, **kwargs: Any) -> None:
+        saves["n"] += 1
+        real(self, *args, **kwargs)
+
+    monkeypatch.setattr(s.AuditLog, "_save_summary", counting)
+    for _ in range(5):
+        log.day_summary(day)
+
+    assert saves["n"] == 0, "a day that has not changed must not be rewritten"
+
+
+def test_eviction_never_drops_today(tmp_path, monkeypatch):
+    """Today is the one day whose summary is never persisted."""
+    monkeypatch.setattr(s.AuditLog, "MAX_DAY_CACHE", 3)
+    log = fresh(tmp_path)
+    log.dir.mkdir(parents=True, exist_ok=True)
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    log.emit("job.done", job="now", duration=60.0)
+    assert log.day_summary(today)["recordings"] == 1
+
+    # Fill past the cap, newest-first like the endpoint's loop does.
+    for i in range(6):
+        other = f"2026-01-{i + 1:02d}"
+        (log.dir / f"audit-{other}.jsonl").write_text(
+            json.dumps({"ts": "x", "event": "job.done", "duration": 1.0}) + "\n"
+        )
+        log.day_summary(other)
+
+    assert today in log._day_stats, "evicting today means refolding the whole day"
 
 
 # --------------------------------------------------------------------------- #
@@ -215,6 +472,13 @@ def test_the_predicate_covers_both_audit_prefixes():
         assert s.audit_gated(path), path
     for path in ("/api/status", "/api/jobs", "/stats", "/"):
         assert not s.audit_gated(path), path
+
+
+def test_an_unknown_api_subpath_is_refused_not_served(configured):
+    """`audit_gated` over-matches on purpose. /api/statsfoo is not a route, and a
+    miss has to fail closed rather than be reachable without the credential."""
+    with TestClient(s.app) as anon:
+        assert anon.get("/api/statsfoo").status_code == 401
 
 
 def test_stats_needs_the_audit_token(configured):
