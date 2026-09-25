@@ -50,6 +50,7 @@ import hashlib
 import hmac
 import importlib.util
 import json
+import math
 import os
 import queue
 import re
@@ -974,12 +975,15 @@ class _DayStats:
     last complete line folded, so the next request reads only what was appended.
     """
 
-    __slots__ = ("dev", "ino", "size", "stats")
+    __slots__ = ("dev", "ino", "size", "mtime_ns", "stats")
 
-    def __init__(self, dev: int, ino: int, size: int, stats: dict[str, Any]) -> None:
+    def __init__(
+        self, dev: int, ino: int, size: int, mtime_ns: int, stats: dict[str, Any]
+    ) -> None:
         self.dev = dev
         self.ino = ino
         self.size = size
+        self.mtime_ns = mtime_ns
         self.stats = stats
 
 
@@ -1931,8 +1935,15 @@ class AuditLog:
                     fold(agg, name, rec)
         return start + cut + 1
 
-    def _load_summary(self, day: str, st: os.stat_result) -> dict[str, Any] | None:
-        """A stored summary for exactly this file, or None to refold."""
+    def _load_summary(
+        self, day: str, st: os.stat_result
+    ) -> tuple[dict[str, Any], int] | None:
+        """(a stored summary, the offset it covers) for exactly this file.
+
+        `None` to refold. The offset is separate from the file's size on
+        purpose: a day whose last line is torn was only folded as far as the
+        last complete record, and remembering `st_size` would skip it forever.
+        """
         try:
             payload = json.loads(self.summary_path(day).read_text(encoding="utf-8"))
         except (OSError, ValueError):
@@ -1946,9 +1957,20 @@ class AuditLog:
             payload.get("mtime_ns"),
         ) != (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns):
             return None
-        return coerce_stats(payload.get("stats"))
+        covered = payload.get("covered")
+        if not isinstance(covered, int) or not 0 <= covered <= st.st_size:
+            return None
+        stats = coerce_stats(payload.get("stats"))
+        # A summary that does not coerce to itself carried something we had to
+        # discard -- a string, a non-finite number, a key the aggregate does not
+        # have. Refold it rather than serve the zeros that were left.
+        if stats != payload.get("stats"):
+            return None
+        return stats, covered
 
-    def _save_summary(self, day: str, st: os.stat_result, agg: dict[str, Any]) -> None:
+    def _save_summary(
+        self, day: str, st: os.stat_result, agg: dict[str, Any], covered: int
+    ) -> None:
         """Write a day's aggregate atomically, stamped to the file it describes."""
         tmp: Path | None = None
         try:
@@ -1965,6 +1987,7 @@ class AuditLog:
                         "ino": st.st_ino,
                         "size": st.st_size,
                         "mtime_ns": st.st_mtime_ns,
+                        "covered": covered,
                         "stats": agg,
                     },
                     fh,
@@ -1999,11 +2022,18 @@ class AuditLog:
         current = day == datetime.now(timezone.utc).strftime("%Y-%m-%d")
         with self._stats_lock:
             cached = self._day_stats.get(day)
-            if cached is not None and (cached.dev, cached.ino) == (
-                st.st_dev,
-                st.st_ino,
+            # A past day must not have changed at all, so its mtime is part of
+            # the identity: an in-place rewrite that keeps the inode would
+            # otherwise fold new bytes onto stale totals and then persist them.
+            # Today's mtime moves with every append, so only its length is
+            # usable there.
+            if (
+                cached is not None
+                and (cached.dev, cached.ino) == (st.st_dev, st.st_ino)
+                and (current or cached.mtime_ns == st.st_mtime_ns)
             ):
                 if cached.size <= st.st_size:
+                    before = cached.size
                     # Appended since last time: fold only the new bytes. A read
                     # that fails leaves the running total where it was, which is
                     # stale but honest, and never raises into the endpoint.
@@ -2012,14 +2042,20 @@ class AuditLog:
                             cached.size = self._fold_bytes(
                                 fh, cached.stats, cached.size, st.st_size
                             )
-                    if not current:
-                        self._save_summary(day, st, cached.stats)
-                    return cached.stats
+                    cached.mtime_ns = st.st_mtime_ns
+                    # Only write when something was actually folded: otherwise a
+                    # poll would rewrite every past day's summary, byte for
+                    # byte, on every request.
+                    if not current and cached.size != before:
+                        self._save_summary(day, st, cached.stats, cached.size)
+                    self._remember(day, cached)
+                    return copy_stats(cached.stats)
                 # The file is shorter than what we folded: refold from scratch.
             stored = None if current else self._load_summary(day, st)
             if stored is not None:
-                self._day_stats[day] = _DayStats(
-                    st.st_dev, st.st_ino, st.st_size, stored
+                stored_stats, covered = stored
+                entry = _DayStats(
+                    st.st_dev, st.st_ino, covered, st.st_mtime_ns, stored_stats
                 )
             else:
                 agg = blank_stats()
@@ -2028,16 +2064,29 @@ class AuditLog:
                         end = self._fold_bytes(fh, agg, 0, st.st_size)
                 except OSError:
                     return agg
-                self._day_stats[day] = _DayStats(st.st_dev, st.st_ino, end, agg)
-                stored = agg
+                entry = _DayStats(st.st_dev, st.st_ino, end, st.st_mtime_ns, agg)
                 if not current:
-                    self._save_summary(day, st, agg)
-            while len(self._day_stats) > self.MAX_DAY_CACHE:
-                victim = next(iter(self._day_stats))
-                if victim == day:
-                    break
-                self._day_stats.pop(victim)
-            return stored
+                    self._save_summary(day, st, agg, end)
+            self._remember(day, entry)
+            return copy_stats(entry.stats)
+
+    def _remember(self, day: str, entry: _DayStats) -> None:
+        """Cache an entry, refresh its recency, evict the least recently used.
+
+        Today is never evicted: its summary is the one thing never persisted, so
+        dropping it means refolding the whole day on the next request. The
+        re-insert is what makes the victim the least recently *used* -- without
+        it the victim is merely the oldest insertion, which the endpoint's
+        newest-first loop makes today. Caller holds `_stats_lock`.
+        """
+        self._day_stats.pop(day, None)
+        self._day_stats[day] = entry
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        while len(self._day_stats) > self.MAX_DAY_CACHE:
+            victim = next((d for d in self._day_stats if d != today), None)
+            if victim is None:
+                break
+            self._day_stats.pop(victim)
 
     # -- retention -------------------------------------------------------- #
 
@@ -2086,9 +2135,17 @@ class AuditLog:
             if old.startswith("audit-") and old.endswith(".jsonl"):
                 day_name = old[len("audit-") : -len(".jsonl")]
                 self._day_lines.pop(day_name, None)
-                self._day_stats.pop(day_name, None)
+                # day_summary reads and evicts this map under its own lock, and
+                # prune runs from the emit thread, so the pop takes it too.
+                with self._stats_lock:
+                    self._day_stats.pop(day_name, None)
                 # The summary is derived, so it goes when its day does.
                 self._unlink(self.summary_path(day_name))
+        # A summary whose day file is gone is unreachable: no reader will ask for
+        # it again, and nothing else will ever clean it up.
+        for path in self.dir.glob("stats-*.json"):
+            if not (self.dir / f"audit-{path.stem[len('stats-') :]}.jsonl").is_file():
+                self._unlink(path)
         for path in self.dir.glob(".stats-*.json.tmp"):
             self._unlink(path)
         return removed
@@ -2353,20 +2410,22 @@ def fold(agg: dict[str, Any], event: str, record: dict[str, Any]) -> None:
         seconds = as_float(record.get("duration"), 0.0)
         agg["segments"] += as_int(record.get("segments"), 0)
         if relabel:
+            # No early return: a record can still carry a `lost` attestation, and
+            # skipping the tail of this function would drop it from the total.
             agg["relabels"] += 1
-            return
-        agg["passes"] += 1
-        agg["audio_seconds"] += seconds
-        agg["processing_seconds"] += as_float(record.get("elapsed"), 0.0)
-        if not retry:
-            agg["recordings"] += 1
-            agg["recording_seconds"] += seconds
-        model = record.get("model")
-        if isinstance(model, str) and model:
-            agg["models"][model] = agg["models"].get(model, 0) + 1
-        language = record.get("language")
-        if isinstance(language, str) and language:
-            agg["languages"][language] = agg["languages"].get(language, 0) + 1
+        else:
+            agg["passes"] += 1
+            agg["audio_seconds"] += seconds
+            agg["processing_seconds"] += as_float(record.get("elapsed"), 0.0)
+            if not retry:
+                agg["recordings"] += 1
+                agg["recording_seconds"] += seconds
+            model = record.get("model")
+            if isinstance(model, str) and model:
+                agg["models"][model] = agg["models"].get(model, 0) + 1
+            language = record.get("language")
+            if isinstance(language, str) and language:
+                agg["languages"][language] = agg["languages"].get(language, 0) + 1
     elif event == "job.error":
         agg["failed"] += 1
     elif event == "job.diarize_failed":
@@ -2383,6 +2442,10 @@ def fold(agg: dict[str, Any], event: str, record: dict[str, Any]) -> None:
         agg["cap_hits"] += 1
     elif event == "audit.sidecars_pruned":
         agg["sidecars_pruned"] += as_int(record.get("removed"), 0)
+    elif event == "audit.repeated_summary":
+        # Collapsed export bursts. It is not a `security.*` record, so without
+        # this branch the "collapsed" total silently omits every one of them.
+        agg["suppressed"] += as_int(record.get("suppressed"), 0)
     elif event.startswith("security."):
         agg["security"][event] = agg["security"].get(event, 0) + 1
         agg["suppressed"] += as_int(record.get("suppressed"), 0)
@@ -2405,15 +2468,38 @@ def coerce_stats(raw: Any) -> dict[str, Any]:
     for key, blank in out.items():
         value = raw.get(key)
         if isinstance(blank, float):
-            out[key] = as_float(value, 0.0)
+            # Finite numbers only: `as_float` would take "Infinity" or "NaN"
+            # from a hand-edited summary and the page would render them.
+            out[key] = (
+                float(value)
+                if isinstance(value, (int, float))
+                and not isinstance(value, bool)
+                and math.isfinite(value)
+                else 0.0
+            )
         elif isinstance(blank, int):
-            out[key] = as_int(value, 0)
+            out[key] = (
+                value if isinstance(value, int) and not isinstance(value, bool) else 0
+            )
         elif isinstance(blank, dict) and isinstance(value, dict):
             out[key] = {
-                str(k): as_int(v, 0)
+                str(k): v
                 for k, v in value.items()
-                if isinstance(v, (int, float))
+                if isinstance(v, int) and not isinstance(v, bool)
             }
+    return out
+
+
+def copy_stats(agg: dict[str, Any]) -> dict[str, Any]:
+    """A detached copy of an aggregate, nested maps included.
+
+    A cached aggregate is folded into in place, so handing it out directly lets
+    a concurrent request read a map while it is being written, and lets the
+    response change under the JSON encoder.
+    """
+    out: dict[str, Any] = {}
+    for key, value in agg.items():
+        out[key] = dict(value) if isinstance(value, dict) else value
     return out
 
 
@@ -2440,6 +2526,13 @@ class Stats:
     did even under --no-audit, where nothing reaches a file. That is what makes
     "this session" and "the retained days" genuinely different views rather
     than two readings of the same file.
+
+    Two consequences of folding before the write, both deliberate: `events`
+    counts actions that never reached a file (a failed write, a cap-suppressed
+    event), and `lost` is structurally always zero here, because the attestation
+    is attached to a record after this fold has already run. `lost_total` and the
+    day view are the places that number lives; do not add a card for the
+    session's.
     """
 
     def __init__(self) -> None:
@@ -2455,10 +2548,7 @@ class Stats:
 
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
-            out = dict(self.total)
-            for key in ("models", "languages", "security"):
-                out[key] = dict(out[key])
-            return out
+            return copy_stats(self.total)
 
 
 def new_job(filename: str, path: Path, opts: dict[str, Any]) -> str:
