@@ -40,10 +40,14 @@ def audit_headers(configured: Any) -> dict[str, str]:
 
 
 def write_day(log: s.AuditLog, day: str, *records: dict[str, Any]) -> Path:
+    """Bytes, not text: write_text translates \n to \r\n on Windows, and the
+    readers' byte offsets are the thing under test."""
     log.dir.mkdir(parents=True, exist_ok=True)
     path = log.dir / f"audit-{day}.jsonl"
-    path.write_text(
-        "".join(json.dumps({"ts": "2026-01-01T00:00:00Z", **r}) + "\n" for r in records)
+    path.write_bytes(
+        "".join(
+            json.dumps({"ts": "2026-01-01T00:00:00Z", **r}) + "\n" for r in records
+        ).encode()
     )
     return path
 
@@ -353,10 +357,10 @@ def test_a_record_split_across_the_read_boundary_is_folded_once(tmp_path):
     path = log.dir / f"audit-{day}.jsonl"
     record = json.dumps({"ts": "x", "event": "job.done", "job": "a", "duration": 60.0})
 
-    path.write_text(record[: len(record) // 2])
+    path.write_bytes(record[: len(record) // 2].encode())
     assert log.day_summary(day)["recordings"] == 0, "a torn line is not a record"
 
-    path.write_text(record + "\n")
+    path.write_bytes((record + "\n").encode())
     assert log.day_summary(day)["recordings"] == 1, "and it is not skipped once whole"
 
 
@@ -367,14 +371,14 @@ def test_a_summary_that_covered_part_of_the_file_resumes_from_its_offset(tmp_pat
     log.dir.mkdir(parents=True, exist_ok=True)
     path = log.dir / f"audit-{day}.jsonl"
     whole = json.dumps({"ts": "x", "event": "job.done", "job": "a", "duration": 60.0})
-    path.write_text(whole + "\n" + whole[: len(whole) // 2])
+    path.write_bytes((whole + "\n" + whole[: len(whole) // 2]).encode())
 
     assert log.day_summary(day)["recordings"] == 1
     # A fresh process reads the stored summary, which covers one record, and
     # must resume at that offset rather than at the file's size.
     assert fresh(tmp_path).day_summary(day)["recordings"] == 1
 
-    path.write_text(whole + "\n" + whole + "\n")
+    path.write_bytes((whole + "\n" + whole + "\n").encode())
     assert fresh(tmp_path).day_summary(day)["recordings"] == 2
 
 
@@ -389,8 +393,8 @@ def test_a_shrunk_day_file_is_refolded(tmp_path):
     )
     assert log.day_summary(day)["recordings"] == 2
 
-    path.write_text(
-        json.dumps({"ts": "x", "event": "job.done", "duration": 60.0}) + "\n"
+    path.write_bytes(
+        json.dumps({"ts": "x", "event": "job.done", "duration": 60.0}).encode() + b"\n"
     )
 
     assert log.day_summary(day)["recordings"] == 1, "a shorter file is not a prefix"

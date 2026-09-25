@@ -118,8 +118,11 @@ def node_argv(*args: str) -> list[str]:
 
 
 def run_node(source: str) -> str:
+    # encoding="utf-8" explicitly: text=True alone decodes with the locale
+    # encoding, which on Windows is cp1252, and every separator the page renders
+    # (the middle dot in "base \u00b7 2 speakers") then arrives mojibaked.
     result = subprocess.run(  # noqa: S603 - fixed argv, no shell
-        node_argv("-e", source), capture_output=True, text=True
+        node_argv("-e", source), capture_output=True, text=True, encoding="utf-8"
     )
     assert result.returncode == 0, f"node failed:\n{result.stderr}"
     return result.stdout
@@ -1287,7 +1290,10 @@ def test_the_embedded_script_parses(tmp_path):
     path = tmp_path / "page.js"
     path.write_text(page_script(), encoding="utf-8")
     result = subprocess.run(  # noqa: S603 - fixed argv, no shell
-        node_argv("--check", str(path)), capture_output=True, text=True
+        node_argv("--check", str(path)),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
     )
     assert result.returncode == 0, f"the page script does not parse:\n{result.stderr}"
 
