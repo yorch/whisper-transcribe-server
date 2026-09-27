@@ -401,6 +401,49 @@ keeps `prompt_len` and `prompt_sha256` for every job, so the trail still shows
 that a prompt was used. `0` keeps every sidecar, and `--no-audit-prompts` stops
 the text being written at all.
 
+### Statistics
+
+`/stats` totals what has been transcribed and what the trail around it has been
+doing. It sits behind the **audit token**, like the trail it is derived from,
+and it reports counts, durations and byte totals only — no filenames, no prompt
+or hotword text, no speaker names — so it can never become a way around the
+two-token split.
+
+Two views, deliberately distinguishable:
+
+- **This run** is counted in process, from the moment the server started, so it
+is the only view that can show anything under `--no-audit`. There, the sole
+file is the one `server.started` marker that keeps a disabled trail
+distinguishable from a server that was simply down, so the retained view shows
+that one row and nothing else.
+- **Retained days** is folded from the trail, so it survives restarts and covers
+exactly the retention window — nothing older, because nothing older is kept.
+
+The numbers are defined so that neither overclaims:
+
+- **Recordings** are first-pass transcriptions. A **retry** transcribes the same
+audio again, so it counts as another pass, not another recording.
+- **A relabel contributes nothing.** It replays a stored transcript through the
+speaker pass and reuses the original job's duration without transcribing. That
+is what `relabel_of`/`retry_of` on `job.done` are for: without them, a fold of
+`duration` counts relabelled audio twice.
+- There is deliberately **no "realtime factor"**. `elapsed` starts before the
+model loads, so a ratio built on it tracks model switching rather than
+transcription speed; hours of audio and hours of processing are reported
+separately instead.
+
+Folding a day is file work, so totals are cached by the day file's identity,
+size and mtime, and a day that is no longer current is written to
+`stats-<day>.json` beside the trail and deleted with it. That file is derived
+data on a disk anyone can edit, so it is trusted exactly as far as a matching
+stat of the day file it names — identity, size, mtime and schema — and no
+further: anything that does not parse, does not match, coerces to something
+other than itself, or was written by an older schema is recomputed from the
+trail, which stays the only source of truth. An edit that keeps those fields
+consistent is beyond what any of this detects; `verify` covers the day files,
+not the summaries. Reading the page is itself an audit event, so today's row
+moves as it is read.
+
 ### Origin attribution behind a tunnel
 
 Behind `cloudflared`, every request arrives from localhost, so `client` is the
