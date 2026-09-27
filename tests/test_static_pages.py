@@ -506,3 +506,26 @@ def test_every_at_rule_is_one_a_browser_can_parse():
         css = asset(name)
         assert re.search(r"@(\w+)\s+@", css) is None, f"a doubled at-rule in {name}"
     assert "@media (prefers-reduced-motion:reduce)" in asset("app.css")
+
+
+# The amber primary button and its white label read the same on both themes,
+# so they are the only literals allowed outside the palette.
+THEME_NEUTRAL = {"#fff", "#c66d16", "#d1781d", "#c26711", "#a8580d", "#8f4a0c"}
+
+
+def test_every_surface_colour_comes_from_the_palette():
+    """Dark mode works by redefining the :root tokens. A hex colour written
+    straight into a rule is a surface the dark palette cannot reach -- a white
+    field on a dark page."""
+    for name in ("app.css", "index.css", "audit.css", "stats.css"):
+        css = re.sub(r"/\*.*?\*/", "", asset(name), flags=re.S)
+        # The palette itself: every :root block, the dark one included.
+        css = re.sub(r":root\s*\{[^}]*\}", "", css)
+        stray = set(re.findall(r"#[0-9a-fA-F]{3,8}\b", css)) - THEME_NEUTRAL
+        assert not stray, f"{name} hard-codes {sorted(stray)}; use a palette token"
+
+
+def test_the_pages_follow_the_system_colour_scheme():
+    app = asset("app.css")
+    assert "color-scheme:light dark" in app
+    assert "@media (prefers-color-scheme:dark)" in app

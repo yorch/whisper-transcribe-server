@@ -2,7 +2,10 @@
    copies. Only rules whose declarations agree on both pages live here;
    names that merely collide (h1, .wrap, .controls) stay per page. */
 
+  /* Colours are named for their role, not their value, so the dark palette
+     below can redefine them in one place. */
   :root{
+    color-scheme:light dark;
     --panel:#dcdfe3;
     --panel-hi:#eef0f2;
     --panel-lo:#c3c8cd;
@@ -12,8 +15,67 @@
     --amber-dim:#d9b48a;
     --green:#36704a;
     --red:#9d3427;
+    --bg-top:#e3e6e9;
+    --bg-bottom:#d3d7dc;
+    --raised-top:#e9ebee;
+    --raised-bottom:#d6dade;
+    --card-top:#eceef1;
+    --card-bottom:#e1e4e8;
+    --line:#a9b0b8;
+    --line-soft:#c9ced3;
+    --line-strong:#8d959e;
+    --field:#fff;
+    --paper:#fbfbfc;
+    --paper-warm:#fdf6ee;
+    --glass:rgba(255,255,255,.5);
+    --glass-strong:rgba(255,255,255,.7);
+    --sheen:rgba(255,255,255,.7);
+    --tint:rgba(0,0,0,.05);
+    --btn-top:#f4f5f6;
+    --btn-bottom:#dfe3e7;
+    --btn-hover-top:#fff;
+    --btn-hover-bottom:#e7ebef;
+    --btn-active:#d8dce0;
     --display:"Bahnschrift","DIN Alternate","Roboto Condensed",system-ui,sans-serif;
     --body:"Segoe UI Variable Text","Segoe UI",system-ui,-apple-system,sans-serif;
+  }
+
+  /* Follows the system setting; there is no toggle. The same instrument
+     panel, lit from below: raised surfaces are lighter than the ground, and
+     amber, green and red are lifted so they keep their contrast on dark. */
+  @media (prefers-color-scheme:dark){
+    :root{
+      --panel:#23272d;
+      --panel-hi:#2e333a;
+      --panel-lo:#3a4048;
+      --ink:#e3e6ea;
+      --muted:#9aa3ad;
+      --amber:#e08a3a;
+      --amber-dim:#7a5634;
+      --green:#5fae7a;
+      --red:#e0675a;
+      --bg-top:#1b1e22;
+      --bg-bottom:#15181b;
+      --raised-top:#282c32;
+      --raised-bottom:#212429;
+      --card-top:#262a30;
+      --card-bottom:#202328;
+      --line:#4a515a;
+      --line-soft:#3a4048;
+      --line-strong:#6a737d;
+      --field:#1d2126;
+      --paper:#1a1d21;
+      --paper-warm:#2a241d;
+      --glass:rgba(255,255,255,.04);
+      --glass-strong:rgba(255,255,255,.07);
+      --sheen:rgba(255,255,255,.05);
+      --tint:rgba(255,255,255,.06);
+      --btn-top:#343a42;
+      --btn-bottom:#2a2f36;
+      --btn-hover-top:#3d444d;
+      --btn-hover-bottom:#323840;
+      --btn-active:#262a30;
+    }
   }
 @media (prefers-reduced-motion:reduce){*{transition:none!important}}
 
@@ -21,7 +83,7 @@
 
   body{
     background:var(--panel);
-    background-image:linear-gradient(180deg,#e3e6e9 0%,#d3d7dc 100%);
+    background-image:linear-gradient(180deg,var(--bg-top) 0%,var(--bg-bottom) 100%);
     color:var(--ink);
     font-family:var(--body);
     font-size:15px;
@@ -34,7 +96,7 @@
   .gate{
     border:1px solid var(--panel-lo);
     border-left:3px solid var(--amber);
-    background:rgba(255,255,255,.5);
+    background:var(--glass);
     border-radius:3px;
     padding:16px 18px;
     margin-bottom:22px;
@@ -53,22 +115,22 @@
     font-size:13px;
     letter-spacing:.03em;
     color:var(--ink);
-    background:linear-gradient(180deg,#f4f5f6,#dfe3e7);
-    border:1px solid #a9b0b8;
+    background:linear-gradient(180deg,var(--btn-top),var(--btn-bottom));
+    border:1px solid var(--line);
     border-radius:3px;
     padding:6px 12px;
     cursor:pointer;
   }
 
-  button:hover{background:linear-gradient(180deg,#fff,#e7ebef)}
+  button:hover{background:linear-gradient(180deg,var(--btn-hover-top),var(--btn-hover-bottom))}
 
-  button:active{background:#d8dce0}
+  button:active{background:var(--btn-active)}
 
   button:focus-visible{outline:2px solid var(--amber);outline-offset:1px}
 
   button.ghost{background:none;border-color:transparent;color:var(--muted)}
 
-  button.ghost:hover{background:rgba(0,0,0,.05);color:var(--ink)}
+  button.ghost:hover{background:var(--tint);color:var(--ink)}
 
   /* The off switch for a control this server does not offer. It has to win
      against the rule the element is styled by — `label.field{display:flex}`,

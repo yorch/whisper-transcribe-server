@@ -516,6 +516,8 @@ server has the whole file. An upload that fails puts the file back in the list,
 so a network blip costs you a second press rather than a second drag of an
 hour-long recording.
 
+The pages follow the system's light or dark setting; there is no switch.
+
 **Main controls**
 
 - **Model** — `large-v3` for best accuracy, `large-v3-turbo` for roughly 4× the
