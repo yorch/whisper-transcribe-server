@@ -286,6 +286,10 @@
 
   .transcript:not(.labeled) .seg .sp{display:none}
 
+  .transcript.named .seg .sp{width:15ch}
+
+  #tracks-field{margin-top:8px}
+
   /* Who spoke, and for how long: the way into merging and naming speakers. */
   .people{display:flex;flex-wrap:wrap;align-items:center;gap:6px;margin:0 0 10px}
 

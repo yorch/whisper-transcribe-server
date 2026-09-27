@@ -1578,14 +1578,14 @@ function makeNode(tag){
 }
 const document = {createElement: (tag) => makeNode(tag)};
 const el = (id) => nodes[id] || (nodes[id] = makeNode(id));
-let MAX_MB = 0;
+let MAX_MB = 0, MAX_TRACKS = 10;
 const staged = [];
 let alerts = [], uploaded = [], uploadFails = false, shown = [];
 const alert = (message) => { alerts.push(message); };
 // The upload goes through postJob (XHR, for progress); report two progress
 // steps the way a browser would, and record what the widget said at each.
-async function postJob(body, onProgress){
-  uploaded.push("/api/jobs");
+async function postJob(body, onProgress, url = "/api/jobs"){
+  uploaded.push(url);
   for(const fraction of [0.5, 1]){
     onProgress(fraction);
     shown.push(el("up-state").textContent);
@@ -1616,6 +1616,8 @@ def stage_probe(body: str) -> dict:
                 "stage",
                 "unstage",
                 "startJobs",
+                "asCall",
+                "sendCall",
                 "showUpload",
                 "send",
             )
@@ -1773,6 +1775,36 @@ def test_a_failed_upload_goes_back_to_the_staging_list_in_order():
     ]
     assert probe["names"] == ["a.wav", "b.wav"], "staged order survives a failure"
     assert probe["disabled"] is False, "there is something to retry"
+
+
+@needs_node
+def test_a_call_goes_up_as_one_request_and_comes_back_whole_on_failure():
+    """Ticked, the staged files are one call: one request to /api/jobs/tracks,
+    not one job per file. A failure returns every file, since none was taken."""
+    probe = stage_probe(
+        """
+        stage([{name: "a.m4a", size: 10}]);
+        const alone = el("tracks-field").classes.has("locked");
+        stage([{name: "b.m4a", size: 10}]);
+        const offered = !el("tracks-field").classes.has("locked");
+        el("as-tracks").checked = true;
+        renderStaged();
+        const label = el("start").textContent;
+        await startJobs();
+        const sent = [...uploaded];
+        uploaded.length = 0;
+        uploadFails = true;
+        stage([{name: "c.m4a", size: 10}, {name: "d.m4a", size: 10}]);
+        await startJobs();
+        return {alone, offered, label, sent, back: staged.map(f => f.name), alerts};
+        """
+    )
+    assert probe["alone"] is True, "one file is not a call"
+    assert probe["offered"] is True
+    assert probe["label"] == "Transcribe the call (2 tracks)"
+    assert probe["sent"] == ["/api/jobs/tracks"]
+    assert probe["back"] == ["c.m4a", "d.m4a"]
+    assert probe["alerts"] == ["Upload failed for the call: the server said no"]
 
 
 @needs_node

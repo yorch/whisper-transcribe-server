@@ -642,6 +642,24 @@ record stays, and the job can be retried.
 Jobs run one at a time regardless of how many files you stage, so the GPU isn't
 fighting itself. Stage five files, press Transcribe, and walk away.
 
+### One call, one file per person
+
+Zoom can record a separate audio file for each participant (Settings →
+Recording → "Record a separate audio file of each participant who speaks";
+local recordings, host only). Stage those files together — two to ten of them
+— and tick **One call, one file per person**: they go up as one job, each file
+is one speaker, and the transcript is merged by time. No diarizer is involved,
+so nobody's lines can be handed to the wrong person, which is the one thing
+the speaker settings above cannot promise.
+
+Speakers are named from the file names (`audioJaneDoe11234567890.m4a` →
+"Jane Doe"; anything else gives the file's own name) and can be renamed or
+merged on the card like any other. Those names are speaker names: the audit
+log records a count and hashes, and the card is titled "Call · N tracks"
+rather than after anyone. Leave out Zoom's combined `audio_only` file, or it
+becomes a speaker of its own. All the tracks of a call share the upload limit
+(`--max-upload-mb`), and Retry re-runs every track.
+
 ### Checking the speaker settings on your own recordings
 
 The defaults were chosen on public and synthetic recordings

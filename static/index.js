@@ -100,6 +100,7 @@ async function refreshStatus(){
     el("r-loaded").textContent = (s.loaded_models && s.loaded_models.length)
       ? s.loaded_models.join(", ") : "none";
     MAX_MB = s.max_upload_mb;
+    MAX_TRACKS = s.max_tracks || MAX_TRACKS;
     RETRY_OK = s.retry_available;
     DIARIZE_OK = !!s.allow_diarize;
 
@@ -143,6 +144,7 @@ async function refreshStatus(){
 /* ---------- upload ---------- */
 let MAX_MB = 0, RETRY_OK = true, POPULATED = false, DIARIZE_OK = false;
 let SPEAKER_MODEL_DEFAULT = "";
+let MAX_TRACKS = 10;
 
 /* Auto, then every count the server accepts. A pure list so the choices can be
    tested without a browser; fillSpeakers() only turns it into options. */
@@ -227,8 +229,14 @@ function fmtSize(bytes){
   return `${i >= 2 ? n.toFixed(1) : Math.round(n)} ${units[i]}`;
 }
 
-function startLabel(count){
+function startLabel(count, asCall){
+  if(asCall) return `Transcribe the call (${count} tracks)`;
   return count > 1 ? `Transcribe ${count} files` : "Transcribe";
+}
+
+/* Whether the staged files go up as one call: only offered for 2 to 10. */
+function asCall(){
+  return staged.length >= 2 && staged.length <= MAX_TRACKS && el("as-tracks").checked;
 }
 
 /* Says out loud what the button does, so the controls above it read as input to
@@ -247,7 +255,9 @@ function renderStaged(){
   box.textContent = "";
   box.classList.toggle("locked", staged.length === 0);
   el("start").disabled = staged.length === 0;
-  el("start").textContent = startLabel(staged.length);
+  el("tracks-field").classList.toggle(
+    "locked", staged.length < 2 || staged.length > MAX_TRACKS);
+  el("start").textContent = startLabel(staged.length, asCall());
   el("run-note").textContent = stageNote(staged.length);
   staged.forEach((file, index) => {
     const row = document.createElement("div");
@@ -289,6 +299,8 @@ function unstage(index){
   renderStaged();
 }
 
+el("as-tracks").addEventListener("change", renderStaged);
+
 el("staged").addEventListener("click", (e) => {
   const button = e.target.closest("button[data-unstage]");
   if(button) unstage(Number(button.dataset.unstage));
@@ -300,19 +312,48 @@ el("start").addEventListener("click", startJobs);
    only from the button: nothing else sends a file. */
 async function startJobs(){
   if(!staged.length) return;
+  const call = asCall();
   const files = staged.splice(0, staged.length);
   renderStaged();
-  await send(files);
+  await (call ? sendCall(files) : send(files));
+}
+
+/* All the staged files as one call, in one request: the server needs them
+   together to know they are the same conversation. A failure puts every one
+   back, since none of them was accepted. */
+async function sendCall(files){
+  const total = files.reduce((sum, f) => sum + (Number(f.size) || 0), 0);
+  const label = {name: `Call \u00b7 ${files.length} tracks`, size: total};
+  showUpload(label, 0, 0);
+  try{
+    const fd = currentSettings();
+    for(const f of files) fd.append("files", f);
+    const r = await postJob(fd, (fraction) => showUpload(label, fraction, 0),
+                            "/api/jobs/tracks");
+    if(!r.ok){
+      let detail = r.statusText;
+      try{ detail = (await r.json()).detail || detail; }catch{}
+      throw new Error(detail);
+    }
+    await r.json();
+    await tick();
+  }catch(err){
+    if(err.message !== "unauthorised")
+      alert(`Upload failed for the call: ${err.message}`);
+    staged.push(...files);
+    renderStaged();
+  }
+  showUpload(null);
 }
 
 /* The upload itself. XHR rather than api(), because fetch cannot report upload
    progress, and an hour of audio over the LAN is minutes of a page that
    otherwise says nothing. Same header, same 401 handling; the result is shaped
    like a fetch Response so send() reads it the same way. */
-function postJob(body, onProgress){
+function postJob(body, onProgress, url = "/api/jobs"){
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
-    xhr.open("POST", "/api/jobs");
+    xhr.open("POST", url);
     const token = TOKENS.get();
     if(token) xhr.setRequestHeader("x-token", token);
     xhr.upload.onprogress = (e) => { if(e.lengthComputable) onProgress(e.loaded / e.total); };
@@ -612,6 +653,10 @@ function appendSegments(view, segments, live, total, labeled){
   /* The speaker column only takes room once there is something in it: a 9ch
      gap between every timestamp and its text read as broken layout. */
   view.transcript.classList.toggle("labeled", !!view.labeled);
+  // Real names ("Daniel Reyes") are wider than "Speaker 1", which the column
+  // was sized for.
+  view.transcript.classList.toggle("named",
+    !!view.names && Object.keys(view.names).length > 0);
   for(const seg of segments){
     const row = document.createElement("div");
     row.className = "seg";

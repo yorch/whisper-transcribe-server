@@ -45,6 +45,13 @@
 
     <div class="staged locked" id="staged" aria-live="polite"></div>
 
+    <!-- Only with two or more files staged. Zoom can record one audio file per
+         participant; sent as one call, each file is one named speaker and no
+         diarizer has to guess who spoke. -->
+    <label class="field locked" id="tracks-field"
+           title="Each file is one person's own audio, e.g. Zoom's 'separate audio file for each participant'">
+      <input type="checkbox" id="as-tracks"> One call, one file per person</label>
+
     <div class="uploading locked" id="uploading" role="status">
       <div class="up-line">
         <span class="up-name" id="up-name"></span>
