@@ -582,7 +582,8 @@ hour-long recording.
   **Relabel speakers** on the finished card. It runs only the speaker pass
   again, over the transcript the job already has — no model load, no
   re-transcription — and the result arrives as a new card, the old one left as
-  it was. It needs the job's word timings (Identify speakers turns them on) and
+  it was so you can compare. When the new labels are the keepers, **Remove the
+  original** on the new card clears the old one (it asks once, like Remove). It needs the job's word timings (Identify speakers turns them on) and
   its audio still on disk; otherwise use **Retry**. A pinned count is taken
   literally: pin one too many and a real voice gets split in two.
 

@@ -816,6 +816,12 @@ function actions(node, job){
       "Identify the speakers again using the Speakers count and Voice model "
       + "above, without transcribing again";
   const live = ["queued","loading","running"].includes(job.state);
+  /* A relabel leaves its original card for comparison; once the new labels
+     are the keepers, this clears the old one. Same two-click guard as Remove,
+     and the poll's sweep takes the button away once the original is gone. */
+  if(job.state === "done" && job.relabel_of && views.has(viewKey(job.relabel_of)))
+    add(node, "Remove the original", {del: job.relabel_of, confirm: "1"}, true)
+      .title = "Remove the card this one relabelled";
   /* A finished transcript lives only in the server's memory, so Remove is the
      one click that loses it for good: it asks twice. */
   add(node, live ? "Cancel" : "Remove",
@@ -1040,6 +1046,9 @@ async function poll(){
     for(const stale of [...known.keys()].filter(id => !live.includes(id))){
       const n = document.getElementById(viewKey(stale));
       if(n) n.remove();
+      // "Remove the original" on a relabelled card has nothing left to remove.
+      for(const b of el("jobs").querySelectorAll(`button[data-del="${stale}"]`))
+        b.remove();
       known.delete(stale);
       views.delete(viewKey(stale));
     }

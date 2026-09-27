@@ -155,6 +155,19 @@ const views = new Map();
 const RETRY_OK = true;
 const SPEAKER_MODEL_DEFAULT = "titanet-small";
 const jobsBox = {children: [], prepend: (kid) => { jobsBox.children.unshift(kid); }};
+// Enough of querySelectorAll for the one selector the sweep uses,
+// button[data-del="<id>"], found anywhere under the jobs area.
+const walk = (node, out = []) => {
+  for(const kid of node.children || []){ out.push([kid, node]); walk(kid, out); }
+  return out;
+};
+jobsBox.querySelectorAll = (selector) => {
+  const id = /data-del="([^"]+)"/.exec(selector)[1];
+  return walk(jobsBox).filter(([kid]) => kid.dataset && kid.dataset.del === id)
+    .map(([kid, parent]) => Object.assign(kid, {remove(){
+      parent.children.splice(parent.children.indexOf(kid), 1);
+    }}));
+};
 const domIds = new Map();
 function makeNode(){
   const node = {
@@ -682,6 +695,36 @@ def test_a_finished_labelled_card_shows_a_chip_per_speaker():
         ["Speaker 2 \u00b7 5s", {"chip": "d", "speaker": "2"}],
     ]
     assert probe["same"], "an open editor would be thrown away every poll"
+
+
+@needs_node
+def test_a_relabelled_card_offers_to_remove_its_original_until_it_is_gone():
+    probe = poll_probe(
+        """
+        const listed = ["new", "orig"];
+        const done = (id, extra) => Object.assign({id, filename: "a.wav", state: "done",
+          progress: 1, opts: {model: "m"}, segment_count: 0, segments: [],
+          speaker_labels: false, elapsed: 1, duration: 1, language: "en"}, extra);
+        api = async (path) => {
+          if(path === "/api/jobs")
+            return {ok: true, json: async () => ({jobs: listed.map(id => (
+              {id, state: "done", progress: 1, segment_count: 0}))})};
+          const id = /\\/api\\/jobs\\/([^?]+)/.exec(path)[1];
+          return {ok: true, json: async () => done(id,
+            id === "new" ? {relabel_of: "orig"} : {})};
+        };
+        const buttons = () => views.get(viewKey("new")).actions.children
+          .map(b => [b.textContent, b.dataset.del || ""]);
+        await tick();
+        const offered = buttons();
+        listed.pop();                // the original is removed
+        await tick();
+        return {offered, after: buttons()};
+        """
+    )
+    assert ["Remove the original", "orig"] in probe["offered"], probe["offered"]
+    assert ["Remove the original", "orig"] not in probe["after"], probe["after"]
+    assert ["Remove", "new"] in probe["after"], "its own Remove is untouched"
 
 
 @needs_node
