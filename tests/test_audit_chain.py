@@ -944,12 +944,14 @@ def test_an_in_place_same_size_rewrite_is_recounted(tmp_path):
     log = fresh(tmp_path)
     log.dir.mkdir(parents=True, exist_ok=True)
     path = log.dir / "audit-2026-01-01.jsonl"
-    path.write_text('{"e":0}\n{"e":1}\n')
+    # newline="\n" throughout: Windows text mode writes \r\n, and the two
+    # states would then differ in size, which is not what this test is about.
+    path.write_text('{"e":0}\n{"e":1}\n', newline="\n")
     assert log.read_page("2026-01-01", limit=1).total == 2
 
     before = path.stat()
     time.sleep(0.01)  # so a coarse-granularity clock still moves
-    with path.open("w", encoding="utf-8") as fh:
+    with path.open("w", encoding="utf-8", newline="\n") as fh:
         fh.write('{"e":"aaaaaaa"}\n')  # same inode, same bytes, one line
     after = path.stat()
     if after.st_mtime_ns == before.st_mtime_ns:
@@ -1083,11 +1085,13 @@ def test_a_same_size_replacement_is_caught_by_file_identity(tmp_path):
     log = fresh(tmp_path)
     log.dir.mkdir(parents=True, exist_ok=True)
     path = log.dir / "audit-2026-09-18.jsonl"
-    path.write_text('{"e":0}\n{"e":1}\n{"e":2}\n{"e":3}\n')
+    # newline="\n": in Windows text mode the extra \r per line would make the
+    # four-line file two bytes longer than the two-line one.
+    path.write_text('{"e":0}\n{"e":1}\n{"e":2}\n{"e":3}\n', newline="\n")
     assert log.read_page("2026-09-18", limit=1).total == 4
 
     other = tmp_path / "other.jsonl"
-    other.write_text('{"e":"aaaaaaa"}\n{"e":"bbbbbbb"}\n')
+    other.write_text('{"e":"aaaaaaa"}\n{"e":"bbbbbbb"}\n', newline="\n")
     assert other.stat().st_size == path.stat().st_size, "the test proves identity"
     os.replace(other, path)
 
