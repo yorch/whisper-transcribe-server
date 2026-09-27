@@ -4287,9 +4287,15 @@ def name_speaker(
 
 @app.get("/api/jobs")
 def list_jobs() -> dict[str, Any]:
+    # Shallow copies under the lock, the work after it: job_public stats each
+    # source file and scans the segments, and the worker needs this lock for
+    # every segment it publishes. A copy is a consistent snapshot because the
+    # worker replaces a job's fields (patch_job, the segment list) rather than
+    # mutating them in place.
     with JOBS_LOCK:
-        jobs = sorted(JOBS.values(), key=lambda j: j["created"], reverse=True)
-        return {"jobs": [job_public(j, include_segments=False) for j in jobs]}
+        jobs = [dict(j) for j in JOBS.values()]
+    jobs.sort(key=lambda j: j["created"], reverse=True)
+    return {"jobs": [job_public(j, include_segments=False) for j in jobs]}
 
 
 @app.get("/api/jobs/{job_id}")

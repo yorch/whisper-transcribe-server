@@ -416,3 +416,21 @@ def test_day_file_is_named_for_the_utc_day(client, configured):
     upload(client)
     day = time.strftime("%Y-%m-%d", time.gmtime())
     assert (configured.audit.dir / f"audit-{day}.jsonl").exists()
+
+
+def test_the_job_list_does_its_work_outside_the_lock(client, configured, monkeypatch):
+    """job_public stats each job's source file and scans its segments. Under
+    JOBS_LOCK, every 1.2 s poll made the worker wait on that for every
+    segment it published."""
+    configured.make_job()
+    real = s.job_public
+    held: list[bool] = []
+
+    def spy(job, include_segments=True):
+        held.append(s.JOBS_LOCK.locked())
+        return real(job, include_segments)
+
+    monkeypatch.setattr(s, "job_public", spy)
+    assert client.get("/api/jobs").status_code == 200
+
+    assert held == [False]
