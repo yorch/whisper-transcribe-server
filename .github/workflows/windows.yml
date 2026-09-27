@@ -140,6 +140,16 @@ jobs:
             throw "the report has no readiness probe; --with-server did not run"
           }
           if ($proc.ExitCode -ne 0) {
+            # The report says *that* the server did not come up; the server's
+            # own output says why, and it is not in the report.
+            $serverLog = Join-Path $env:LOCALAPPDATA `
+              "TranscriptionServer\self-test-server.log"
+            if (Test-Path $serverLog) {
+              Write-Host "---- self-test-server.log (last 80 lines) ----"
+              Get-Content $serverLog -Tail 80
+            } else {
+              Write-Host "no self-test-server.log: the server never started"
+            }
             throw "bundled launcher self-test failed"
           }
         timeout-minutes: 15
