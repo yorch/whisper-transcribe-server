@@ -575,8 +575,9 @@ hour-long recording.
   Names are treated like prompt text in the audit trail: the main log records
   only a length and a hash, the names themselves go to the job's sidecar in
   `prompts/`, readable with the audit token, and `--no-audit-prompts` keeps
-  them out of it too. A relabel starts a new job without the old job's names,
-  since its speakers are drawn afresh.
+  them out of it too. A relabel draws its speakers afresh, so each new speaker
+  takes the name of the old speaker they overlap most in time; one who matches
+  nobody stays "Speaker N".
 
   **Got the count wrong?** Set Speakers to the right number and press
   **Relabel speakers** on the finished card. It runs only the speaker pass

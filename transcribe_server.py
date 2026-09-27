@@ -2717,7 +2717,16 @@ def job_public(job: dict[str, Any], include_segments: bool = True) -> dict[str, 
         k: v
         for k, v in job.items()
         # "tracks" holds server paths, like "path"; the page gets a count.
-        if k not in ("path", "segments", "opts", "transcribed", "tracks")
+        if k
+        not in (
+            "path",
+            "segments",
+            "opts",
+            "transcribed",
+            "tracks",
+            "prior_names",
+            "prior_turns",
+        )
     }
     out["opts"] = public_opts(job["opts"])
     now = time.time()
@@ -3212,6 +3221,54 @@ def fold_minor_speakers(
     return relabel_speakers(out), len(minor)
 
 
+def carry_speaker_names(
+    old: list[dict[str, Any]], names: dict[str, str], new: list[dict[str, Any]]
+) -> dict[str, str]:
+    """Names for a relabel's speakers, from who they overlap most in time.
+
+    A relabel numbers its speakers afresh, so "Speaker 1" may be someone else.
+    Each new speaker takes the name of the named old speaker whose lines
+    overlap theirs most; pairs are taken largest overlap first and a name is
+    given once, so a voice the relabel split in two keeps its name on the
+    larger half and the other half stays unnamed. Both lists are time-ordered,
+    so one cursor walks them together, as in align_speakers.
+    """
+    overlap: dict[tuple[int, int], float] = {}
+    olds = sorted(
+        (
+            x
+            for x in old
+            if segment_speaker(x) is not None and str(x["speaker"]) in names
+        ),
+        key=lambda x: float(x["start"]),
+    )
+    cursor = 0
+    for seg in sorted(new, key=lambda x: float(x["start"])):
+        speaker = segment_speaker(seg)
+        if speaker is None:
+            continue
+        start, end = float(seg["start"]), float(seg["end"])
+        while cursor < len(olds) and float(olds[cursor]["end"]) <= start:
+            cursor += 1
+        index = cursor
+        while index < len(olds) and float(olds[index]["start"]) < end:
+            amount = _overlap(
+                start, end, float(olds[index]["start"]), float(olds[index]["end"])
+            )
+            if amount > 0:
+                key = (speaker, int(olds[index]["speaker"]))
+                overlap[key] = overlap.get(key, 0.0) + amount
+            index += 1
+    carried: dict[str, str] = {}
+    used: set[int] = set()
+    for (speaker, previous), _amount in sorted(overlap.items(), key=lambda kv: -kv[1]):
+        if str(speaker) in carried or previous in used:
+            continue
+        carried[str(speaker)] = names[str(previous)]
+        used.add(previous)
+    return carried
+
+
 def renumber_segments(
     segments: list[dict[str, Any]],
 ) -> tuple[list[dict[str, Any]], dict[int, int]]:
@@ -3675,6 +3732,13 @@ def label_and_finish(
                     job_id, segments=list(collected), transcribed=transcribed
                 ):
                     return
+                prior = job.get("prior_names")
+                if prior:
+                    carried = carry_speaker_names(
+                        job.get("prior_turns") or [], prior, collected
+                    )
+                    patch_job(job_id, speaker_names=carried)
+                    store_speaker_names(job_id, job["filename"], carried)
                 audit(
                     "job.diarized",
                     job=job_id,
@@ -4843,6 +4907,18 @@ def relabel_speakers_endpoint(
         language=old.get("language"),
         duration=old.get("duration"),
     )
+    if old.get("speaker_names"):
+        # So the new speakers can inherit names by who overlaps whom; the
+        # timeline keeps only times and numbers, never text.
+        patch_job(
+            new_id,
+            prior_names=dict(old["speaker_names"]),
+            prior_turns=[
+                {"start": x["start"], "end": x["end"], "speaker": x["speaker"]}
+                for x in old["segments"]
+                if segment_speaker(x) is not None
+            ],
+        )
     JOB_QUEUE.put(new_id)
     audit(
         "job.relabelled",

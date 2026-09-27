@@ -11,6 +11,7 @@ model, and must pass without sherpa-onnx.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
@@ -235,3 +236,69 @@ def test_a_relabel_cancelled_mid_pass_stays_cancelled(client, configured, monkey
     s.run_job(job_id)
 
     assert s.JOBS[job_id]["state"] == "cancelled"
+
+
+# --------------------------------------------------------------------------- #
+# Names carry over to a relabel, by who overlaps whom in time
+# --------------------------------------------------------------------------- #
+
+
+def seg(start: float, end: float, speaker: int) -> dict[str, Any]:
+    return {"start": start, "end": end, "text": "x", "speaker": speaker}
+
+
+def test_each_new_speaker_takes_the_name_they_overlap_most():
+    old = [seg(0, 4, 1), seg(4, 8, 2), seg(8, 9, 3)]
+    new = [seg(0, 3.5, 1), seg(3.5, 9, 2)]  # the old 2 and 3 are now one voice
+
+    names = s.carry_speaker_names(old, {"1": "Alice", "2": "Bob"}, new)
+
+    assert names == {"1": "Alice", "2": "Bob"}
+
+
+def test_a_name_is_given_once_and_a_stranger_stays_unnamed():
+    old = [seg(0, 10, 1)]
+    new = [seg(0, 6, 1), seg(6, 10, 2)]  # one old voice split in two
+
+    names = s.carry_speaker_names(old, {"1": "Alice"}, new)
+
+    assert names == {"1": "Alice"}, "the larger overlap keeps the name"
+
+
+def test_a_relabel_keeps_the_names_it_can_match(client, configured, monkeypatch):
+    monkeypatch.setattr(s, "load_model", no_model)
+    old = finished_job(configured)
+    s.patch_job(
+        old,
+        segments=[
+            {
+                **TRANSCRIBED[0],
+                "text": "Hello there.",
+                "start": 0.0,
+                "end": 1.5,
+                "speaker": 1,
+            },
+            {
+                **TRANSCRIBED[0],
+                "text": "Hi back.",
+                "start": 2.5,
+                "end": 4.0,
+                "speaker": 2,
+            },
+        ],
+        transcribed=[dict(t) for t in TRANSCRIBED],
+        speaker_names={"1": "Alice Nightjar", "2": "Bob"},
+    )
+    monkeypatch.setattr(s, "diarize_job", lambda *_a: TWO_TURNS)
+    new = client.post(f"/api/jobs/{old}/speakers", data={"speakers": "2"}).json()["id"]
+
+    s.run_job(new)
+
+    assert s.JOBS[new]["speaker_names"] == {"1": "Alice Nightjar", "2": "Bob"}
+    assert configured.audit.read_prompt(new)["speaker_names"] == {
+        "1": "Alice Nightjar",
+        "2": "Bob",
+    }
+    assert "Alice" not in json.dumps(configured.events()), "names stay off the log"
+    listed = client.get("/api/jobs").json()["jobs"]
+    assert all("prior_" not in key for job in listed for key in job)
