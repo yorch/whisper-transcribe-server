@@ -42,7 +42,8 @@ parallel sessions, and a stale number is worse than none. `uv run ruff format
 hygiene above); a clean `ruff check` does not imply a formatted file.
 
 On macOS `tests/test_cuda_bootstrap.py::test_preload_loads_by_absolute_path`
-fails: it asserts Linux `libcublas.so` loading. It is not a regression.
+skips: its stand-in for libcublas is a real system library file, and macOS
+keeps those in the dyld shared cache rather than on disk.
 
 `uv run tests/test_cuda_bootstrap.py` runs the same suite in a throwaway env
 with no `.venv` and no CUDA wheels; the two `tests/test_gpu.py` tests that need

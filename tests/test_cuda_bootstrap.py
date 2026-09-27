@@ -765,7 +765,10 @@ def system_library() -> Path | None:
     if not found:
         return None
     if "/" in found:
-        return Path(found)
+        # macOS answers /usr/lib/libc.dylib, which has not been a file since
+        # Big Sur moved system libraries into the dyld shared cache: a symlink
+        # to it dangles, and the test would fail for want of a stand-in.
+        return Path(found) if Path(found).is_file() else None
     for directory in (
         "/lib/x86_64-linux-gnu",
         "/usr/lib/x86_64-linux-gnu",
@@ -781,8 +784,8 @@ def system_library() -> Path | None:
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX-only path")
 def test_preload_loads_by_absolute_path(tmp_path):
     real = system_library()
-    if real is None:  # pragma: no cover - unusual container
-        pytest.skip("no system library to stand in for libcublas")
+    if real is None:  # pragma: no cover - macOS, or an unusual container
+        pytest.skip("no system library file to stand in for libcublas")
 
     (tmp_path / "libcublas.so.12").symlink_to(real)
 
