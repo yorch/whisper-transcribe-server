@@ -1026,6 +1026,7 @@ const controls = {
 };
 const el = (id) => controls[id];
 let DIARIZE_OK = false;
+let wordsChoice = false;
 """
 
 
@@ -1126,19 +1127,24 @@ def test_the_speaker_count_is_disabled_while_labels_are_off():
 
 
 @needs_node
-def test_unticking_speakers_releases_the_word_timing_box():
-    """Unlocking must not also untick it: once the box is the operator's again,
-    whatever they last chose should stand."""
+def test_unticking_speakers_puts_back_the_operators_own_choice():
+    """Speaker labels force word timings on. Releasing that lock used to leave
+    the box ticked -- a slow setting the operator never chose. It now returns
+    to what they chose themselves: off by default, on if they ticked it."""
     probe = control_probe(
         """
         DIARIZE_OK = true; controls.diarize.checked = true; syncDiarize();
         controls.diarize.checked = false; syncDiarize();
-        return {disabled: controls.words.disabled, title: controls.words.title,
-                words: controls.words.checked};
+        const never = {disabled: controls.words.disabled, title: controls.words.title,
+                       words: controls.words.checked};
+        wordsChoice = true;   // what the change listener records for a tick
+        controls.diarize.checked = true; syncDiarize();
+        controls.diarize.checked = false; syncDiarize();
+        return {never, chosen: controls.words.checked};
         """
     )
-    assert probe["disabled"] is False and probe["title"] == ""
-    assert probe["words"] is True, "the tick itself is left as it was"
+    assert probe["never"] == {"disabled": False, "title": "", "words": False}
+    assert probe["chosen"] is True, "a tick the operator made survives the lock"
 
 
 @needs_node

@@ -606,8 +606,10 @@ hour-long recording.
 - **Translate to English** — switches the task from transcribe to translate.
 - **Word-level timings** — costs time, but the exported `.json` word timings
   are useful on their own, and **Identify speakers** turns this on for you. That
-  box is ticked by default, so this one is too and is locked while it is; on a
-  server started with `--no-diarize` neither happens.
+  box is ticked by default, so this one is too and is locked while it is.
+  Untick Identify speakers and this goes back to your own choice — off, unless
+  you ticked it yourself. On a server started with `--no-diarize` neither
+  happens.
 - **Carry context forward** — off by default, and that's deliberate. Whisper's
   `condition_on_previous_text` is the usual cause of repetition loops on long
   recordings: one bad segment poisons the context and it repeats a phrase for

@@ -436,9 +436,15 @@ function locksWordTimings(diarizeAvailable, boxTicked){
   return !!diarizeAvailable && !!boxTicked;
 }
 
+/* The operator's own tick on Word-level timings, kept apart from the lock:
+   speaker labels force the box on, and releasing that lock puts back what the
+   operator chose rather than leaving a slow setting nobody asked for. */
+let wordsChoice = false;
+
 function syncDiarize(){
   const on = locksWordTimings(DIARIZE_OK, el("diarize").checked);
   if(on) el("words").checked = true;
+  else if(el("words").disabled) el("words").checked = wordsChoice;
   el("words").disabled = on;
   el("words").title = on ? "Required for speaker labels" : "";
   // A count for labels nobody asked for would read as a setting that applies.
@@ -446,6 +452,8 @@ function syncDiarize(){
   el("speaker-model").disabled = !el("diarize").checked;
 }
 el("diarize").addEventListener("change", syncDiarize);
+// Only a change the operator makes: a locked box cannot be changed by hand.
+el("words").addEventListener("change", () => { wordsChoice = el("words").checked; });
 /* Deliberately not called here: DIARIZE_OK is only known once /api/status has
    answered, and running this before then would lock the word-timing box for a
    feature the server may not offer. Called from the status handler instead. */
