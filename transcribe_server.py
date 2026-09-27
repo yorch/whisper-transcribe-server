@@ -3057,6 +3057,10 @@ def diarize_job(
     job_id: str, audio_path: str, opts: dict[str, Any]
 ) -> list[dict[str, Any]] | None:
     """The job-aware wrapper: fetch, report progress, honour Cancel."""
+    # patch_job only refuses a *state* change on a cancelled job; a status line
+    # would still land over "Cancelled", so every write here checks first.
+    if job_cancelled(job_id):
+        return None
     patch_job(job_id, message="Fetching diarization models", phase="diarizing")
     models = fetch_diarize_models_or_explain(opts.get("speaker_model"))
     if job_cancelled(job_id):
@@ -3070,6 +3074,8 @@ def diarize_job(
                 message=f"Identifying speakers {percent}%",
             )
 
+    if job_cancelled(job_id):
+        return None
     patch_job(job_id, message="Identifying speakers", phase="diarizing")
     return run_diarizer(
         audio_path,

@@ -711,3 +711,14 @@ def test_the_real_diarizer_finds_the_expected_speakers(tmp_path):
     assert all(entry["start"] < entry["end"] for entry in turns)
     if expected:
         assert {entry["speaker"] for entry in turns} == set(range(1, expected + 1))
+
+
+def test_a_cancelled_job_keeps_saying_cancelled(configured, monkeypatch):
+    """The speaker pass wrote its own status over a cancel -- "Identifying
+    speakers" on a card whose job was already stopped."""
+    job_id = configured.make_job(diarize="true")
+    s.patch_job(job_id, state="cancelled", message="Cancelled")
+    monkeypatch.setattr(s, "fetch_diarize_models_or_explain", lambda *_a: {})
+
+    assert s.diarize_job(job_id, "audio.wav", s.JOBS[job_id]["opts"]) is None
+    assert s.JOBS[job_id]["message"] == "Cancelled"
