@@ -795,7 +795,14 @@ def end_to_end_probe(timeout: float = 900.0) -> tuple[bool, bool]:
     if uv is None:
         return False, False
     script = server_script()
-    command = build_command(uv, port, [], script)
+    # --device cpu, because what this proves is that the bundle starts a server
+    # and that the launcher's credentials are the ones it accepts -- not that
+    # the machine has a GPU. Left on the default the server correctly refuses to
+    # serve where no CUDA device is visible, which is what kept a GPU-less CI
+    # runner red for a reason that had nothing to do with the bundle. The tray
+    # itself still starts on whatever device the operator chose; this is the
+    # automated check, not the user's path.
+    command = build_command(uv, port, ["--device", "cpu"], script)
     env = child_env(None)
     env["TRANSCRIBE_TOKEN"] = token
     if not audit_open_requested([], env):

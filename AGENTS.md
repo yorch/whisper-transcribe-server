@@ -93,6 +93,12 @@ launcher/transcribe_tray.py --self-test                # fast, headless
 launcher/transcribe_tray.py --self-test --with-server   # also probes a real server
 ```
 
+`--with-server` starts the server on `--device cpu` on purpose: it verifies the
+bundle and the credentials, not that the host has a GPU, and the server rightly
+refuses to serve on a GPU-less machine under its default device. Keep that pin —
+without it the check fails on any CI runner and looks like a broken bundle.
+`tests/test_launcher_self_test.py` fails if it is dropped.
+
 ## Constraints
 
 - **`transcribe_server.py` stays a PEP 723 script.** Its inline `# /// script`

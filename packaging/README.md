@@ -100,6 +100,11 @@ For a fuller check, including starting a real server and probing it:
 & "dist\TranscriptionServer\Transcription Server.exe" --self-test --with-server
 ```
 
+The probe starts the server with `--device cpu`. It is proving that the bundle
+starts a server and that the launcher's credentials are the ones it accepts, not
+that the machine has a GPU — and on a GPU-less machine the server correctly
+refuses to serve on its default device, which is what it did on the CI runner.
+
 ## Known gaps
 
 Being explicit about what has and has not been exercised:
@@ -110,6 +115,14 @@ Being explicit about what has and has not been exercised:
 - **The Windows build itself is untested by the author** — no Windows machine
   was available. The spec, the PowerShell script and the Inno Setup script are
   written but unverified. Expect to iterate on the first build.
+- **The first real Windows run was CI's, and it found one thing.** That job had
+  never run: it needs the Python suite, which was failing on Windows for
+  unrelated reasons, so the bundle job was skipped every time. Once the suite
+  passed, the bundle built and every check passed except the two that start a
+  real server, which failed because the probe used the server's default device
+  and the runner has no GPU. The probe pins `--device cpu` now. Everything else
+  — the PyInstaller spec, the vendored ffmpeg and uv, the icon, the token files
+  — built and reported as expected on that run.
 - **Untested Windows-specific paths:** `CREATE_NO_WINDOW`, `os.startfile` for
   the log, the `clip` clipboard call, `os.add_dll_directory` for CUDA, and
   `netsh` firewall rules.

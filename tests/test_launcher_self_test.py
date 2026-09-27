@@ -75,6 +75,39 @@ def test_the_self_test_checks_mode_bits_where_they_mean_something(stubbed, capsy
     assert "all checks passed" in out
 
 
+def test_the_end_to_end_probe_does_not_need_a_gpu(stubbed, monkeypatch):
+    """It proves the bundle starts a server, not that the host has a GPU.
+
+    On the default device the server correctly refuses to serve where no CUDA
+    device is visible, which is what kept the Windows bundle job red for a
+    reason that had nothing to do with the bundle.
+    """
+    captured: dict[str, list[str]] = {}
+
+    class FakeServer:
+        def __init__(self, command, env, log_path):
+            captured["command"] = command
+
+        def start(self):
+            pass
+
+        def stop(self):
+            pass
+
+    monkeypatch.setattr(launcher, "ServerProcess", FakeServer)
+    monkeypatch.setattr(launcher, "wait_for_ready", lambda *a, **k: True)
+    monkeypatch.setattr(launcher, "audit_probe", lambda *a, **k: True)
+
+    ready, audit_ready = launcher.end_to_end_probe()
+
+    assert ready and audit_ready
+    command = captured["command"]
+    assert "--device" in command, "the probe must pin a device"
+    assert command[command.index("--device") + 1] == "cpu", (
+        "and it must be one that exists on a machine with no GPU"
+    )
+
+
 def test_the_self_test_skips_both_credential_checks_on_windows(
     stubbed, monkeypatch, capsys
 ):
