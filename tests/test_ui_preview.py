@@ -119,7 +119,7 @@ def node_argv(*args: str) -> list[str]:
 
 def run_node(source: str) -> str:
     result = subprocess.run(  # noqa: S603 - fixed argv, no shell
-        node_argv("-e", source), capture_output=True, text=True
+        node_argv("-e", source), capture_output=True, text=True, encoding="utf-8"
     )
     assert result.returncode == 0, f"node failed:\n{result.stderr}"
     return result.stdout

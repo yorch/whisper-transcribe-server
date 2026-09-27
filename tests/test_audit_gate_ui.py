@@ -74,7 +74,7 @@ def relock(mode: str) -> dict:
         + " main: [...nodes.main.classes], off: [...nodes.off.classes]}));"
     )
     result = subprocess.run(  # noqa: S603 - fixed argv, no shell
-        node_argv("-e", program), capture_output=True, text=True
+        node_argv("-e", program), capture_output=True, text=True, encoding="utf-8"
     )
     assert result.returncode == 0, f"node failed:\n{result.stderr}"
     return json.loads(result.stdout)

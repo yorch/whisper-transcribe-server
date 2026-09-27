@@ -65,3 +65,17 @@ def test_the_lock_pairs_sherpa_onnx_with_its_native_core():
     }
     assert set(versions) == {"sherpa-onnx", "sherpa-onnx-core"}, versions
     assert versions["sherpa-onnx"] == versions["sherpa-onnx-core"], versions
+
+
+def test_windows_ci_installs_every_inline_dependency_but_cuda():
+    """CI builds its own package list rather than the lock (the lock pulls 2 GB
+    of CUDA wheels). It drifted once -- no numpy, no sherpa-onnx, so the speaker
+    code never ran on Windows -- and nothing noticed."""
+    workflow = (ROOT / ".github/workflows/windows.yml").read_text(encoding="utf-8")
+    listed = {m.lower() for m in re.findall(r'--with "?([A-Za-z0-9_.-]+)', workflow)}
+    wanted = {
+        re.split(r"[\[<>=;! ]", dep, maxsplit=1)[0].lower()
+        for dep in inline_metadata(ROOT / "transcribe_server.py")["dependencies"]
+    }
+    missing = {name for name in wanted - listed if not name.startswith("nvidia-")}
+    assert not missing, f"windows.yml DEPS lacks {sorted(missing)}"

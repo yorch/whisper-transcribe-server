@@ -125,7 +125,8 @@ def test_a_wsl_style_install_is_found_without_path(monkeypatch):
     and they are not on PATH, so a which()-only lookup finds nothing."""
     monkeypatch.setattr(s.shutil, "which", lambda name: None)
     wanted = "/usr/lib/wsl/lib/nvidia-smi"
-    monkeypatch.setattr(s.Path, "is_file", lambda self: str(self) == wanted)
+    # as_posix, not str: on Windows str() of this path uses backslashes.
+    monkeypatch.setattr(s.Path, "is_file", lambda self: self.as_posix() == wanted)
     assert s.find_nvidia_smi() == wanted
 
 

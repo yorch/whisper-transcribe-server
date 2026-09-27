@@ -39,12 +39,13 @@ concurrency:
 env:
   # One place to bump; both jobs must agree or the venv and the bundle drift.
   PYTHON: "3.12"
-  # Everything transcribe_server.py declares inline, plus the launcher's extras
-  # and the test-only packages.
+  # Everything transcribe_server.py declares inline except the CUDA wheels
+  # (2 GB, and no GPU here), plus the launcher's extras and the test-only
+  # packages. tests/test_project_metadata.py fails if this drifts.
   DEPS: >-
     --with pytest --with httpx --with fastapi --with "uvicorn[standard]"
-    --with python-multipart --with faster-whisper --with tomli
-    --with pystray --with pillow
+    --with python-multipart --with faster-whisper --with numpy
+    --with sherpa-onnx --with tomli --with pystray --with pillow
 
 jobs:
   test:
