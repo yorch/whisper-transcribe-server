@@ -107,12 +107,17 @@ Being explicit about what has and has not been exercised:
 - **The launcher logic and the supervisor path are tested** (self-test, and
   `--self-test --with-server` starts a real server and probes it). That was run
   on Linux; the code is platform-neutral apart from the Windows-only branches.
-- **The Windows build itself is untested by the author** — no Windows machine
-  was available. The spec, the PowerShell script and the Inno Setup script are
-  written but unverified. Expect to iterate on the first build.
-- **Untested Windows-specific paths:** `CREATE_NO_WINDOW`, `os.startfile` for
-  the log, the `clip` clipboard call, `os.add_dll_directory` for CUDA, and
-  `netsh` firewall rules.
+- **The Windows build is verified in CI, not on a desktop.** The `windows`
+  workflow runs the PyInstaller spec, the PowerShell script and the Inno Setup
+  script on `windows-latest`, then starts the bundled launcher with
+  `--self-test --with-server`: it launches a real server through the vendored
+  uv (on CPU — the runner has no GPU), probes it, stops it, and fails if the
+  server outlives the launcher. What CI cannot do is click the tray icon or
+  run on a machine with a GPU; nobody has installed it by hand yet.
+- **Untested Windows-specific paths:** `os.startfile` for the log, the `clip`
+  clipboard call, `os.add_dll_directory` for CUDA on a real GPU, and `netsh`
+  firewall rules. (`CREATE_NO_WINDOW` and stopping the server's whole process
+  tree with `taskkill /T` do run in CI.)
 - **No code signing.** Windows SmartScreen will warn on first run, and some
   antivirus products flag PyInstaller output. Signing needs a certificate.
 - **No auto-update.** Rebuild and reinstall to update, which also refreshes the

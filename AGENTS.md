@@ -86,7 +86,8 @@ launcher-aware code. Keep it that way — no state file, no protocol.
 
 The CUDA runtime is deliberately not bundled (2.2 GB; `uv` resolves it on first
 run). `packaging/README.md` records what is and is not verified: the launcher
-logic is tested, the Windows build is not (no Windows machine was available).
+logic is tested, and the Windows build and a real-server self-test of the
+bundle run in CI on every push; the tray UI and a GPU machine are not.
 
 ```bash
 launcher/transcribe_tray.py --self-test                # fast, headless

@@ -1,8 +1,8 @@
 name: windows
 
-# The Windows build has never been run locally — no Windows machine was
-# available — so this is the only thing that actually verifies it. It also runs
-# the Python suite on Windows, which the author could not do either.
+# No Windows machine is available locally, so this is the only thing that
+# verifies the Windows build: the suite on Windows, then the bundle, the
+# installer, and a real-server self-test of the bundle.
 #
 # Everything here is a plain `uv run --no-project`, resolving the scripts'
 # inline dependencies the way users do. pyproject.toml and uv.lock describe the
