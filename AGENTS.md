@@ -147,6 +147,15 @@ launcher/transcribe_tray.py --self-test --with-server   # also probes a real ser
   under a single hold of `JOBS_LOCK` (no `get_job`/`patch_job` inside), and
   bumps `labels_rev` -- the page's poll signature includes it, because a merge
   changes nothing else a poll can see.
+- **A call (`POST /api/jobs/tracks`) is one job over several source files.**
+  `job["tracks"]` holds their paths; anything that touches a job's source goes
+  through `job_paths()` -- retention, `source_shared`, retry, `can_retry`,
+  the startup sweep -- or it will delete, keep or check only the first track.
+  `job_public` must keep excluding `tracks` (server paths), and a call's
+  `filename` must never contain a participant's name: every event about the
+  job logs it. Names come from the file names into `speaker_names`, so they
+  follow the rule below. Tracks are published in track order and sorted at
+  the end, which is why the sort bumps `labels_rev`.
 - **Speaker names never reach the main audit log.** A name is visible to the
   app (it renders the transcript), but `job.speaker_named` records only
   `name_len` and `name_sha256`; the text lives in the job's sidecar via

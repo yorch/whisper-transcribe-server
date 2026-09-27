@@ -2615,19 +2615,28 @@ def get_job(job_id: str) -> dict[str, Any]:
         return job
 
 
+def job_paths(job: dict[str, Any]) -> list[str]:
+    """Every source file a job owns: one upload, or a call's tracks."""
+    tracks = job.get("tracks")
+    return [str(t["path"]) for t in tracks] if tracks else [str(job["path"])]
+
+
 def source_shared(path: str, exclude_id: str) -> bool:
     """A retried job reuses the original upload; don't delete it out from under."""
     with JOBS_LOCK:
-        return any(j["path"] == path and j["id"] != exclude_id for j in JOBS.values())
+        return any(
+            path in job_paths(j) and j["id"] != exclude_id for j in JOBS.values()
+        )
 
 
 def drop_source(job: dict[str, Any]) -> None:
     if ARGS.source_retention == "forever":
         return
-    if source_shared(job["path"], job["id"]):
-        return
-    with contextlib.suppress(OSError):
-        Path(job["path"]).unlink(missing_ok=True)
+    for path in job_paths(job):
+        if source_shared(path, job["id"]):
+            continue
+        with contextlib.suppress(OSError):
+            Path(path).unlink(missing_ok=True)
 
 
 def prune_jobs() -> None:
@@ -2678,6 +2687,11 @@ def relabel_refusal(job: dict[str, Any]) -> str | None:
     One function for both the endpoint's refusal and the page's can_relabel,
     so the button is never offered for a request the server would turn down.
     """
+    if job.get("tracks"):
+        return (
+            "This call's speakers come from its tracks, one per person; merge "
+            "or rename them on the card instead"
+        )
     if not ARGS.allow_diarize:
         return "Speaker identification is turned off on this server"
     if job["state"] != "done":
@@ -2691,7 +2705,7 @@ def relabel_refusal(job: dict[str, Any]) -> str | None:
             "This transcript has no word timings, which speaker labels need; "
             "use Retry with Identify speakers ticked"
         )
-    if not Path(job["path"]).exists():
+    if not all(Path(path).exists() for path in job_paths(job)):
         return "The source audio is no longer on disk; re-upload it"
     return None
 
@@ -2702,7 +2716,8 @@ def job_public(job: dict[str, Any], include_segments: bool = True) -> dict[str, 
     out = {
         k: v
         for k, v in job.items()
-        if k not in ("path", "segments", "opts", "transcribed")
+        # "tracks" holds server paths, like "path"; the page gets a count.
+        if k not in ("path", "segments", "opts", "transcribed", "tracks")
     }
     out["opts"] = public_opts(job["opts"])
     now = time.time()
@@ -2710,9 +2725,11 @@ def job_public(job: dict[str, Any], include_segments: bool = True) -> dict[str, 
     finished = job.get("finished")
     out["elapsed"] = round((finished or now) - started, 1) if started else 0.0
     out["segment_count"] = len(job["segments"])
-    out["can_retry"] = (
-        job["state"] in ("done", "error", "cancelled") and Path(job["path"]).exists()
+    out["can_retry"] = job["state"] in ("done", "error", "cancelled") and all(
+        Path(path).exists() for path in job_paths(job)
     )
+    if job.get("tracks"):
+        out["track_count"] = len(job["tracks"])
     out["can_relabel"] = relabel_refusal(job) is None
     if include_segments:
         out["segments"] = job["segments"]
@@ -3774,6 +3791,117 @@ def relabel_job(job_id: str, job: dict[str, Any]) -> None:
         prune_jobs()
 
 
+def transcribe_into(
+    job_id: str,
+    model: Any,
+    path: str,
+    opts: dict[str, Any],
+    collected: list[dict[str, Any]],
+    speaker: int | None = None,
+    share: tuple[int, int] = (0, 1),
+) -> tuple[list[dict[str, Any]], str | None, float] | None:
+    """Transcribe one file, publishing each segment onto `collected` as it lands.
+
+    `speaker` labels every segment (a call's track); `share` is (index, count),
+    so the meter covers one track's slice of a multi-track job. Returns the
+    segments, the language and the duration -- or None if the job was
+    cancelled or evicted under it.
+    """
+    kwargs = transcribe_kwargs(opts)
+    try:
+        segments, info = model.transcribe(path, **kwargs)
+    except TypeError as exc:
+        # hotwords landed in faster-whisper 1.0.2; degrade rather than fail.
+        if "hotwords" not in str(exc):
+            raise
+        kwargs.pop("hotwords", None)
+        segments, info = model.transcribe(path, **kwargs)
+
+    duration = float(getattr(info, "duration", 0.0) or 0.0)
+    language = getattr(info, "language", None)
+    if share == (0, 1):
+        patch_job(job_id, language=language, duration=round(duration, 2))
+
+    index, count = share
+    for seg in segments:
+        entry: dict[str, Any] = {
+            "start": round(seg.start, 2),
+            "end": round(seg.end, 2),
+            "text": seg.text.strip(),
+        }
+        if opts["word_timestamps"]:
+            words = getattr(seg, "words", None)
+            if words:
+                entry["words"] = [
+                    {
+                        "start": round(w.start, 2),
+                        "end": round(w.end, 2),
+                        "word": w.word,
+                    }
+                    for w in words
+                ]
+        if speaker is not None:
+            entry["speaker"] = speaker
+        collected.append(entry)
+
+        # When labels are coming, the meter deliberately stops at 90% here
+        # so the diarization pass has somewhere to go. Otherwise it would
+        # sit at 100% while the second pass ran, looking stuck.
+        ceiling = 0.9 if opts["diarize"] else 1.0
+        within = min(seg.end / duration, 1.0) if duration else 0.0
+        progress = (index + within) / count * ceiling
+        with JOBS_LOCK:
+            live = JOBS.get(job_id)
+            if live is None or live["state"] == "cancelled":
+                return None
+            live["segments"] = list(collected)
+            live["progress"] = progress
+    return collected, language, duration
+
+
+def transcribe_tracks(
+    job_id: str, job: dict[str, Any], model: Any, opts: dict[str, Any]
+) -> tuple[list[dict[str, Any]], str | None, float] | None:
+    """A call: each track transcribed as its own speaker, then merged by time.
+
+    Segments are published track by track while it runs -- the preview only
+    ever appends -- and sorted into one conversation at the end. The sort
+    reorders rows the page has already drawn without changing how many there
+    are, so it bumps labels_rev, which is what makes an open card refetch.
+    """
+    collected: list[dict[str, Any]] = []
+    languages: list[str] = []
+    duration = 0.0
+    tracks = job["tracks"]
+    for index, track in enumerate(tracks):
+        outcome = transcribe_into(
+            job_id,
+            model,
+            str(track["path"]),
+            opts,
+            collected,
+            speaker=index + 1,
+            share=(index, len(tracks)),
+        )
+        if outcome is None:
+            return None
+        _, language, track_duration = outcome
+        duration = max(duration, track_duration)
+        if language:
+            languages.append(language)
+    collected.sort(key=lambda x: (x["start"], x["end"]))
+    language = max(set(languages), key=languages.count) if languages else None
+    with JOBS_LOCK:
+        live = JOBS.get(job_id)
+        if live is None or live["state"] == "cancelled":
+            return None
+        live["segments"] = list(collected)
+        live["labels_rev"] = live.get("labels_rev", 0) + 1
+        live["language"] = language
+        live["duration"] = round(duration, 2)
+    return collected, language, duration
+
+
 def run_job(job_id: str) -> None:
     job = get_job(job_id)
     if job.get("relabel_of"):
@@ -3819,69 +3947,16 @@ def run_job(job_id: str) -> None:
     )
 
     try:
-        kwargs = transcribe_kwargs(opts)
-        try:
-            segments, info = model.transcribe(job["path"], **kwargs)
-        except TypeError as exc:
-            # hotwords landed in faster-whisper 1.0.2; degrade rather than fail.
-            if "hotwords" not in str(exc):
-                raise
-            kwargs.pop("hotwords", None)
-            segments, info = model.transcribe(job["path"], **kwargs)
-
-        duration = float(getattr(info, "duration", 0.0) or 0.0)
-        patch_job(
-            job_id,
-            language=getattr(info, "language", None),
-            duration=round(duration, 2),
-        )
-
-        collected: list[dict[str, Any]] = []
-        for seg in segments:
-            entry: dict[str, Any] = {
-                "start": round(seg.start, 2),
-                "end": round(seg.end, 2),
-                "text": seg.text.strip(),
-            }
-            if opts["word_timestamps"]:
-                words = getattr(seg, "words", None)
-                if words:
-                    entry["words"] = [
-                        {
-                            "start": round(w.start, 2),
-                            "end": round(w.end, 2),
-                            "word": w.word,
-                        }
-                        for w in words
-                    ]
-            collected.append(entry)
-
-            # When labels are coming, the meter deliberately stops at 90% here
-            # so the diarization pass has somewhere to go. Otherwise it would
-            # sit at 100% while the second pass ran, looking stuck.
-            ceiling = 0.9 if opts["diarize"] else 1.0
-            progress = min(seg.end / duration, 1.0) * ceiling if duration else 0.0
-            stop = False
-            with JOBS_LOCK:
-                live = JOBS.get(job_id)
-                if live is None or live["state"] == "cancelled":
-                    stop = True
-                else:
-                    live["segments"] = list(collected)
-                    live["progress"] = progress
-            if stop:
-                # Outside the lock on purpose: drop_source re-acquires JOBS_LOCK,
-                # and threading.Lock is not reentrant.
-                return
-
-        label_and_finish(
-            job_id,
-            job,
-            opts,
-            collected,
-            getattr(info, "language", None),
-            duration,
-        )
+        if job.get("tracks"):
+            outcome = transcribe_tracks(job_id, job, model, opts)
+        else:
+            outcome = transcribe_into(job_id, model, job["path"], opts, [])
+        if outcome is None:
+            # Cancelled mid-file. Returning is safe here: drop_source (in the
+            # finally) re-acquires JOBS_LOCK, and nothing below holds it.
+            return
+        collected, language, duration = outcome
+        label_and_finish(job_id, job, opts, collected, language, duration)
     except Exception as exc:  # noqa: BLE001
         traceback.print_exc()
         if patch_job(
@@ -4369,6 +4444,7 @@ def status() -> dict[str, Any]:
         "loaded_models": loaded,
         "model_cache": ARGS.model_cache,
         "max_upload_mb": ARGS.max_upload_mb,
+        "max_tracks": MAX_TRACKS,
         "retry_available": ARGS.source_retention != "run",
         "allow_diarize": ARGS.allow_diarize,
         "diarize_max_speakers": DIARIZE_MAX_SPEAKERS,
@@ -4508,6 +4584,124 @@ async def create_job(
     return {"id": job_id}
 
 
+@app.post("/api/jobs/tracks")
+async def create_call(
+    request: Request,
+    files: list[UploadFile] = File(...),
+    model: str = Form(None),
+    compute_type: str = Form(None),
+    language: str = Form(""),
+    vad: str = Form("true"),
+    quality: str = Form("balanced"),
+    prompt: str = Form(""),
+    hotwords: str = Form(""),
+    translate: str = Form("false"),
+    condition: str = Form("false"),
+    word_timestamps: str = Form("false"),
+    min_silence_ms: int = Form(2000),
+    speech_pad_ms: int = Form(400),
+) -> dict[str, Any]:
+    """One call recorded as one file per person, transcribed as one job.
+
+    Zoom's "separate audio file for each participant" is the case this is for:
+    each file is one person, so who spoke is known exactly and no diarizer
+    guesses at it -- the one fix for a voice being handed to the wrong speaker.
+    Each track is transcribed with its own speaker number and the results are
+    merged by time; the speakers are named from the file names. Those names
+    are speaker names, so the main log never holds them (see name_speaker).
+    """
+    if not 2 <= len(files) <= MAX_TRACKS:
+        audit_rejection(
+            "job.rejected", request, tracks=len(files), reason="track-count", status=400
+        )
+        raise HTTPException(
+            status_code=400,
+            detail=f"A call is 2 to {MAX_TRACKS} tracks, one file per person",
+        )
+    # Speaker labels come from the tracks; a diarizer would only second-guess
+    # them. Word timings stay the operator's choice.
+    opts = build_opts(
+        model,
+        compute_type,
+        language,
+        vad,
+        quality,
+        prompt,
+        hotwords,
+        translate,
+        condition,
+        word_timestamps,
+        min_silence_ms,
+        speech_pad_ms,
+    )
+
+    with JOBS_LOCK:
+        pending = sum(
+            1 for j in JOBS.values() if j["state"] in ("queued", "loading", "running")
+        )
+    if pending >= ARGS.max_queue:
+        audit_rejection("job.rejected", request, reason="queue-full", status=429)
+        raise HTTPException(
+            status_code=429, detail=f"Queue is full ({ARGS.max_queue} jobs)"
+        )
+
+    # The body-size precheck already bounds the whole request at
+    # max_upload_mb, so the tracks of one call share that limit.
+    limit = ARGS.max_upload_mb * 1024 * 1024
+    tracks: list[dict[str, Any]] = []
+    names: dict[str, str] = {}
+    try:
+        for index, upload in enumerate(files, 1):
+            raw_name = Path(upload.filename or "audio").name
+            safe = "".join(c for c in raw_name if c.isalnum() or c in " ._-").strip()
+            dest = UPLOAD_DIR / f"{uuid.uuid4().hex[:8]}_{safe[:100] or 'audio'}"
+            # Recorded before the write, so a failure part-way through still
+            # discards the partial file below.
+            tracks.append({"path": str(dest), "bytes": 0})
+            tracks[-1]["bytes"] = await run_in_threadpool(
+                save_upload, upload.file, dest, limit
+            )
+            names[str(index)] = track_speaker_name(raw_name, index)
+    except UploadTooLarge as exc:
+        for track in tracks:
+            await run_in_threadpool(discard_file, Path(track["path"]))
+        audit_rejection(
+            "job.rejected",
+            request,
+            tracks=len(files),
+            bytes=exc.written,
+            reason="upload-too-large",
+            status=413,
+        )
+        raise HTTPException(
+            status_code=413,
+            detail=f"File exceeds the {ARGS.max_upload_mb} MB limit",
+        ) from None
+    except BaseException:
+        for track in tracks:
+            await run_in_threadpool(discard_file, Path(track["path"]))
+        raise
+
+    # No participant's name in the job's filename: it is logged by every event
+    # about the job, and names belong in the sidecar only.
+    title = f"Call \u00b7 {len(tracks)} tracks"
+    job_id = new_job(filename=title, path=Path(tracks[0]["path"]), opts=opts)
+    patch_job(job_id, tracks=tracks, speaker_names=names)
+    JOB_QUEUE.put(job_id)
+    audit(
+        "job.created",
+        request,
+        job=job_id,
+        file=title,
+        tracks=len(tracks),
+        bytes=sum(t["bytes"] for t in tracks),
+        opts=audit_opts(opts),
+    )
+    store_prompt_sidecar(job_id, title, opts, source="upload")
+    store_speaker_names(job_id, title, names)
+    return {"id": job_id}
+
+
 @app.post("/api/jobs/{job_id}/retry")
 def retry_job(
     job_id: str,
@@ -4531,7 +4725,7 @@ def retry_job(
     """Re-run the same source audio with different settings, no re-upload."""
     old = get_job(job_id)
     source = Path(old["path"])
-    if not source.exists():
+    if not all(Path(path).exists() for path in job_paths(old)):
         audit_rejection(
             "job.retry_rejected", request, job=job_id, reason="source-gone", status=409
         )
@@ -4570,10 +4764,22 @@ def retry_job(
             status_code=429, detail=f"Queue is full ({ARGS.max_queue} jobs)"
         )
 
+    if old.get("tracks"):
+        # A call stays a call: its speakers are its tracks, never a diarizer's.
+        opts["diarize"] = False
+        opts["speaker_model"] = None
     new_id = new_job(filename=old["filename"], path=source, opts=opts)
     # Provenance on the job, so its job.done can say it re-transcribed this
     # source rather than being the first pass at it.
     patch_job(new_id, retry_of=job_id)
+    if old.get("tracks"):
+        names = dict(old.get("speaker_names") or {})
+        patch_job(
+            new_id,
+            tracks=[dict(t) for t in old["tracks"]],
+            speaker_names=names,
+        )
+        store_speaker_names(new_id, old["filename"], names)
     JOB_QUEUE.put(new_id)
     audit(
         "job.retried",
@@ -4716,6 +4922,33 @@ def merge_speakers(
 # would end WebVTT's <v Name> voice span, control characters a line.
 SPEAKER_NAME_LIMIT = 60
 SPEAKER_NAME_BAD = re.compile(r"[<>\x00-\x1f\x7f]")
+
+
+# A call is at most this many tracks: one per person, and the speaker palette
+# and the count selector both stop at DIARIZE_MAX_SPEAKERS.
+MAX_TRACKS = DIARIZE_MAX_SPEAKERS
+# Zoom names a participant's file "audio" + display name + a numeric id:
+# audioJaneDoe11234567890.m4a. Older builds keep the spaces.
+ZOOM_TRACK = re.compile(r"^audio[ _-]?(?P<name>.*?)\d*$", re.IGNORECASE)
+
+
+def track_speaker_name(filename: str, index: int) -> str:
+    """The speaker a track belongs to, from its file name.
+
+    Zoom's pattern gives the display name; anything else gives the file's stem.
+    Falls back to "Track N" when nothing usable is left, and never returns
+    what name_speaker would refuse.
+    """
+    stem = Path(filename).stem
+    match = ZOOM_TRACK.match(stem)
+    raw = match.group("name") if match else stem
+    raw = re.sub(r"[_-]+", " ", raw)
+    raw = re.sub(r"(?<=[a-z])(?=[A-Z])", " ", raw)  # JaneDoe -> Jane Doe
+    if SPEAKER_NAME_BAD.search(raw):
+        # Markup in a file name is not a name worth salvaging.
+        return f"Track {index}"
+    name = " ".join(raw.split())[:SPEAKER_NAME_LIMIT].strip()
+    return name if name and not name.isdigit() else f"Track {index}"
 
 
 @app.post("/api/jobs/{job_id}/speakers/name")
@@ -5957,7 +6190,7 @@ def sweep_uploads() -> tuple[int, int]:
     except OSError:
         return 0, 0
     with JOBS_LOCK:
-        referenced = {j["path"] for j in JOBS.values()}
+        referenced = {p for j in JOBS.values() for p in job_paths(j)}
     for path in entries:
         if not path.is_file() or str(path) in referenced:
             continue
