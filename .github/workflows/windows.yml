@@ -135,9 +135,26 @@ jobs:
           # one (it exits with its own "use --device cpu" advice). The launcher
           # passes inherited TRANSCRIBE_* through, so this reaches the child.
           $env:TRANSCRIBE_DEVICE = "cpu"
+          # WaitForExit, not Start-Process -Wait: -Wait waits for the whole
+          # process tree, so a server left behind by the launcher hung the step
+          # until its timeout with nothing printed. Waiting on the launcher
+          # alone lets the orphan check below catch that instead.
           $proc = Start-Process -FilePath $exe `
             -ArgumentList "--self-test", "--with-server", "--timeout", "480" `
-            -Wait -PassThru
+            -PassThru
+          if (-not $proc.WaitForExit(600000)) {
+            Stop-Process -Id $proc.Id -Force
+            throw "the launcher self-test did not exit within 10 minutes"
+          }
+
+          # The launcher must stop the server it started, grandchild included.
+          $orphans = Get-CimInstance Win32_Process |
+            Where-Object { $_.CommandLine -like "*transcribe_server.py*" }
+          if ($orphans) {
+            $orphans | Select-Object ProcessId, Name, CommandLine | Format-List
+            $orphans | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }
+            throw "the self-test left the server running after it stopped"
+          }
 
           if (-not (Test-Path $report)) {
             throw "the self-test wrote no report; the run cannot be trusted"

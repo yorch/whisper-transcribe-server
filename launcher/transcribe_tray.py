@@ -284,6 +284,17 @@ def creation_flags() -> int:
     return 0
 
 
+def kill_tree(pid: int) -> None:
+    """Windows: end a process and every process it started."""
+    with contextlib.suppress(OSError, subprocess.SubprocessError):
+        subprocess.run(  # noqa: S603 - fixed argv, a pid we started
+            ["taskkill", "/T", "/F", "/PID", str(pid)],  # noqa: S607
+            capture_output=True,
+            timeout=15,
+            creationflags=creation_flags(),
+        )
+
+
 class ServerProcess:
     """Owns the child process and its log."""
 
@@ -317,6 +328,12 @@ class ServerProcess:
         """Ask nicely, then insist. The server has no shutdown endpoint."""
         if self.proc is None:
             return
+        if sys.platform == "win32":
+            # The child is uv.exe, and the server is uv's own child. terminate()
+            # is TerminateProcess on uv alone, which can leave the server
+            # running with the port -- a tray that quits without stopping it.
+            # taskkill /T takes the whole tree; it is a no-op once it is gone.
+            kill_tree(self.proc.pid)
         if self.proc.poll() is None:
             with contextlib.suppress(OSError):
                 self.proc.terminate()
