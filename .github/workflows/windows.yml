@@ -128,12 +128,16 @@ jobs:
           # it is a GUI-subsystem binary and PowerShell does not wait for those.
           # `& $exe` returned immediately, left $LASTEXITCODE stale, and made
           # the checks below meaningless.
+          # --timeout 480: the probe gives up well inside this step's 15
+          # minutes, so a server that never answers fails with its log printed
+          # below instead of the step timing out with nothing to read.
           # The runner has no GPU, and the server refuses --device cuda without
           # one (it exits with its own "use --device cpu" advice). The launcher
           # passes inherited TRANSCRIBE_* through, so this reaches the child.
           $env:TRANSCRIBE_DEVICE = "cpu"
           $proc = Start-Process -FilePath $exe `
-            -ArgumentList "--self-test", "--with-server" -Wait -PassThru
+            -ArgumentList "--self-test", "--with-server", "--timeout", "480" `
+            -Wait -PassThru
 
           if (-not (Test-Path $report)) {
             throw "the self-test wrote no report; the run cannot be trusted"

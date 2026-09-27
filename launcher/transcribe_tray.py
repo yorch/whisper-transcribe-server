@@ -639,7 +639,7 @@ def report_check(
     return "skip" if skip else ("pass" if ok else "fail")
 
 
-def self_test(with_server: bool = False) -> int:
+def self_test(with_server: bool = False, timeout: float = 900.0) -> int:
     """Exercise the logic that can be checked without a display.
 
     With --with-server this also starts a real server, waits for readiness the
@@ -722,7 +722,7 @@ def self_test(with_server: bool = False) -> int:
         # stdout nobody captures, the report never gets written, and the run
         # fails with no explanation of why.
         try:
-            ready, audit_ready = end_to_end_probe()
+            ready, audit_ready = end_to_end_probe(timeout)
         except Exception as exc:  # noqa: BLE001
             note = f"  probe raised: {type(exc).__name__}: {exc}"
             print(note)
@@ -840,7 +840,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     if args.self_test:
-        return self_test(with_server=args.with_server)
+        return self_test(with_server=args.with_server, timeout=args.timeout)
 
     supervisor = Supervisor(args)
     if args.no_tray or sys.platform != "win32":
