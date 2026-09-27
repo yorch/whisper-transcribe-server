@@ -17,7 +17,10 @@ Runs in the dev environment, where sherpa-onnx and the server are importable:
 
 A manifest is a JSON list of {"path": ..., "speakers": N, "turns": [...]},
 paths relative to the manifest; "turns" (start, end, speaker) is optional.
-Your own recordings go in the same shape -- a count alone is enough.
+Your own recordings go in the same shape -- a count alone is enough; see
+scripts/eval-manifest.example.json and the README's "Checking the speaker
+settings on your own recordings". The printed summary names files, never
+their content, so it is safe to share.
 """
 
 from __future__ import annotations
@@ -192,10 +195,13 @@ def summarise(rows: list[dict]) -> None:
         exact = mean([r["found"] == r["speakers"] for r in g])
         exact_fold = mean([r["found_fold"] == r["speakers"] for r in g])
         err = mean([abs(r["found"] - r["speakers"]) for r in g])
+        der, der_fold = mean([r["der"] for r in g]), mean([r["der_fold"] for r in g])
+        # A manifest with counts only (the usual case for real calls) has no
+        # timeline to score DER against: say so rather than print nan%.
+        pct = lambda v: f"{v:6.1%}" if v == v else f"{'—':>6}"  # noqa: E731
         print(
             f"{seg:13} {emb[:44]:44} {thr:>6} {exact:6.0%} {exact_fold:6.0%} "
-            f"{err:6.2f} {mean([r['der'] for r in g]):6.1%} "
-            f"{mean([r['der_fold'] for r in g]):6.1%}"
+            f"{err:6.2f} {pct(der)} {pct(der_fold)}"
         )
 
 
@@ -211,7 +217,20 @@ def main() -> int:
     parser.add_argument("--fold", type=float, default=s.DIARIZE_FOLD_SHARE)
     parser.add_argument("--threads", type=int, default=4)
     parser.add_argument("--out", type=Path, default=ROOT / "tmp/eval/results.json")
+    parser.add_argument(
+        "--quick",
+        action="store_true",
+        help="only what the server offers: pyannote-3.0 with titanet-small and "
+        "eres2net-en at 0.7-0.9 -- 8 passes per recording instead of 84",
+    )
     args = parser.parse_args()
+    if args.quick:
+        args.segmentation = ["pyannote-3.0"]
+        args.embedding = [
+            "nemo_en_titanet_small.onnx",
+            "3dspeaker_speech_eres2net_sv_en_voxceleb_16k.onnx",
+        ]
+        args.threshold = [0.7, 0.8, 0.9]
 
     args.models.mkdir(parents=True, exist_ok=True)
     items = load(args.manifests)

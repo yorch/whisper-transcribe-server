@@ -642,6 +642,27 @@ record stays, and the job can be retried.
 Jobs run one at a time regardless of how many files you stage, so the GPU isn't
 fighting itself. Stage five files, press Transcribe, and walk away.
 
+### Checking the speaker settings on your own recordings
+
+The defaults were chosen on public and synthetic recordings
+(`docs/speaker-diarization.md`, section 10). Your own calls are the better
+test, and nothing leaves the machine:
+
+1. Put 5–10 recordings whose speaker count you know in a folder — Zoom's
+   `.m4a` is fine, and a mix of two-person and larger calls is most telling.
+2. Copy `scripts/eval-manifest.example.json` into that folder as
+   `manifest.json` and list each file with its number of speakers.
+3. From the repository: `uv sync`, then
+
+   ```bash
+   uv run python scripts/diarize_eval.py --quick path/to/folder/manifest.json
+   ```
+
+It prints, per model and threshold, how often Auto found the right count with
+and without the fold. The table names files, never their content. Expect a
+few minutes per hour of audio for each of its 8 passes; the models download
+into `tmp/eval/models` on first use.
+
 ## A note on VRAM
 
 Models are cached so repeat jobs don't reload, but the cache is capped at
