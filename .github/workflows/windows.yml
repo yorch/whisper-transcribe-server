@@ -110,10 +110,15 @@ jobs:
       - name: Version
         # vX.Y.Z tag -> X.Y.Z; anything else is a dev build. A tag that is not a
         # plain version fails here, before a release could be made from it.
+        # Through env, never interpolated into the script: a ref name is text
+        # someone chose, and this runs before it has been validated.
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
         run: |
-          if ("${{ github.ref_type }}" -eq "tag") {
-            if ("${{ github.ref_name }}" -notmatch '^v(\d+\.\d+\.\d+)$') {
-              throw "release tags look like v1.2.3, got ${{ github.ref_name }}"
+          if ($env:REF_TYPE -eq "tag") {
+            if ($env:REF_NAME -notmatch '^v(\d+\.\d+\.\d+)$') {
+              throw "release tags look like v1.2.3, got '$env:REF_NAME'"
             }
             $version = $Matches[1]
           } else {
