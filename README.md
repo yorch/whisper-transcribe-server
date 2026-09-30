@@ -2,6 +2,8 @@
 
 Drag-and-drop Whisper transcription served over your LAN.
 
+Project page: <https://yorch.github.io/whisper-transcribe-server/>
+
 ## Setup on the Windows machine
 
 Two ways in: run it from source (below), or install the tray app. The tray app

@@ -1,0 +1,194 @@
+/* The project page wears the app's own look: the same palette, type and
+   instrument-panel surfaces, light and dark. Standalone on purpose -- the site
+   must not depend on static/, which belongs to the server. */
+
+:root{
+  color-scheme:light dark;
+  --ink:#1b2027;
+  --muted:#5c646e;
+  --amber:#b9610f;
+  --on-amber:#fff;
+  /* The primary button: deep enough for white text to pass WCAG AA
+     (4.6-5.9:1 across the gradient) -- the palette's own amber is not. */
+  --go-top:#ad5c0e;
+  --go-bottom:#9a510b;
+  --go-hover-top:#b0600f;
+  --go-hover-bottom:#a0540c;
+  --go-active:#93490a;
+  --go-edge:#7c3f08;
+  --green:#36704a;
+  --bg-top:#e3e6e9;
+  --bg-bottom:#d3d7dc;
+  --raised-top:#e9ebee;
+  --raised-bottom:#d6dade;
+  --card-top:#eceef1;
+  --card-bottom:#e1e4e8;
+  --line:#a9b0b8;
+  --line-soft:#c3c8cd;
+  --paper:#fbfbfc;
+  --sheen:rgba(255,255,255,.7);
+  --btn-top:#f4f5f6;
+  --btn-bottom:#dfe3e7;
+  --display:"Bahnschrift","DIN Alternate","Roboto Condensed",system-ui,sans-serif;
+  --body:"Segoe UI Variable Text","Segoe UI",system-ui,-apple-system,sans-serif;
+  --mono:ui-monospace,"Cascadia Mono","SF Mono",Menlo,Consolas,monospace;
+}
+
+@media (prefers-color-scheme:dark){
+  :root{
+    --ink:#e3e6ea;
+    --muted:#9aa3ad;
+    --amber:#e08a3a;
+    /* The lifted amber is light: white on it fails contrast, ink passes. */
+    --on-amber:#16191c;
+    /* Lifted amber with ink text (6.6:1 and up) rather than white. */
+    --go-top:#e8964a;
+    --go-bottom:#e08a3a;
+    --go-hover-top:#efa25c;
+    --go-hover-bottom:#e8964a;
+    --go-active:#d47e2f;
+    --go-edge:#b8702c;
+    --green:#5fae7a;
+    --bg-top:#1b1e22;
+    --bg-bottom:#15181b;
+    --raised-top:#282c32;
+    --raised-bottom:#212429;
+    --card-top:#262a30;
+    --card-bottom:#202328;
+    --line:#4a515a;
+    --line-soft:#3a4048;
+    --paper:#1a1d21;
+    --sheen:rgba(255,255,255,.05);
+    --btn-top:#343a42;
+    --btn-bottom:#2a2f36;
+  }
+}
+
+*,*::before,*::after{box-sizing:border-box}
+
+html,body{margin:0}
+
+body{
+  background:var(--bg-bottom);
+  background-image:linear-gradient(180deg,var(--bg-top) 0%,var(--bg-bottom) 100%);
+  background-attachment:fixed;
+  color:var(--ink);
+  font-family:var(--body);
+  font-size:16px;
+  line-height:1.6;
+  padding:28px 20px 64px;
+}
+
+.wrap{max-width:900px;margin:0 auto}
+
+a{color:var(--amber)}
+
+a:focus-visible,.button:focus-visible{outline:2px solid var(--amber);outline-offset:2px}
+
+code{font-family:var(--mono);font-size:.9em}
+
+/* The same readout strip the app opens with. */
+.readout{
+  border:1px solid var(--line-soft);
+  background:linear-gradient(180deg,var(--raised-top),var(--raised-bottom));
+  box-shadow:inset 0 1px 0 var(--sheen);
+  border-radius:3px;
+  padding:12px 16px;
+  display:flex;flex-wrap:wrap;gap:6px 28px;align-items:baseline;
+}
+
+.readout dl{margin:0;display:flex;gap:8px;align-items:baseline}
+
+.readout dt{
+  font-family:var(--display);font-size:10.5px;letter-spacing:.14em;
+  text-transform:uppercase;color:var(--muted);
+}
+
+.readout dd{margin:0;font-family:var(--display);font-size:14px}
+
+.lamp{
+  width:8px;height:8px;border-radius:50%;display:inline-block;
+  margin-right:7px;vertical-align:1px;
+  background:var(--amber);box-shadow:0 0 6px rgba(185,97,15,.55);
+}
+
+h1,h2,h3{font-family:var(--display);font-weight:600;letter-spacing:-.01em;line-height:1.2}
+
+.hero{margin:44px 0 30px}
+
+h1{font-size:clamp(30px,5vw,44px);margin:0 0 14px}
+
+.lede{font-size:18px;color:var(--muted);max-width:60ch;margin:0 0 24px}
+
+.cta{display:flex;flex-wrap:wrap;gap:12px}
+
+.button{
+  display:inline-block;text-decoration:none;
+  font-family:var(--display);font-size:15px;letter-spacing:.03em;
+  color:var(--ink);
+  background:linear-gradient(180deg,var(--btn-top),var(--btn-bottom));
+  border:1px solid var(--line);border-radius:3px;
+  padding:10px 20px;
+}
+
+.button.primary{
+  color:var(--on-amber);
+  background:linear-gradient(180deg,var(--go-top),var(--go-bottom));
+  border-color:var(--go-edge);
+}
+
+.fine{color:var(--muted);font-size:14px;margin:14px 0 0}
+
+.shot{margin:0 0 48px}
+
+.shot img{
+  display:block;width:100%;height:auto;
+  border:1px solid var(--line-soft);border-radius:4px;
+  box-shadow:0 12px 32px rgba(0,0,0,.14);
+}
+
+.shot figcaption{color:var(--muted);font-size:14px;margin-top:10px;text-align:center}
+
+section{margin-bottom:48px}
+
+h2{
+  font-size:13px;letter-spacing:.14em;text-transform:uppercase;color:var(--muted);
+  border-bottom:1px solid var(--line-soft);padding-bottom:8px;margin:0 0 20px;
+}
+
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:14px}
+
+.steps{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:14px}
+
+article{
+  border:1px solid var(--line-soft);border-radius:3px;
+  background:linear-gradient(180deg,var(--card-top),var(--card-bottom));
+  box-shadow:inset 0 1px 0 var(--sheen);
+  padding:16px 18px;
+}
+
+h3{font-size:18px;margin:0 0 8px}
+
+article p,article li{margin:0 0 8px;color:var(--muted);font-size:15px}
+
+article ol{padding-left:20px;margin:0}
+
+article strong{color:var(--ink);font-weight:600}
+
+pre{
+  background:var(--paper);border:1px solid var(--line-soft);border-radius:3px;
+  padding:12px 14px;overflow-x:auto;margin:0 0 10px;
+  font-size:13.5px;line-height:1.5;
+}
+
+footer{
+  border-top:1px solid var(--line-soft);padding-top:18px;
+  display:flex;flex-wrap:wrap;gap:22px;
+  font-family:var(--display);font-size:14px;
+}
+
+footer a{color:var(--muted);text-decoration:none}
+
+footer a:hover{color:var(--ink)}
+
+@media (prefers-reduced-motion:reduce){*{transition:none!important}}

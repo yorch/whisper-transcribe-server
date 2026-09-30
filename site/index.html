@@ -1,0 +1,123 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Transcription Server — Whisper on your own machine</title>
+<meta name="description" content="Drag-and-drop Whisper transcription served over your LAN. Runs on your workstation's GPU; nothing leaves the network.">
+<meta name="color-scheme" content="light dark">
+<link rel="stylesheet" href="site.css">
+</head>
+<body>
+<div class="wrap">
+
+  <header class="readout" aria-label="At a glance">
+    <dl><dt>Engine</dt><dd><span class="lamp"></span>faster-whisper</dd></dl>
+    <dl><dt>Runs on</dt><dd>your GPU or CPU</dd></dl>
+    <dl><dt>Reach</dt><dd>your LAN only</dd></dl>
+    <dl><dt>Cloud</dt><dd>none</dd></dl>
+  </header>
+
+  <main>
+    <section class="hero">
+      <h1>Transcribe audio on your own machine</h1>
+      <p class="lede">Drag a recording onto a web page, and Whisper transcribes it on
+      the workstation it runs on — with speaker labels, live progress and exports.
+      Anyone on your network can use it; nothing leaves the network.</p>
+      <div class="cta">
+        <a class="button primary" href="https://github.com/yorch/whisper-transcribe-server/releases/latest">Download for Windows</a>
+        <a class="button" href="https://github.com/yorch/whisper-transcribe-server">View on GitHub</a>
+      </div>
+      <p class="fine">Windows installer with a tray app, or run it from source on
+      Windows, Linux or macOS with <code>uv</code>.</p>
+    </section>
+
+    <figure class="shot">
+      <picture>
+        <source srcset="img/card-dark.png" media="(prefers-color-scheme: dark)">
+        <img src="img/card-light.png" width="1320" height="1116"
+             alt="A finished transcription card: two named speakers, Daniel and Samantha, with their talk time, a timestamped transcript labelled by speaker, and buttons to copy, save as txt, srt, vtt or json, retry and relabel speakers.">
+      </picture>
+      <figcaption>A finished job: speakers named on the card, transcript labelled
+      line by line, five export formats.</figcaption>
+    </figure>
+
+    <section>
+      <h2>What it does</h2>
+      <div class="grid">
+        <article>
+          <h3>Drop, set, transcribe</h3>
+          <p>Stage audio or video files, choose the model, language and quality,
+          and press Transcribe. Uploads show their progress, and the transcript
+          streams in live as each segment finishes.</p>
+        </article>
+        <article>
+          <h3>Who said what</h3>
+          <p>Speaker identification runs locally with sherpa-onnx — no PyTorch, no
+          account. Set the speaker count, then name speakers or merge a stray one
+          on the card, or relabel without transcribing again.</p>
+        </article>
+        <article>
+          <h3>One file per person</h3>
+          <p>Zoom can record a separate audio file for each participant. Drop them
+          together as one call and every line is attributed exactly, named after
+          the person, with no guessing.</p>
+        </article>
+        <article>
+          <h3>Exports that fit</h3>
+          <p>Copy the text, or save plain text, timestamped text, SRT, WebVTT with
+          speaker voices, or JSON with segment and word timings.</p>
+        </article>
+        <article>
+          <h3>Private by design</h3>
+          <p>An access token guards the page. A tamper-evident audit trail, behind
+          a token of its own, records what happened — hashes, never transcript or
+          prompt text.</p>
+        </article>
+        <article>
+          <h3>Made for the GPU you have</h3>
+          <p>With <code>--preload</code> it proves the card can really encode before
+          it calls itself ready, and when CUDA is not usable it says what to fix.
+          CPU works too, more slowly.</p>
+        </article>
+      </div>
+    </section>
+
+    <section>
+      <h2>Get started</h2>
+      <div class="steps">
+        <article>
+          <h3>Windows: the tray app</h3>
+          <ol>
+            <li>Download <strong>TranscriptionServer-…-setup.exe</strong> from the
+            <a href="https://github.com/yorch/whisper-transcribe-server/releases/latest">latest release</a>.</li>
+            <li>Run it. It is not code-signed yet, so SmartScreen will ask you to
+            confirm; <code>SHA256SUMS.txt</code> on the release lets you check the
+            download.</li>
+            <li>Start it from the tray. It picks the port, holds the access token,
+            and opens the page for you.</li>
+          </ol>
+        </article>
+        <article>
+          <h3>Any OS: from source</h3>
+          <p>The server is one Python script that declares its own dependencies,
+          so <a href="https://docs.astral.sh/uv/">uv</a> is the whole install:</p>
+          <pre><code>git clone https://github.com/yorch/whisper-transcribe-server
+cd whisper-transcribe-server
+uv run transcribe_server.py --preload</code></pre>
+          <p>Open the link it prints. Add <code>--device cpu</code> on a machine
+          without an NVIDIA GPU. ffmpeg is needed for anything that is not plain
+          WAV.</p>
+        </article>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <a href="https://github.com/yorch/whisper-transcribe-server">Source</a>
+    <a href="https://github.com/yorch/whisper-transcribe-server#readme">Documentation</a>
+    <a href="https://github.com/yorch/whisper-transcribe-server/releases">Releases</a>
+  </footer>
+</div>
+</body>
+</html>
