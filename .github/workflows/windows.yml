@@ -200,3 +200,56 @@ jobs:
           name: TranscriptionServer-installer
           path: packaging/output/*.exe
           retention-days: 14
+
+      - name: Install, check the firewall rule, uninstall
+        # The installer is built on every run but was never run. This installs
+        # it silently with the firewall task, checks the program and the netsh
+        # rule it adds (inbound TCP 8765, private profile), then uninstalls and
+        # checks the rule went with it. After the artifact uploads, so a failure
+        # here still leaves the installer to download.
+        run: |
+          $rule = "Transcription Server"
+          $setup = Get-ChildItem packaging\output\*.exe | Select-Object -First 1
+          if (-not $setup) { throw "no installer was built" }
+          $log = Join-Path $env:RUNNER_TEMP "install.log"
+          $p = Start-Process $setup.FullName -PassThru -ArgumentList `
+            "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", `
+            "/TASKS=firewall", "/LOG=$log"
+          if (-not $p.WaitForExit(300000)) { throw "the installer did not finish" }
+          if ($p.ExitCode -ne 0) {
+            Get-Content $log -Tail 40
+            throw "the installer exited with $($p.ExitCode)"
+          }
+
+          $dir = Join-Path $env:ProgramFiles $rule
+          if (-not (Test-Path (Join-Path $dir "Transcription Server.exe"))) {
+            Get-Content $log -Tail 40
+            throw "the installed launcher is missing from $dir"
+          }
+          if (-not (Test-Path (Join-Path $dir "_internal\static\index.html"))) {
+            throw "the install lacks static/, so every page would be a 500"
+          }
+
+          $shown = netsh advfirewall firewall show rule name="$rule" | Out-String
+          if ($LASTEXITCODE -ne 0) { throw "the installer added no firewall rule" }
+          Write-Host $shown
+          foreach ($want in "8765", "In", "TCP", "Private") {
+            if ($shown -notmatch $want) { throw "the firewall rule lacks '$want'" }
+          }
+
+          # Inno's uninstaller relaunches itself from a temp copy and returns at
+          # once, so wait on the result rather than on the process.
+          $u = Start-Process (Join-Path $dir "unins000.exe") -PassThru `
+            -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART"
+          $null = $u.WaitForExit(300000)
+          $gone = $false
+          for ($i = 0; $i -lt 60; $i++) {
+            netsh advfirewall firewall show rule name="$rule" | Out-Null
+            $ruleGone = $LASTEXITCODE -ne 0
+            $exeGone = -not (Test-Path (Join-Path $dir "Transcription Server.exe"))
+            if ($ruleGone -and $exeGone) { $gone = $true; break }
+            Start-Sleep -Seconds 2
+          }
+          if (-not $gone) { throw "the uninstall left the program or the rule behind" }
+          Write-Host "installed, rule present, uninstalled, rule removed"
+        timeout-minutes: 15

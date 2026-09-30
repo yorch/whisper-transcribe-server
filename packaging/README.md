@@ -114,10 +114,15 @@ Being explicit about what has and has not been exercised:
   uv (on CPU — the runner has no GPU), probes it, stops it, and fails if the
   server outlives the launcher. What CI cannot do is click the tray icon or
   run on a machine with a GPU; nobody has installed it by hand yet.
-- **Untested Windows-specific paths:** `os.startfile` for the log, the `clip`
-  clipboard call, `os.add_dll_directory` for CUDA on a real GPU, and `netsh`
-  firewall rules. (`CREATE_NO_WINDOW` and stopping the server's whole process
-  tree with `taskkill /T` do run in CI.)
+- **Windows-specific paths CI does run:** `CREATE_NO_WINDOW`, stopping the
+  server's whole process tree with `taskkill /T`, the `clip` clipboard
+  round-trip (including non-ASCII), that `.log` has a handler for "Open log",
+  and the installer itself — a silent install with the firewall task, the
+  `netsh` rule it adds (inbound TCP 8765, private profile), and an uninstall
+  that removes both the program and the rule.
+- **Still untested:** loading the CUDA DLLs on a machine with a GPU, and
+  anything that needs a person at the screen — the tray menu, the log
+  actually opening in an editor, and the installer's interactive pages.
 - **No code signing.** Windows SmartScreen will warn on first run, and some
   antivirus products flag PyInstaller output. Signing needs a certificate.
 - **No auto-update.** Rebuild and reinstall to update, which also refreshes the
