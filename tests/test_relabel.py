@@ -302,3 +302,49 @@ def test_a_relabel_keeps_the_names_it_can_match(client, configured, monkeypatch)
     assert "Alice" not in json.dumps(configured.events()), "names stay off the log"
     listed = client.get("/api/jobs").json()["jobs"]
     assert all("prior_" not in key for job in listed for key in job)
+
+
+def test_a_diarized_retry_keeps_the_names_it_can_match(client, configured, monkeypatch):
+    """Retry re-transcribes and re-diarizes, numbering speakers afresh like a
+    relabel, so it carries names over the same way: by overlap in time."""
+    old = finished_job(configured, diarize="true")
+    s.patch_job(
+        old,
+        segments=[
+            {"start": 0.0, "end": 1.5, "text": "Hello there.", "speaker": 1},
+            {"start": 2.5, "end": 4.0, "text": "Hi back.", "speaker": 2},
+        ],
+        speaker_names={"1": "Alice", "2": "Bob"},
+    )
+    response = client.post(
+        f"/api/jobs/{old}/retry", data={"model": "base", "diarize": "true"}
+    )
+    new = response.json()["id"]
+
+    class Model:
+        def transcribe(self, *_a, **_k):
+            from types import SimpleNamespace
+
+            words = [SimpleNamespace(**w) for w in TRANSCRIBED[0]["words"]]
+            seg = SimpleNamespace(
+                start=0.0, end=4.0, text=" Hello there. Hi back.", words=words
+            )
+            return iter([seg]), SimpleNamespace(language="en", duration=4.0)
+
+    monkeypatch.setattr(s, "load_model", lambda *_a: Model())
+    monkeypatch.setattr(s, "diarize_job", lambda *_a: TWO_TURNS)
+
+    s.run_job(new)
+
+    assert s.JOBS[new]["state"] == "done", s.JOBS[new]["message"]
+    assert s.JOBS[new]["speaker_names"] == {"1": "Alice", "2": "Bob"}
+    assert "Alice" not in json.dumps(configured.events())
+
+
+def test_a_retry_without_speakers_inherits_nothing(client, configured):
+    old = finished_job(configured, diarize="true")
+    s.patch_job(old, speaker_names={"1": "Alice"})
+
+    new = client.post(f"/api/jobs/{old}/retry", data={"model": "base"}).json()["id"]
+
+    assert "prior_names" not in s.JOBS[new]

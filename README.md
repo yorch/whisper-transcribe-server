@@ -577,16 +577,17 @@ The pages follow the system's light or dark setting; there is no switch.
   Names are treated like prompt text in the audit trail: the main log records
   only a length and a hash, the names themselves go to the job's sidecar in
   `prompts/`, readable with the audit token, and `--no-audit-prompts` keeps
-  them out of it too. A relabel draws its speakers afresh, so each new speaker
-  takes the name of the old speaker they overlap most in time; one who matches
-  nobody stays "Speaker N".
+  them out of it too. A relabel — or a Retry with Identify speakers on — draws
+  its speakers afresh, so each new speaker takes the name of the old speaker
+  they overlap most in time; one who matches nobody stays "Speaker N".
 
   **Got the count wrong?** Set Speakers to the right number and press
   **Relabel speakers** on the finished card. It runs only the speaker pass
   again, over the transcript the job already has — no model load, no
   re-transcription — and the result arrives as a new card, the old one left as
   it was so you can compare. When the new labels are the keepers, **Remove the
-  original** on the new card clears the old one (it asks once, like Remove). It needs the job's word timings (Identify speakers turns them on) and
+  original** on the new card clears the old one (it asks once, like Remove).
+  A finished Retry offers the same. It needs the job's word timings (Identify speakers turns them on) and
   its audio still on disk; otherwise use **Retry**. A pinned count is taken
   literally: pin one too many and a real voice gets split in two.
 

@@ -728,6 +728,22 @@ def test_a_relabelled_card_offers_to_remove_its_original_until_it_is_gone():
 
 
 @needs_node
+def test_a_retried_card_also_offers_to_remove_its_original():
+    probe = card_probe(
+        """
+        const done = (id, extra) => Object.assign({id, filename: "a.wav", state: "done",
+          opts: {model: "m"}, segments: [], segment_count: 0, elapsed: 1, duration: 1,
+          language: "en"}, extra);
+        render(done("orig", {}));
+        render(done("again", {retry_of: "orig"}));
+        return views.get(viewKey("again")).actions.children
+          .map(b => [b.textContent, b.dataset.del || "", b.title]);
+        """
+    )
+    assert ["Remove the original", "orig", "Remove the card this one re-ran"] in probe
+
+
+@needs_node
 def test_a_running_job_keeps_its_cancel_button_between_polls():
     """The action buttons were rebuilt on every render, which for a running job
     is every poll. A click whose press and release straddled a poll landed on

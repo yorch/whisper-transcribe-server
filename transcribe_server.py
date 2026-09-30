@@ -3795,6 +3795,27 @@ def label_and_finish(
     )
 
 
+def inherit_speaker_names(new_id: str, old: dict[str, Any]) -> None:
+    """Let a re-run's speakers inherit the names given on the job it re-runs.
+
+    A relabel or a diarized retry numbers its speakers afresh, so the names
+    cannot be copied by number: label_and_finish matches them by who overlaps
+    whom in time (carry_speaker_names). This keeps what that needs -- the
+    names and a text-free timeline of times and numbers -- on the new job.
+    """
+    if not old.get("speaker_names"):
+        return
+    patch_job(
+        new_id,
+        prior_names=dict(old["speaker_names"]),
+        prior_turns=[
+            {"start": x["start"], "end": x["end"], "speaker": x["speaker"]}
+            for x in old["segments"]
+            if segment_speaker(x) is not None
+        ],
+    )
+
+
 def relabel_job(job_id: str, job: dict[str, Any]) -> None:
     """Only the speaker pass, over a transcript the job was created with.
 
@@ -4836,6 +4857,8 @@ def retry_job(
     # Provenance on the job, so its job.done can say it re-transcribed this
     # source rather than being the first pass at it.
     patch_job(new_id, retry_of=job_id)
+    if not old.get("tracks") and opts["diarize"]:
+        inherit_speaker_names(new_id, old)
     if old.get("tracks"):
         names = dict(old.get("speaker_names") or {})
         patch_job(
@@ -4907,18 +4930,7 @@ def relabel_speakers_endpoint(
         language=old.get("language"),
         duration=old.get("duration"),
     )
-    if old.get("speaker_names"):
-        # So the new speakers can inherit names by who overlaps whom; the
-        # timeline keeps only times and numbers, never text.
-        patch_job(
-            new_id,
-            prior_names=dict(old["speaker_names"]),
-            prior_turns=[
-                {"start": x["start"], "end": x["end"], "speaker": x["speaker"]}
-                for x in old["segments"]
-                if segment_speaker(x) is not None
-            ],
-        )
+    inherit_speaker_names(new_id, old)
     JOB_QUEUE.put(new_id)
     audit(
         "job.relabelled",

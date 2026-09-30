@@ -816,12 +816,15 @@ function actions(node, job){
       "Identify the speakers again using the Speakers count and Voice model "
       + "above, without transcribing again";
   const live = ["queued","loading","running"].includes(job.state);
-  /* A relabel leaves its original card for comparison; once the new labels
-     are the keepers, this clears the old one. Same two-click guard as Remove,
-     and the poll's sweep takes the button away once the original is gone. */
-  if(job.state === "done" && job.relabel_of && views.has(viewKey(job.relabel_of)))
-    add(node, "Remove the original", {del: job.relabel_of, confirm: "1"}, true)
-      .title = "Remove the card this one relabelled";
+  /* A relabel or a retry leaves its original card for comparison; once the
+     new result is the keeper, this clears the old one. Same two-click guard as
+     Remove, and the poll's sweep takes the button away once the original is
+     gone. */
+  const original = job.relabel_of || job.retry_of;
+  if(job.state === "done" && original && views.has(viewKey(original)))
+    add(node, "Remove the original", {del: original, confirm: "1"}, true)
+      .title = job.relabel_of ? "Remove the card this one relabelled"
+                              : "Remove the card this one re-ran";
   /* A finished transcript lives only in the server's memory, so Remove is the
      one click that loses it for good: it asks twice. */
   add(node, live ? "Cancel" : "Remove",
