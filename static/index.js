@@ -617,6 +617,9 @@ function createCard(job){
   /* Scrolling away from the newest line pauses; coming back re-arms. The
      Follow switch stays the authoritative off switch. */
   view.transcript.addEventListener("scroll", () => {
+    // Only a live transcript has anything to follow: reading a finished one
+    // from the top is not "following paused".
+    if(!view.live) return;
     const atBottom = view.transcript.scrollHeight - view.transcript.scrollTop
                      - view.transcript.clientHeight <= 8;
     if(atBottom === view.paused) setPaused(view, !atBottom);
@@ -636,6 +639,8 @@ function speakerName(names, speaker){
    text needs no escaping and cannot become markup. */
 function appendSegments(view, segments, live, total, labeled){
   view.live = live;
+  // A job that finishes while paused has nothing left to catch up with.
+  if(!live && view.paused) setPaused(view, false);
   let rebuilt = false;
   /* `segments` is the tail the server has not sent yet, so there is nothing to
      de-duplicate: a poll with no new text sends an empty list. `total` is the

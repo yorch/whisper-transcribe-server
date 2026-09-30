@@ -1596,6 +1596,23 @@ def test_a_finished_job_does_not_chase_its_tail():
 
 
 @needs_node
+def test_a_finished_transcript_is_never_left_marked_paused():
+    """The amber "following paused" border and its "scroll back to catch up"
+    tooltip showed on finished transcripts, which have nothing to follow."""
+    probe = preview_probe(
+        """
+        const h = makeView();
+        appendSegments(h.view, [seg(0, "one")], true, 1, false);
+        setPaused(h.view, true);                 // scrolled up while it ran
+        appendSegments(h.view, [], false, 1, false);   // then it finished
+        return {marks: [...h.marks], title: h.view.transcript.title,
+                paused: h.view.paused};
+        """
+    )
+    assert probe == {"marks": [], "title": "", "paused": False}
+
+
+@needs_node
 def test_pausing_marks_the_preview_and_says_why():
     probe = preview_probe(
         """
