@@ -71,7 +71,7 @@ jobs:
         # skip themselves if it is missing rather than failing.
         run: |
           uv run --no-project --python ${{ env.PYTHON }} `
-            ${{ env.DEPS }} pytest tests/ -q
+            ${{ env.DEPS }} pytest tests/ -q -rs
 
       - name: Lint
         run: uvx ruff check . --output-format github
@@ -252,4 +252,7 @@ jobs:
           }
           if (-not $gone) { throw "the uninstall left the program or the rule behind" }
           Write-Host "installed, rule present, uninstalled, rule removed"
+          # Explicit: a pwsh step exits with the last native command's code,
+          # and the last netsh above failed on purpose -- the rule is gone.
+          exit 0
         timeout-minutes: 15
