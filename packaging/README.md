@@ -31,9 +31,31 @@ pwsh -File packaging\build-windows.ps1 -Installer
 Output:
 
 - `dist\TranscriptionServer\` — the app folder (~50 MB + ~80 MB for ffmpeg)
-- `packaging\output\TranscriptionServer-1.0.0-setup.exe` — the installer
+- `packaging\output\TranscriptionServer-0.0.0-dev-setup.exe` — the installer
+  (pass `-Version 1.2.3` for a versioned one; a release does that from its tag)
 
 Must run on Windows; PyInstaller cannot cross-compile.
+
+## Releases
+
+Pushing a version tag publishes a release:
+
+```bash
+git tag v1.2.3
+git push origin v1.2.3
+```
+
+The `windows` workflow then builds with that version, runs the full suite, the
+bundle's real-server self-test and the install/uninstall check, and only then
+creates a GitHub Release with the installer
+(`TranscriptionServer-1.2.3-setup.exe`), the portable bundle
+(`TranscriptionServer-1.2.3-portable.zip`) and `SHA256SUMS.txt`. A tag that is
+not `vX.Y.Z` fails before anything is built. Every other push still uploads
+the dev build as a workflow artifact, kept for 14 days.
+
+The installer keeps the same `AppId` across versions, so installing a newer
+release upgrades the old one in place. It is not code-signed: SmartScreen will
+warn on first run, and the checksums only prove a download is what CI built.
 
 ## What the installer does
 

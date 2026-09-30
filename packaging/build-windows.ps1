@@ -10,7 +10,8 @@
 param(
     [switch]$Installer,
     [switch]$SkipVendor,   # reuse an existing packaging\vendor
-    [string]$Python = "3.12"
+    [string]$Python = "3.12",
+    [string]$Version = ""   # the release version (from the git tag); empty = dev
 )
 
 $ErrorActionPreference = "Stop"
@@ -129,7 +130,9 @@ if ($Installer) {
         Warn "Install it with: winget install JRSoftware.InnoSetup"
     } else {
         Step "Building the installer"
-        & $iscc (Join-Path $PSScriptRoot "transcribe-server.iss")
+        $defines = @()
+        if ($Version) { $defines += "/DAppVersion=$Version" }
+        & $iscc @defines (Join-Path $PSScriptRoot "transcribe-server.iss")
         if ($LASTEXITCODE -ne 0) { throw "ISCC failed" }
         Step "Installer written to packaging\output"
     }

@@ -6,7 +6,12 @@
 ; what this packages. Admin is required only to add the firewall rule.
 
 #define AppName "Transcription Server"
-#define AppVersion "1.0.0"
+; A release build passes the version from its git tag (ISCC /DAppVersion=1.2.3,
+; via build-windows.ps1 -Version). Anything else is a dev build and says so,
+; rather than claiming to be a release it is not.
+#ifndef AppVersion
+  #define AppVersion "0.0.0-dev"
+#endif
 #define AppPublisher "yorch"
 #define AppExe "Transcription Server.exe"
 #define AppURL "https://github.com/yorch/whisper-transcribe-server"

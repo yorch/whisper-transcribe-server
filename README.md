@@ -6,7 +6,9 @@ Drag-and-drop Whisper transcription served over your LAN.
 
 Two ways in: run it from source (below), or install the tray app. The tray app
 is a launcher that manages the process, token and port for you, and bundles
-ffmpeg — see [packaging/README.md](packaging/README.md).
+ffmpeg — download the installer from the
+[latest release](https://github.com/yorch/whisper-transcribe-server/releases/latest),
+or build it yourself: see [packaging/README.md](packaging/README.md).
 
 ```powershell
 # from source, zero install
