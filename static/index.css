@@ -157,14 +157,14 @@
     font-family:var(--display);
     font-size:14px;
     padding:8px 20px;
-    color:#fff;
-    background:linear-gradient(180deg,#c66d16,var(--amber));
-    border-color:#8f4a0c;
+    color:var(--on-amber);
+    background:linear-gradient(180deg,var(--go-top),var(--go-bottom));
+    border-color:var(--go-edge);
   }
 
-  #start:hover{background:linear-gradient(180deg,#d1781d,#c26711)}
+  #start:hover{background:linear-gradient(180deg,var(--go-hover-top),var(--go-hover-bottom))}
 
-  #start:active{background:#a8580d}
+  #start:active{background:var(--go-active)}
 
   /* After the hover and active rules: a disabled button must not light up. */
   #start:disabled{

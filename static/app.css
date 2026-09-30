@@ -13,6 +13,15 @@
     --muted:#5c646e;
     --amber:#b9610f;
     --amber-dim:#d9b48a;
+    --on-amber:#fff;
+    /* The primary button: deep enough for white text to pass WCAG AA
+       (4.6-5.9:1 across the gradient) -- the palette's own amber is not. */
+    --go-top:#ad5c0e;
+    --go-bottom:#9a510b;
+    --go-hover-top:#b0600f;
+    --go-hover-bottom:#a0540c;
+    --go-active:#93490a;
+    --go-edge:#7c3f08;
     --green:#36704a;
     --red:#9d3427;
     --bg-top:#e3e6e9;
@@ -52,6 +61,15 @@
       --muted:#9aa3ad;
       --amber:#e08a3a;
       --amber-dim:#7a5634;
+      /* The lifted amber is light: white on it fails contrast, ink passes. */
+      --on-amber:#16191c;
+      /* Lifted amber with ink text (6.6:1 and up) rather than white. */
+      --go-top:#e8964a;
+      --go-bottom:#e08a3a;
+      --go-hover-top:#efa25c;
+      --go-hover-bottom:#e8964a;
+      --go-active:#d47e2f;
+      --go-edge:#b8702c;
       --green:#5fae7a;
       --red:#e0675a;
       --bg-top:#1b1e22;

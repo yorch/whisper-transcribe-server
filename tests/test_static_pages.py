@@ -508,11 +508,6 @@ def test_every_at_rule_is_one_a_browser_can_parse():
     assert "@media (prefers-reduced-motion:reduce)" in asset("app.css")
 
 
-# The amber primary button and its white label read the same on both themes,
-# so they are the only literals allowed outside the palette.
-THEME_NEUTRAL = {"#fff", "#c66d16", "#d1781d", "#c26711", "#a8580d", "#8f4a0c"}
-
-
 def test_every_surface_colour_comes_from_the_palette():
     """Dark mode works by redefining the :root tokens. A hex colour written
     straight into a rule is a surface the dark palette cannot reach -- a white
@@ -521,7 +516,7 @@ def test_every_surface_colour_comes_from_the_palette():
         css = re.sub(r"/\*.*?\*/", "", asset(name), flags=re.S)
         # The palette itself: every :root block, the dark one included.
         css = re.sub(r":root\s*\{[^}]*\}", "", css)
-        stray = set(re.findall(r"#[0-9a-fA-F]{3,8}\b", css)) - THEME_NEUTRAL
+        stray = set(re.findall(r"#[0-9a-fA-F]{3,8}\b", css))
         assert not stray, f"{name} hard-codes {sorted(stray)}; use a palette token"
 
 
@@ -529,3 +524,42 @@ def test_the_pages_follow_the_system_colour_scheme():
     app = asset("app.css")
     assert "color-scheme:light dark" in app
     assert "@media (prefers-color-scheme:dark)" in app
+
+
+def _luminance(hex_colour: str) -> float:
+    channels = [int(hex_colour[i : i + 2], 16) / 255 for i in (1, 3, 5)]
+    linear = [
+        c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4 for c in channels
+    ]
+    return 0.2126 * linear[0] + 0.7152 * linear[1] + 0.0722 * linear[2]
+
+
+def _contrast(a: str, b: str) -> float:
+    high, low = sorted((_luminance(a), _luminance(b)), reverse=True)
+    return (high + 0.05) / (low + 0.05)
+
+
+def test_the_primary_button_text_passes_wcag_aa_in_both_themes():
+    """White on the palette's amber was 3.8-4.4:1 in light and 2.4-2.7:1 in
+    dark. The button has its own tokens now; this reads them from the CSS and
+    holds every stop to 4.5:1."""
+    for name in ("app.css",):
+        css = asset(name)
+        blocks = re.findall(r":root\s*\{([^}]*)\}", css)
+        assert len(blocks) == 2, "expected a light and a dark :root"
+        for block in blocks:
+            tokens = {
+                name: value
+                if len(value) == 7
+                else "#" + "".join(c * 2 for c in value[1:])
+                for name, value in re.findall(
+                    r"--([\w-]+):\s*(#[0-9a-fA-F]{6}|#[0-9a-fA-F]{3})\b", block
+                )
+            }
+            # Both themes, or a short hex (#fff) slipping past the pattern would
+            # quietly check one of them -- which the first version of this did.
+            assert "on-amber" in tokens, "a :root block has no --on-amber"
+            for stop in ("go-top", "go-bottom", "go-hover-top", "go-hover-bottom",
+                         "go-active"):  # fmt: skip
+                ratio = _contrast(tokens["on-amber"], tokens[stop])
+                assert ratio >= 4.5, f"{name} {stop}: {ratio:.2f}:1"
