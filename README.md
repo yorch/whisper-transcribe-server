@@ -950,3 +950,7 @@ On Windows two of those checks report `SKIP` rather than `PASS`: mode bits are a
 POSIX idea, and `chmod 0600` there only sets the file's read-only flag, so the
 self-test says what it could not verify instead of claiming it did. The summary
 line counts them.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
