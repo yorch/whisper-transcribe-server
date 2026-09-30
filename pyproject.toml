@@ -30,7 +30,9 @@ dependencies = [
 [dependency-groups]
 dev = [
     "pytest>=8",
-    "httpx>=0.27",
+    # starlette's TestClient: httpx2 is what it asks for from starlette 1.6;
+    # plain httpx still works there but warns that it is deprecated.
+    "httpx2>=2.13",
     "ruff>=0.6",
     "pyright>=1.1.380",
     # The tray launcher's own inline dependencies, so pyright can resolve its
@@ -52,6 +54,12 @@ package = false
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+filterwarnings = [
+    # Raised inside starlette's own testclient.py (it names anyio.abc's
+    # BlockingPortal alias), not by anything here; nothing to change on our
+    # side until starlette does.
+    "ignore:The anyio.abc.BlockingPortal alias is deprecated:DeprecationWarning",
+]
 
 [tool.ruff]
 line-length = 88

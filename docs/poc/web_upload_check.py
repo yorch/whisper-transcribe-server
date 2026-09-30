@@ -26,7 +26,7 @@ import subprocess
 import time
 from pathlib import Path
 
-import httpx
+import httpx2 as httpx
 
 # The repo root: this file lives in docs/poc/. Override to run it elsewhere.
 ROOT = Path(

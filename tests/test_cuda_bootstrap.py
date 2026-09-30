@@ -5,7 +5,7 @@
 #     "fastapi>=0.110",
 #     "uvicorn[standard]>=0.27",
 #     "python-multipart>=0.0.9",
-#     "httpx>=0.27",
+#     "httpx2>=2.13",
 #     "numpy>=1.24",
 #     "tomli>=2; python_version < '3.11'",
 # ]

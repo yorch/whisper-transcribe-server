@@ -43,7 +43,7 @@ env:
   # (2 GB, and no GPU here), plus the launcher's extras and the test-only
   # packages. tests/test_project_metadata.py fails if this drifts.
   DEPS: >-
-    --with pytest --with httpx --with fastapi --with "uvicorn[standard]"
+    --with pytest --with httpx2 --with fastapi --with "uvicorn[standard]"
     --with python-multipart --with faster-whisper --with numpy
     --with sherpa-onnx --with tomli --with pystray --with pillow
 
