@@ -210,14 +210,14 @@ jobs:
           }
 
       # v7.0.1
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: TranscriptionServer-windows
           path: dist/TranscriptionServer/
           retention-days: 14
 
       # v7.0.1
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         if: hashFiles('packaging/output/*.exe') != ''
         with:
           name: TranscriptionServer-installer
@@ -297,7 +297,7 @@ jobs:
           Get-ChildItem $out | Select-Object Name, Length
 
       # v7.0.1
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         if: github.ref_type == 'tag'
         with:
           name: TranscriptionServer-release
